@@ -510,6 +510,56 @@ Cheap, partial; ships behind the heuristic. **Rejected in favour of
 that complexity the buffer round-trip is still the dominant cost. (C)
 removes the round-trip entirely.
 
+### E. Chained-read terminals: what the matrix already says
+
+Smudge, blur, liquify and watercolor all have a *semantic* dependency
+between consecutive dabs: dab `n+1` reads what dab `n` wrote (the
+scratch read mirror for the first three, the deposit channel for
+watercolor). Any future graph that samples the live stroke, such as a
+canvas-sampling node feeding `paint`, has the same dependency.
+
+That dependency rules out the two shapes that won above:
+
+- **#4 cannot express it.** Instances in one draw cannot see each
+  other's writes; the ROP blends them but a fragment never reads the
+  target. `paint`'s one-pass-per-phase trick is unavailable.
+- **#3 cannot express it.** A thread owns one pixel and cannot read a
+  neighbour's post-dab value; workgroups cannot barrier against each
+  other.
+
+Only #1 (one render pass per dab, what the read-mirror terminals run
+today) and #2 (one workgroup walking the dab list with a
+`storageBarrier()` between dabs) can. The matrix already contains
+their crossover, read from the synthesis table:
+
+| radius_px | #1 pass-per-dab | #2 single workgroup |
+|---:|---:|---:|
+| 1 to 10 | +1006 to +17614 | +4 to +5 |
+| 100 | +15 to +27 | +3 to +1415 (4K) |
+| 250 and up | +16 to +55 | +34 to +54099 |
+
+So a chained terminal would want #2 below roughly radius 100 and #1
+above it, with the crossover depending on canvas size. Caveats before
+building that hybrid:
+
+- Nobody has measured the existing smudge, blur or liquify at any
+  cell. `stroke_replay_matrix --topology smudge` exists. Run it first;
+  if the per-dab fragment path keeps up at radius 1 on the recorded
+  stroke, there is nothing to fix.
+- #2's numbers were measured with the buffer round-trip that #3 showed
+  dominates at large bboxes. A chained #2 pays the same round-trip (or
+  needs storage textures), so its large-radius column is not
+  pessimistic by accident.
+- The hybrid was dropped for `paint` because #4 made it unnecessary,
+  not because it was wrong. For chained terminals #4 is not on the
+  table, so the hybrid question is live again, and it belongs in the
+  shared serialized flush path, not in `paint`'s instanced path.
+- Watercolor is the cautionary tale in the other direction: it was
+  batched onto #4, then re-serialized because the batched answer was
+  wrong (banding at the pointer-event period). Correctness decides
+  whether a terminal is chained; performance only decides #1 versus
+  #2 within that.
+
 ## What the user proposed
 
 > "We can do all the dabs in one pass without assigning each pixel a thread."
@@ -731,7 +781,8 @@ cells in the per-approach tables above):
 - Each new attempt is its own commit. Shader + CPU evolve together.
 - New attempts append a row here: what we did, what we measured, why
   we kept it or moved on.
-- Watercolor has now been ported to the same architecture: see
-  [`watercolor-perf-tracking.md`](watercolor-perf-tracking.md). Smudge
-  and liquify still on their per-dab fragment paths; the same pattern
-  applies if/when their compute ports need a perf pass.
+- Watercolor was ported to the same architecture and then went back to
+  a per-dab path: see [`watercolor-perf-tracking.md`](watercolor-perf-tracking.md)
+  and its status note. Smudge, blur and liquify have never been
+  benched; see "Chained-read terminals" under Options to explore next
+  before touching any of them.

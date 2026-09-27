@@ -6,7 +6,8 @@ many dabs per pen event, and the per-event GPU cost balloons. The
 end-to-end behavior the artist sees is **stroke lag**: frames stall,
 the stroke trails the pen, the editor stops feeling responsive.
 
-Predecessor doc: [`darkly-stabilization-perf-investigation.md`](darkly-stabilization-perf-investigation.md).
+Predecessor investigation: its findings are folded into
+[`brush/stabilization.md`](brush/stabilization.md) ("Lag investigation findings").
 Originating plan: `~/.claude/plans/paint-compute-perf-fix.md`.
 
 ## Problem
@@ -378,6 +379,31 @@ column). The difference is bench noise and the modest CPU cost of
 appending 900 dab records to the storage buffer per event vs writing
 the same records as compute-buffer dabs. Neither is felt by an artist;
 the matrix's noise floor is around ±20 ms.
+
+### Watercolor: the same shapes, one extra constraint
+
+The wet-media terminal went through the same sequence, and it is the
+only terminal to have gone *back*:
+
+- `watercolor_compute` had #3's architecture and #3's failure: sync
+  bytes over the union bbox, catastrophic from 1280x720 at 250 px up.
+  Nothing new was learned from it.
+- `watercolor_batched` ported it to #4 with one addition: a per-dab
+  *pickup* probe (the 8x8 neighbourhood average under the dab) written
+  into one cell of a 128x128 atlas by a single instanced pass, which is
+  legal only because the probe reads the read-only pre-stroke snapshot.
+  The pattern is worth keeping: any per-dab probe whose source does
+  not change mid-flush can be instanced. Result: 26 of 28 cells within
+  bench noise; full table in
+  [bench-results/stroke-replay-matrix-watercolor-recorded_curvy_stroke-39c5566bc3.md](../crates/darkly/bench-results/stroke-replay-matrix-watercolor-recorded_curvy_stroke-39c5566bc3.md).
+- The two outliers were the 4K overdraw cells, where its fragment
+  shader cost about 7x paint's (+875 ms versus +124 ms at 4K + 2000 px).
+  Shader weight matters only where overdraw does.
+- It was then **re-serialized**: a dab's colour reads the deposit
+  earlier dabs left under it, and a batched flush gave every dab the
+  same pre-flush answer, banding at the pointer-event period. Today's
+  `watercolor.rs` runs one pickup pass and one composite pass per dab,
+  and that version has never been benched. See section E below.
 
 ## Background changes that are NOT competing attempts
 
@@ -781,8 +807,6 @@ cells in the per-approach tables above):
 - Each new attempt is its own commit. Shader + CPU evolve together.
 - New attempts append a row here: what we did, what we measured, why
   we kept it or moved on.
-- Watercolor was ported to the same architecture and then went back to
-  a per-dab path: see [`watercolor-perf-tracking.md`](watercolor-perf-tracking.md)
-  and its status note. Smudge, blur and liquify have never been
-  benched; see "Chained-read terminals" under Options to explore next
-  before touching any of them.
+- Watercolor's history is under Attempts above. Smudge, blur, liquify
+  and the per-dab watercolor have never been benched; see section E
+  under Options to explore next before touching any of them.

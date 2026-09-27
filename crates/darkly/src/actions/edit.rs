@@ -34,13 +34,14 @@ const ACTIONS: &[ActionDef] = &[
     ActionDef {
         id: "pasteAsSmartObject",
         display_name: "Paste as Smart Object",
-        description: "Paste the clipboard image as a smart object: a layer you can resize freely without losing quality, because the original is kept and re-sampled rather than overwritten.",
+        description: "Paste the clipboard image as a smart object layer.",
         icon: "tabler:photo-scan",
     },
     ActionDef {
         id: "convertFloatingToSmartObject",
         display_name: "Convert to Smart Object",
-        description: "Turn the content you are positioning into a smart object layer instead of stamping it down, so you can keep resizing it without losing quality.",
+        description:
+            "Turn the floating content into a smart object layer instead of stamping it down.",
         icon: "tabler:photo-scan",
     },
     ActionDef {
@@ -57,8 +58,8 @@ const ACTIONS: &[ActionDef] = &[
     },
     ActionDef {
         id: "rescaleImage",
-        display_name: "Scale Image to New Size",
-        description: "Resize all layers to new document dimensions.",
+        display_name: "Image Size",
+        description: "Resize the image or change its DPI.",
         icon: "fa6-solid:expand",
     },
     ActionDef {

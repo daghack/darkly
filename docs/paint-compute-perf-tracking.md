@@ -405,6 +405,93 @@ only terminal to have gone *back*:
   `watercolor.rs` runs one pickup pass and one composite pass per dab,
   and that version has never been benched. See section E below.
 
+### #5, stage 1: dispatch per dab, measured in isolation
+
+**Shape:** option F. One compute pass, one `dispatch_workgroups` per dab
+sized to the dab's bounding box, one thread per pixel, against a
+stroke-resident `r32uint` read-write storage texture holding packed RGBA8.
+Each dispatch gets its dab through a static index buffer (slot `i` holds
+`i`, written once) bound with a dynamic offset; the tight 32-byte record
+array is uploaded once per pass.
+
+**Files:** [`crates/darkly/src/bin/dispatch_cost_bench.rs`](../crates/darkly/src/bin/dispatch_cost_bench.rs)
+(harness, inline WGSL). No engine, no stroke, no terminal: this stage
+measures the one quantity B.1 was dismissed over without measuring, the
+all-in cost of a dispatch inside a pass, barrier included. Plan:
+[`plans/compute-dispatch-per-dab-spike.md`](plans/compute-dispatch-per-dab-spike.md).
+
+**Bench data.** 3840x2160 target, N dabs scattered, three shapes over the
+same dabs: (a) the option F shape; (b) the same dispatches with the texture
+bound read-only and the store dropped, identical encode and no
+inter-dispatch barrier, so (a) minus (b) is the barrier; (c) one render
+pass per dab with hardware source-over, the shape the read-mirror
+terminals pay today. Five untimed warm-up iterations per cell, then 20
+timed iterations with the three shapes interleaved so an integrated GPU's
+frequency scaling lands on all three alike (the first run, without that,
+showed N = 2000 finishing faster than N = 900 purely from clock ramp).
+Wall clock is encode through `poll(Wait)`; GPU time is pass timestamps.
+Full file: `bench-results/dispatch-cost-bench-9d824e90e8.md`.
+
+Adapter: Intel Raptor Lake-P iGPU, Vulkan, Mesa 26.2.3. Same machine as
+the section E smudge baseline.
+
+| radius_px | N | shape | wall p50 (ms) | wall min (ms) | wall per dab, p50 (us) | gpu p50 (ms) | gpu per dab, p50 (us) | parity max diff (LSB) |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 1.5 | 300 | (a) dispatch, read-write | 4.65 | 3.62 | 15.5 | 2.86 | 9.5 | 1 |
+| 1.5 | 300 | (b) dispatch, read-only | 5.03 | 3.52 | 16.8 | 2.77 | 9.2 | - |
+| 1.5 | 300 | (c) render pass per dab | 28.12 | 19.21 | 93.7 | 11.54 | 38.5 | - |
+| 1.5 | 900 | (a) dispatch, read-write | 6.46 | 5.60 | 7.2 | 4.69 | 5.2 | 1 |
+| 1.5 | 900 | (b) dispatch, read-only | 6.97 | 6.07 | 7.7 | 4.56 | 5.1 | - |
+| 1.5 | 900 | (c) render pass per dab | 49.59 | 43.34 | 55.1 | 19.03 | 21.1 | - |
+| 1.5 | 2000 | (a) dispatch, read-write | 7.82 | 7.16 | 3.9 | 5.48 | 2.7 | 1 |
+| 1.5 | 2000 | (b) dispatch, read-only | 8.54 | 7.02 | 4.3 | 5.50 | 2.7 | - |
+| 1.5 | 2000 | (c) render pass per dab | 73.96 | 67.20 | 37.0 | 21.78 | 10.9 | - |
+| 10 | 300 | (a) dispatch, read-write | 2.47 | 2.01 | 8.2 | 1.09 | 3.6 | 1 |
+| 10 | 300 | (b) dispatch, read-only | 2.66 | 2.08 | 8.9 | 1.07 | 3.6 | - |
+| 10 | 300 | (c) render pass per dab | 15.42 | 12.44 | 51.4 | 4.25 | 14.2 | - |
+| 10 | 900 | (a) dispatch, read-write | 6.59 | 5.64 | 7.3 | 4.25 | 4.7 | 2 |
+| 10 | 900 | (b) dispatch, read-only | 7.54 | 5.37 | 8.4 | 4.56 | 5.1 | - |
+| 10 | 900 | (c) render pass per dab | 49.61 | 42.92 | 55.1 | 16.74 | 18.6 | - |
+| 10 | 2000 | (a) dispatch, read-write | 8.20 | 7.34 | 4.1 | 5.67 | 2.8 | 2 |
+| 10 | 2000 | (b) dispatch, read-only | 7.91 | 7.30 | 4.0 | 5.33 | 2.7 | - |
+| 10 | 2000 | (c) render pass per dab | 73.72 | 66.97 | 36.9 | 21.24 | 10.6 | - |
+
+**What it shows.**
+
+- **The gate is met.** The gate written before the run (plan, stage 1):
+  shape (a) at N = 900 within 9 ms wall, i.e. 10 us per dispatch. Measured:
+  6.5 ms p50, 5.6 ms min, 7.2 us per dispatch, at both radii. N = 2000
+  fits in 8 ms.
+- **The barrier is free.** (b) is not cheaper than (a) in any cell; the
+  differences are inside the noise. The `vkCmdPipelineBarrier` wgpu
+  inserts between read-write dispatches costs nothing measurable here.
+- **A dispatch is not a render pass.** Marginal cost from the 300 to 2000
+  slope: about 1.5 us wall and 1.5 us GPU per dispatch, against about 27 us
+  wall and 6 us GPU per single-instance render pass. The pass-per-dab
+  column reproduces section E's smudge figure (about 40 us per dab all-in)
+  on this machine in this harness.
+- **Both shapes carry a fixed cost per submission** (roughly 4 ms wall for
+  the compute shapes at the smallest N, more for the render-pass shape),
+  attributed to the harness's submit-and-idle cycle and an idle GPU's clock
+  ramp rather than to either shape. The engine pays that cycle once per
+  event regardless of terminal, so it cancels in a comparison with #4; the
+  slopes are what differ.
+- **Parity:** the compute path's packed result matches hardware blending
+  within 1 LSB at radius 1.5 and 2 LSB at radius 10 (stacked rounding where
+  dabs overlap), so the timed shapes do equivalent work.
+
+**Caveats.** One adapter, one driver, native Vulkan. The WebGPU backend
+routes every `setBindGroup` and `dispatchWorkgroups` through the browser's
+GPU process, and that per-call cost is unmeasured; a browser replay is a
+separate measurement after the port. This is not a stroke: stabiliser
+rewinds, checkpoints and layer growth are not in the number, but they are
+terminal-independent and #4 pays them too.
+
+**Decision: stage 2 proceeds.** Per the plan, a pass at or under 10 us per
+dispatch means the throwaway terminal is built and run on the replay
+matrix against a same-session `paint` run, and the outcome is recorded
+here as attempt #5, stage 2.
+
 ## Background changes that are NOT competing attempts
 
 These landed for different reasons over the same time window. Listed
@@ -585,6 +672,76 @@ building that hybrid:
   wrong (banding at the pointer-event period). Correctness decides
   whether a terminal is chained; performance only decides #1 versus
   #2 within that.
+
+### F. Dispatch-per-dab on a resident storage scratch: B.1 revisited, *stage 1 passed, stage 2 pending*
+
+Section E established that chained terminals cannot use #4 and are stuck
+choosing between #1 and #2. This option asks whether a third compute shape
+serves *every* terminal, chained or not, and so removes the choice.
+
+**The shape.** One compute pass per flush. One `dispatchWorkgroups` per dab,
+sized to that dab's bounding box, one thread per pixel. The stroke scratch
+is a `read_write` storage texture that lives for the whole stroke, packed
+RGBA8 in `r32uint` (the only read-write storage formats in core WebGPU are
+32-bit single-channel). Within one compute pass, dispatches execute in
+order and each one's storage writes are visible to the next, so dab `n+1`
+reads dab `n`'s output through the same texture with no copy and no pass
+boundary.
+
+**Why it was dismissed before, and why that was not a measurement.** This is
+option B.1 above, written off as "brings back the per-dispatch overhead we
+paid (#2) to eliminate; probably worse than #3". Two premises under that
+line were never tested:
+
+1. That a dispatch inside one compute pass costs what a render pass costs.
+   #2 removed per-*render-pass* overhead (attachment load/store, pass
+   begin/end, bind-group rebinding); per-dispatch overhead inside a pass
+   was never measured anywhere in this doc. The smudge baseline in section
+   E puts one pass plus one copy at roughly 40 us per dab on the test iGPU;
+   a dispatch plus the barrier wgpu inserts between dispatches should be a
+   different order of magnitude, but "should" is the word to remove.
+2. That the scratch must be a buffer, so the shape pays #3's texture-to-
+   buffer round trip over the union bbox. A read-write storage texture
+   removes the round trip: no `sync_in`, no `sync_out`, the scratch is
+   simply resident. The cost model above did not consider that format.
+
+**What it would unify if it holds.** Every accumulation law becomes shader
+code applied per dab against the live ground: the wash ceiling that
+`composite.wgsl` already runs across strokes would run per dab within the
+stroke too (for one pigment it reproduces the max blend exactly, for
+varying colour it does not fringe), build-up is source-over, a smear is a
+read at an offset, watercolor's deposit is a field the shader reads. The
+build channel, the max blend, the read-mirror loop and its copies, and
+the "must stay on build-up" caveats all go. The instanced-versus-serialized
+branch goes with them, because there is one path.
+
+**Cost axes, predicted (to be replaced by measurement):** per-event cost
+scales with `dab_count` (one dispatch each) plus `sum(dab_area)` (threads),
+the same area term as #4. The catastrophe regime, if any, is the same as
+#1's: many dabs per event, if per-dispatch overhead is not small.
+
+**Decision gate, written before the run.** The spike keeps up (`behind_by_ms`
+within noise of #4) on 3840x2160 at radius 1 (about 916 dabs per event) and
+on the 1920x1080 rows at radius 1 and 10. If it does, the paint terminal
+moves to this shape and the terminals above consolidate onto it. If it
+does not, the fallback is the hybrid from section E with #4 kept only for
+the one law fixed-function blending does exactly, and this section records
+the numbers that closed the door.
+
+**Spike shape.** A throwaway terminal, source-over only, with a hand-written
+compute shader for a soft disc (no per-brush WGSL assembly: that is the
+expensive part of the real port and is not what the gate measures), the
+`r32uint` scratch, and an unpack pass at commit into the existing RGBA8
+scratch so the normal commit runs unchanged. The unpack is one full-layer
+pass per event that the real port would fold into `composite.wgsl`; the
+bench reports it separately so the gate is judged on the dispatch cost.
+Driven through `stroke_replay_matrix` under its own topology on the same
+cells and the same recorded stroke as attempts #1 to #4. Result recorded
+here as attempt #5, kept or removed.
+
+**Status:** stage 1 (the harness, measured in isolation) passed its gate;
+see "#5, stage 1" under Attempts. Stage 2, the terminal on the replay
+matrix, is next.
 
 ## What the user proposed
 

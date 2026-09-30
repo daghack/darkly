@@ -1899,7 +1899,10 @@ fn paint_terminal_compiles_the_accumulation_dial_to_targets_and_a_body() {
     assert_eq!(mid.channels.len(), 1);
     assert_eq!(mid.channels[0].name, "build");
     assert_eq!(mid.channels[0].format, wgpu::TextureFormat::Rgba8Unorm);
-    assert_eq!(mid.channels[0].blend, PREMULTIPLIED_SOURCE_OVER);
+    assert_eq!(
+        mid.channels[0].attachment_blend(),
+        Some(PREMULTIPLIED_SOURCE_OVER)
+    );
     assert!(mid.stroke_wgsl.contains(
         "return FsOut(rgba * wash_flow * sel * 0.500000, rgba * build_flow * sel * 0.500000);"
     ));

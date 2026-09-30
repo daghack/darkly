@@ -65,7 +65,9 @@ const MAX_UNIFORM_BYTES: usize = 1024;
 const BUILD_CHANNEL: crate::brush::scratch::StrokeChannel = crate::brush::scratch::StrokeChannel {
     name: "build",
     format: wgpu::TextureFormat::Rgba8Unorm,
-    blend: crate::brush::node::PREMULTIPLIED_SOURCE_OVER,
+    kind: crate::brush::scratch::ChannelUse::Attachment {
+        blend: crate::brush::node::PREMULTIPLIED_SOURCE_OVER,
+    },
 };
 
 /// How much of each dab goes to each half, from the `buildup` dial.
@@ -673,6 +675,7 @@ impl BrushNodeEvaluator for PaintEvaluator {
         });
 
         gpu.perf.record_dab_flush(total_dabs);
+        gpu.perf.record_dispatches(1);
     }
 
     fn commit(&self, ctx: &EvalContext, gpu: &mut BrushGpuContext) {

@@ -118,10 +118,40 @@ pub struct StrokeChannel {
     /// WGSL identifier for the `FsOut` field, and the debug label stem.
     pub name: &'static str,
     pub format: wgpu::TextureFormat,
-    /// How the blend unit folds each dab's contribution into the running
-    /// value.  Source-over gives `1 − Π(1−aᵢ)`, which is order-invariant
-    /// and therefore immune to how dabs are grouped into draws.
-    pub blend: wgpu::BlendState,
+    /// How the terminal writes the channel: as a colour attachment under a
+    /// blend law, or as a storage texture from a compute pass.
+    pub kind: ChannelUse,
+}
+
+/// How a terminal writes a [`StrokeChannel`].
+///
+/// The framework's bookkeeping (allocate with the write side, clear at
+/// stroke start and every rewind boundary, checkpoint, restore, grow) is
+/// the same for both; what differs is the texture's usage and whether the
+/// channel is a colour target of the terminal's draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelUse {
+    /// A colour attachment on the terminal's instanced draw, folded by the
+    /// blend unit under `blend`.  Source-over gives `1 - prod(1 - a_i)`,
+    /// which is order-invariant and therefore immune to how dabs are
+    /// grouped into draws.  Readable from a pass that does not target it
+    /// through [`Scratch::channel_bind_group`].
+    Attachment { blend: wgpu::BlendState },
+    /// A read-write storage texture written by a compute pass.  Not a
+    /// colour target of any draw, so it contributes no `FsOut` field and
+    /// no canvas-copy bind group (a non-float format cannot satisfy that
+    /// layout); the terminal binds it through [`Scratch::channel_view`].
+    Storage,
+}
+
+impl StrokeChannel {
+    /// The blend law when the channel is a colour attachment.
+    pub fn attachment_blend(&self) -> Option<wgpu::BlendState> {
+        match self.kind {
+            ChannelUse::Attachment { blend } => Some(blend),
+            ChannelUse::Storage => None,
+        }
+    }
 }
 
 /// The allocated realization of a terminal's declared channels.
@@ -143,8 +173,9 @@ struct StrokeChannels {
     /// off its render pass after [`Scratch::write_view`].
     views: Vec<wgpu::TextureView>,
     /// Canvas-copy bind groups, in declaration order: what a pass that
-    /// does not target a channel binds to read it.
-    bind_groups: Vec<wgpu::BindGroup>,
+    /// does not target a channel binds to read it.  `None` for a storage
+    /// channel, whose format the canvas-copy layout cannot sample.
+    bind_groups: Vec<Option<wgpu::BindGroup>>,
 }
 
 impl Scratch {
@@ -278,7 +309,16 @@ impl Scratch {
     pub fn channel_bind_group(&self, name: &str) -> Option<&wgpu::BindGroup> {
         let channels = self.channels.as_ref()?;
         let i = channels.declared.iter().position(|c| c.name == name)?;
-        channels.bind_groups.get(i)
+        channels.bind_groups.get(i)?.as_ref()
+    }
+
+    /// The view of the channel a terminal declared under `name`, for a
+    /// terminal that binds it itself (a storage channel written from a
+    /// compute pass).  By name, like [`Scratch::channel_bind_group`].
+    pub fn channel_view(&self, name: &str) -> Option<&wgpu::TextureView> {
+        let channels = self.channels.as_ref()?;
+        let i = channels.declared.iter().position(|c| c.name == name)?;
+        channels.views.get(i)
     }
 
     /// Colour attachments for a per-dab pass: the write side first, then
@@ -626,6 +666,15 @@ fn build_channels(
     let mut bind_groups = Vec::with_capacity(declared.len());
 
     for channel in declared {
+        // Every channel keeps `RENDER_ATTACHMENT` so the framework's clear
+        // pass can clear it as an attachment, whatever writes it later.
+        let mut usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::TEXTURE_BINDING;
+        if channel.kind == ChannelUse::Storage {
+            usage |= wgpu::TextureUsages::STORAGE_BINDING;
+        }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("scratch-channel-{}", channel.name)),
             size: wgpu::Extent3d {
@@ -637,20 +686,20 @@ fn build_channels(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: channel.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        bind_groups.push(canvas_copy_bind_group(
-            device,
-            canvas_copy_bgl,
-            &format!("scratch-channel-{}-bg", channel.name),
-            &view,
-            sampler,
-        ));
+        bind_groups.push(match channel.kind {
+            ChannelUse::Attachment { .. } => Some(canvas_copy_bind_group(
+                device,
+                canvas_copy_bgl,
+                &format!("scratch-channel-{}-bg", channel.name),
+                &view,
+                sampler,
+            )),
+            ChannelUse::Storage => None,
+        });
         views.push(view);
         textures.push(texture);
     }

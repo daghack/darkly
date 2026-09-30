@@ -7,7 +7,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --release --bin stroke_replay_matrix -- \
+//! cargo run --release -p darkly --features testing --bin stroke_replay_matrix -- \
 //!     --input crates/darkly/tests/fixtures/recorded_curvy_stroke.json
 //! ```
 //!
@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use darkly::brush::builtin_brushes;
+use darkly::brush::portable::PortableBrush;
 use darkly::engine::DarklyEngine;
 use darkly::format::stroke_recording::{replay, ReplayPacing, StrokeRecording};
 use darkly::gpu::context::GpuContext;
@@ -58,6 +59,11 @@ const BRUSH_NAME_WATERCOLOR: &str = "Smooth Watercolor";
 const BRUSH_NAME_ROUGH_INK: &str = "Rough Ink";
 const BRUSH_NAME_SMUDGE: &str = "Smudge";
 const BRUSH_NAME_LIQUIFY: &str = "Liquify";
+const BRUSH_NAME_DISPATCH_SPIKE: &str = "Ink Pen (dispatch spike)";
+/// The Ink Pen with its terminal swapped for the spike; a fixture rather
+/// than a builtin so nothing shipped carries the measurement vehicle.
+const DISPATCH_SPIKE_FIXTURE: &str =
+    include_str!("../../tests/fixtures/ink_pen_dispatch_spike.yaml");
 
 /// Stabilizer strength override. The recorded stroke is what stresses
 /// the stabilizer; cranking this to 1.0 maximises the rewind workload.
@@ -92,6 +98,12 @@ enum Topology {
     /// per-dab regime scales with displacement padding (larger read
     /// footprint vs. smudge).
     Liquify,
+    /// The Ink Pen graph terminating in `paint_dispatch_spike`: one
+    /// compute dispatch per dab inside one compute pass, against a
+    /// stroke-resident `r32uint` ground. Attempt #5 of
+    /// `docs/paint-compute-perf-tracking.md`; the brush is a test
+    /// fixture, not a builtin.
+    PaintDispatchSpike,
 }
 
 impl Topology {
@@ -102,6 +114,7 @@ impl Topology {
             "rough-ink" | "rough_ink" | "compiled" => Some(Topology::RoughInk),
             "smudge" => Some(Topology::Smudge),
             "liquify" => Some(Topology::Liquify),
+            "paint-dispatch-spike" | "spike" => Some(Topology::PaintDispatchSpike),
             _ => None,
         }
     }
@@ -113,6 +126,7 @@ impl Topology {
             Topology::RoughInk => "rough-ink",
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
+            Topology::PaintDispatchSpike => "paint-dispatch-spike",
         }
     }
 
@@ -125,6 +139,7 @@ impl Topology {
             Topology::RoughInk => "paint",
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
+            Topology::PaintDispatchSpike => "paint_dispatch_spike",
         }
     }
 
@@ -135,7 +150,24 @@ impl Topology {
             Topology::RoughInk => BRUSH_NAME_ROUGH_INK,
             Topology::Smudge => BRUSH_NAME_SMUDGE,
             Topology::Liquify => BRUSH_NAME_LIQUIFY,
+            Topology::PaintDispatchSpike => BRUSH_NAME_DISPATCH_SPIKE,
         }
+    }
+
+    /// The topology's brush: a builtin by name, or the spike's fixture.
+    fn brush(self) -> darkly::brush::metadata::Brush {
+        if self == Topology::PaintDispatchSpike {
+            let portable: PortableBrush =
+                serde_yaml_ng::from_str(DISPATCH_SPIKE_FIXTURE).expect("spike fixture parses");
+            return portable
+                .into_brush(darkly::brush::registry(), "paint-dispatch-spike")
+                .expect("spike fixture builds");
+        }
+        let brush_name = self.brush_name();
+        builtin_brushes::all()
+            .into_iter()
+            .find(|b| b.metadata.name == brush_name)
+            .unwrap_or_else(|| panic!("brush `{brush_name}` not found in builtin_brushes::all()"))
     }
 }
 
@@ -164,17 +196,22 @@ fn parse_args() -> Args {
             "--topology" | "-t" => {
                 let v = argv.next().expect("--topology requires a value");
                 topology = Topology::parse(&v).unwrap_or_else(|| {
-                    panic!("unknown topology `{v}`, expected `paint`, `watercolor`, or `rough-ink`")
+                    panic!(
+                        "unknown topology `{v}`, expected `paint`, `watercolor`, `rough-ink`, \
+                         `smudge`, `liquify`, or `paint-dispatch-spike`"
+                    )
                 });
             }
             "-h" | "--help" => {
                 eprintln!(
                     "stroke_replay_matrix --input <path> [--output <tsv>] \
-                     [--topology paint|watercolor|rough-ink]\n\n\
+                     [--topology paint|watercolor|rough-ink|smudge|liquify|paint-dispatch-spike]\n\n\
                      Replays a recording across the configured (dab_radius × resolution) matrix.\n\
                      Axes are constants at the top of stroke_replay_matrix.rs.\n\
                      `paint` = Ink Pen (compiled). `watercolor` = Smooth Watercolor (compiled).\n\
-                     `rough-ink` = the demo brush with the upstream random graph."
+                     `rough-ink` = the demo brush with the upstream random graph.\n\
+                     `smudge` / `liquify` = the read-mirror terminals, one pass per dab.\n\
+                     `paint-dispatch-spike` = the Ink Pen on the dispatch-per-dab spike terminal."
                 );
                 std::process::exit(0);
             }
@@ -196,11 +233,7 @@ fn parse_args() -> Args {
 /// Load the topology's built-in brush, override its terminal's `size`
 /// port and the `pen_input` stabilizer.
 fn brush_graph_json(topology: Topology, dab_radius_px: f32) -> String {
-    let brush_name = topology.brush_name();
-    let mut brush = builtin_brushes::all()
-        .into_iter()
-        .find(|b| b.metadata.name == brush_name)
-        .unwrap_or_else(|| panic!("brush `{brush_name}` not found in builtin_brushes::all()"));
+    let mut brush = topology.brush();
     let pen_id = darkly::brush::nodes::brush_settings::node_id(&brush.metadata.graph)
         .expect("brush must have a pen_input node");
     let graph = &mut brush.metadata.graph;
@@ -220,6 +253,8 @@ fn brush_graph_json(topology: Topology, dab_radius_px: f32) -> String {
 
 #[derive(Debug)]
 struct CellResult {
+    /// The adapter the cell ran on, so a results file names its hardware.
+    adapter: String,
     canvas: (u32, u32),
     dab_radius_px: f32,
     event_count: u32,
@@ -243,6 +278,9 @@ struct CellResult {
     /// discriminates spacing regimes; `bbox_area/ev` carries the union-
     /// bbox shape that mattered for the compute round-trip (and stays
     /// interesting for the fragment path's overdraw cost).
+    flushes_per_event_avg: f64,
+    /// Draws or compute dispatches into the scratch per event: one per
+    /// flush for an instanced terminal, one per dab for a serialized one.
     dispatches_per_event_avg: f64,
     dabs_per_event_avg: f64,
     union_bbox_area_per_event_avg: f64,
@@ -270,6 +308,11 @@ fn run_cell(
 ) -> CellResult {
     let graph_json = brush_graph_json(topology, dab_radius_px);
     let (device, queue) = bench_device();
+    let info = device.adapter_info();
+    let adapter = format!(
+        "{} ({:?}, {} {})",
+        info.name, info.backend, info.driver, info.driver_info
+    );
     let gpu = GpuContext::new_headless(device, queue);
     let mut engine = DarklyEngine::new(gpu, canvas.0, canvas.1);
     engine
@@ -311,8 +354,10 @@ fn run_cell(
     submit_us.sort_unstable();
 
     let total_events = timings.len().max(1) as f64;
-    let dispatches_per_event_avg =
+    let flushes_per_event_avg =
         timings.iter().map(|t| t.dab_flushes as f64).sum::<f64>() / total_events;
+    let dispatches_per_event_avg =
+        timings.iter().map(|t| t.dispatches as f64).sum::<f64>() / total_events;
     let dabs_per_event_avg =
         timings.iter().map(|t| t.dabs_total as f64).sum::<f64>() / total_events;
     let union_bbox_area_per_event_avg = timings
@@ -322,6 +367,7 @@ fn run_cell(
         / total_events;
 
     CellResult {
+        adapter,
         canvas,
         dab_radius_px,
         event_count: timings.len() as u32,
@@ -335,6 +381,7 @@ fn run_cell(
         submit_median_us: percentile(&submit_us, 0.5),
         submit_p95_us: percentile(&submit_us, 0.95),
         submit_max_us: *submit_us.last().unwrap_or(&0),
+        flushes_per_event_avg,
         dispatches_per_event_avg,
         dabs_per_event_avg,
         union_bbox_area_per_event_avg,
@@ -386,7 +433,7 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
          wall_total_ms\tbehind_by_ms\tmax_event_behind_ms\t\
          cpu_median_us\tcpu_p95_us\tcpu_max_us\t\
          submit_median_us\tsubmit_p95_us\tsubmit_max_us\t\
-         dispatches_per_event_avg\tdabs_per_event_avg\tunion_bbox_area_per_event_avg"
+         flushes_per_event_avg\tdispatches_per_event_avg\tdabs_per_event_avg\tunion_bbox_area_per_event_avg"
     )?;
     for r in results {
         writeln!(
@@ -394,7 +441,7 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
             "{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t\
              {:.2}\t{:.2}\t{}\t\
              {:.2}\t{:.2}\t{}\t\
-             {:.3}\t{:.3}\t{:.0}",
+             {:.3}\t{:.3}\t{:.3}\t{:.0}",
             r.canvas.0,
             r.canvas.1,
             r.dab_radius_px,
@@ -409,6 +456,7 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
             r.submit_median_us,
             r.submit_p95_us,
             r.submit_max_us,
+            r.flushes_per_event_avg,
             r.dispatches_per_event_avg,
             r.dabs_per_event_avg,
             r.union_bbox_area_per_event_avg,
@@ -429,6 +477,10 @@ fn write_markdown(
     let mut file = fs::File::create(path)?;
     writeln!(file, "# stroke_replay_matrix: `{}`", topology.slug())?;
     writeln!(file)?;
+    if let Some(first) = results.first() {
+        writeln!(file, "Adapter: {}.", first.adapter)?;
+        writeln!(file)?;
+    }
     writeln!(
         file,
         "Brush: `{}` topology `{}` (terminal: `{}`, stabilize=`{STABILIZE}`). \
@@ -450,8 +502,11 @@ fn write_markdown(
         file,
         "Markdown carries the slim view; the sibling TSV has p95/max for every column. \
          `submit` is host wall-clock around `queue.submit()`: high values indicate \
-         back-pressure. `dispatches/ev`, `dabs/ev`, `bbox/ev` are per-event averages \
-         of the workload the engine fed the GPU. The 6-slot GPU-timestamp columns \
+         back-pressure. `flushes/ev`, `dispatches/ev`, `dabs/ev`, `bbox/ev` are \
+         per-event averages of the workload the engine fed the GPU: flushes are \
+         `flush_dabs` calls, dispatches are draws or compute dispatches into the \
+         scratch (one per flush for an instanced terminal, one per dab for a \
+         serialized one). The 6-slot GPU-timestamp columns \
          (`gpu_shader` / `gpu_sync_in` / `gpu_sync_out`) that the older matrices \
          carried are gone; they instrumented the compute-path buffer round-trip, \
          which the `paint` terminal no longer pays."
@@ -460,16 +515,16 @@ fn write_markdown(
     writeln!(
         file,
         "| canvas | radius_px | events | wall (ms) | behind (ms) | worst-frame (ms) | \
-         cpu p50 (µs) | submit p50 (µs) | dispatches/ev | dabs/ev | bbox px²/ev |"
+         cpu p50 (µs) | submit p50 (µs) | flushes/ev | dispatches/ev | dabs/ev | bbox px²/ev |"
     )?;
     writeln!(
         file,
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )?;
     for r in results {
         writeln!(
             file,
-            "| {}×{} | {} | {} | {:.0} | {:+.0} | {:.1} | {:.0} | {:.0} | {:.2} | {:.1} | {:.0} |",
+            "| {}×{} | {} | {} | {:.0} | {:+.0} | {:.1} | {:.0} | {:.0} | {:.2} | {:.1} | {:.1} | {:.0} |",
             r.canvas.0,
             r.canvas.1,
             r.dab_radius_px,
@@ -479,6 +534,7 @@ fn write_markdown(
             r.max_event_behind_ms,
             r.cpu_median_us,
             r.submit_median_us,
+            r.flushes_per_event_avg,
             r.dispatches_per_event_avg,
             r.dabs_per_event_avg,
             r.union_bbox_area_per_event_avg,

@@ -336,9 +336,19 @@ spending. Redo the production / tests / generated split per stage.
 6. Bench doc-comment and help-text fixes as listed under 8.
 
 
-**Status:** stage 1 implemented and run; gate met (6.5 ms at N = 900, 7.2 us
-per dispatch, barrier free). Recorded as "#5, stage 1" in
-`docs/paint-compute-perf-tracking.md`. Stage 2 awaits approval.
+**Status:** both stages implemented and run. Stage 1: gate met (6.5 ms at
+N = 900, 7.2 us per dispatch, barrier free). Stage 2: gate met on the replay
+matrix (+16 ms against `paint`'s +6 at 4K r = 1; +15 and +12 against +4 at
+1080p); one regime marked where the fragment path wins (dabs of 1000 px
+and more at 4K, about 2x per pixel on the test iGPU). Recorded as "#5,
+stage 1" and "#5, stage 2" in `docs/paint-compute-perf-tracking.md`. The
+spike stays behind its bench topology until the port replaces it.
+Deviations from the plan during implementation: the dispatch grid covers
+the layer-clamped footprint (the ledger's rect) rather than the raw
+bounding box, since the rasterizer clips `paint`'s quad for free; the
+parity test compares in premultiplied space, because the straight-alpha
+readback un-premultiplies edge texels into full-range colour noise; its
+tolerance is 4 LSB and 5% beyond 1 LSB, from the measured histogram.
 
 A measurement spike, not a feature. It builds the smallest throwaway
 terminal that has the shape section F of

@@ -168,14 +168,24 @@ impl CompiledBrush {
             blend: Some(self.dab_blend),
             write_mask: wgpu::ColorWrites::ALL,
         })
-        .chain(self.channels.iter().map(|c| wgpu::ColorTargetState {
-            format: c.format,
-            blend: Some(c.blend),
-            write_mask: wgpu::ColorWrites::ALL,
-        }))
+        .chain(
+            attachment_channels(&self.channels).map(|c| wgpu::ColorTargetState {
+                format: c.format,
+                blend: c.attachment_blend(),
+                write_mask: wgpu::ColorWrites::ALL,
+            }),
+        )
         .map(Some)
         .collect()
     }
+}
+
+/// The channels that are colour targets of the terminal's draw: every
+/// declared channel except the storage ones a compute pass writes.
+fn attachment_channels(
+    channels: &[crate::brush::scratch::StrokeChannel],
+) -> impl Iterator<Item = &crate::brush::scratch::StrokeChannel> {
+    channels.iter().filter(|c| c.attachment_blend().is_some())
 }
 
 impl std::fmt::Debug for CompiledBrush {
@@ -1002,13 +1012,17 @@ fn assemble_shader(
     // same draw, so `fs_main` returns a struct instead of a bare vec4.
     // The terminal's pipeline declares one colour target per output, in
     // the same order, each with its own blend law.
-    if channels.is_empty() {
+    // A storage channel is written by a compute pass, not by this draw,
+    // so it is neither an `FsOut` field nor a colour target.
+    let attachments: Vec<&crate::brush::scratch::StrokeChannel> =
+        attachment_channels(channels).collect();
+    if attachments.is_empty() {
         out.push_str("@fragment\n");
         out.push_str("fn fs_main(in: VsOut) -> @location(0) vec4<f32> {\n");
     } else {
         out.push_str("struct FsOut {\n");
         out.push_str("    @location(0) color: vec4<f32>,\n");
-        for (i, channel) in channels.iter().enumerate() {
+        for (i, channel) in attachments.iter().enumerate() {
             out.push_str(&format!(
                 "    @location({}) {}: vec4<f32>,\n",
                 i + 1,

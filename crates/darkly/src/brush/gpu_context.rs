@@ -72,6 +72,10 @@ pub struct BrushPerfCounters {
     pub dab_flushes: u32,
     /// Total dabs that flowed through a dab-batching terminal.
     pub flushed_dabs: u32,
+    /// Draw calls or compute dispatches a terminal issued into the stroke
+    /// scratch, summed over flushes: one per flush for an instanced draw,
+    /// one per dab for a serialized terminal.
+    pub dispatches: u32,
     /// Sum of `union_w * union_h` across every dab flush.
     pub dab_union_bbox_area: u64,
     /// Per-flush dab counts. One entry per `flush_dabs` call. Drained
@@ -93,6 +97,12 @@ impl BrushPerfCounters {
     pub fn record_dab_flush(&mut self, dab_count: u32) {
         self.flushed_dabs = self.flushed_dabs.saturating_add(dab_count);
         self.dab_flushes = self.dab_flushes.saturating_add(1);
+    }
+
+    /// Record how many draws or dispatches a flush issued into the
+    /// scratch.
+    pub fn record_dispatches(&mut self, n: u32) {
+        self.dispatches = self.dispatches.saturating_add(n);
     }
 
     /// Record the workload shape of one dab flush: `dab_count` queued
@@ -119,6 +129,7 @@ impl std::ops::AddAssign for BrushPerfCounters {
         self.submits = self.submits.saturating_add(rhs.submits);
         self.dab_flushes = self.dab_flushes.saturating_add(rhs.dab_flushes);
         self.flushed_dabs = self.flushed_dabs.saturating_add(rhs.flushed_dabs);
+        self.dispatches = self.dispatches.saturating_add(rhs.dispatches);
         self.dab_union_bbox_area = self
             .dab_union_bbox_area
             .saturating_add(rhs.dab_union_bbox_area);

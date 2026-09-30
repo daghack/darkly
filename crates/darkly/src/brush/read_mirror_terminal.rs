@@ -601,6 +601,7 @@ pub fn flush_dabs<T: ReadMirrorTerminal>(gpu: &mut BrushGpuContext) {
     });
 
     gpu.perf.record_dab_flush(total_dabs);
+    gpu.perf.record_dispatches(total_dabs);
 }
 
 /// Scratch → layer. `gpu.blend_mode` is ignored, since erase semantics

@@ -64,7 +64,7 @@ use crate::brush::paint_target_ext::BrushPaintTargetExt;
 use crate::brush::pipeline::{
     BrushPipelineEntry, BrushPipelineRegistration, BuildContext, DynamicUniformRing,
 };
-use crate::brush::scratch::StrokeChannel;
+use crate::brush::scratch::{ChannelUse, StrokeChannel};
 use crate::brush::wgsl::{
     pack_intrinsic_uniforms, pack_uniforms, CompileWgslCtx, CompiledBrush, NodeWgsl, WgslType,
     INTRINSIC_UNIFORMS_SIZE,
@@ -109,16 +109,18 @@ const MAX_UNIFORM_BYTES: usize = 1024;
 const DEPOSIT_CHANNEL: StrokeChannel = StrokeChannel {
     name: "deposit",
     format: wgpu::TextureFormat::R8Unorm,
-    blend: wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-        alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
+    kind: ChannelUse::Attachment {
+        blend: wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
         },
     },
 };
@@ -1083,6 +1085,9 @@ impl BrushNodeEvaluator for WatercolorEvaluator {
         });
 
         gpu.perf.record_dab_flush(total_dabs);
+        // The pickup probes draw into the atlas; only the composites draw
+        // into the scratch.
+        gpu.perf.record_dispatches(total_dabs);
     }
 
     fn commit(&self, ctx: &EvalContext, gpu: &mut BrushGpuContext) {

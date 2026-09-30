@@ -145,6 +145,10 @@ pub struct EventTiming {
     pub dab_flushes: u32,
     /// Dabs that flowed through any dab terminal during the event.
     pub dabs_total: u32,
+    /// Draws or compute dispatches issued into the scratch during the
+    /// event: one per flush for an instanced terminal, one per dab for a
+    /// serialized one.
+    pub dispatches: u32,
     /// Sum of `union_w * union_h` across every flush of the event.
     pub union_bbox_area_total: u64,
     /// Per-flush dab counts (one entry per flush).
@@ -219,6 +223,7 @@ pub fn replay(
             submits: perf.submits,
             dab_flushes: perf.dab_flushes,
             dabs_total: perf.flushed_dabs.min(u32::MAX as u64) as u32,
+            dispatches: perf.dispatches,
             union_bbox_area_total: perf.dab_union_bbox_area_total,
             dabs_per_flush: perf.dabs_per_flush,
             dab_union_bbox_area_per_flush: perf.dab_union_bbox_area_per_flush,
@@ -241,6 +246,7 @@ pub fn replay(
         last.dabs_total = last
             .dabs_total
             .saturating_add(tail_perf.flushed_dabs.min(u32::MAX as u64) as u32);
+        last.dispatches = last.dispatches.saturating_add(tail_perf.dispatches);
         last.union_bbox_area_total = last
             .union_bbox_area_total
             .saturating_add(tail_perf.dab_union_bbox_area_total);

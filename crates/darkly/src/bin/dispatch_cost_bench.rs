@@ -56,10 +56,21 @@ use darkly::gpu::test_utils::bench_device;
 
 const TARGET_W: u32 = 3840;
 const TARGET_H: u32 = 2160;
-const DAB_COUNTS: [u32; 3] = [300, 900, 2000];
-/// Dab radii in pixels: a 3x3 footprint (one 8x8 workgroup) and a radius
-/// that spans a 3x3 grid of workgroups.
-const RADII: [f32; 2] = [1.5, 10.0];
+/// The cells, as `(radius_px, dab_count)`. The small radii (a 3x3
+/// footprint in one workgroup, and a 3x3 grid of workgroups) at the
+/// matrix's many-dabs-per-event counts measure per-dispatch overhead; the
+/// large radius at the matrix's few-dabs-per-event counts measures the
+/// thread-per-pixel cost of a dab that covers most of a 4K canvas.
+const CELLS: [(f32, u32); 8] = [
+    (1.5, 300),
+    (1.5, 900),
+    (1.5, 2000),
+    (10.0, 300),
+    (10.0, 900),
+    (10.0, 2000),
+    (1000.0, 5),
+    (1000.0, 10),
+];
 const ITERATIONS: usize = 20;
 /// Untimed iterations of every shape before a cell is timed.
 const WARMUP: usize = 5;
@@ -249,8 +260,8 @@ fn main() {
     line("|---:|---:|---|---:|---:|---:|---:|---:|---:|".into());
 
     let shapes = [Shape::DispatchRw, Shape::DispatchRo, Shape::RenderPass];
-    for &radius in &RADII {
-        for &n in &DAB_COUNTS {
+    for &(radius, n) in &CELLS {
+        {
             let dabs = scatter(n, radius);
             let parity = gpu.parity(&dabs);
             // Untimed warm-up so the first timed iteration does not pay
@@ -319,7 +330,8 @@ fn scatter(n: u32, radius: f32) -> Vec<Dab> {
             .wrapping_add(1442695040888963407);
         ((state >> 33) as f64) / ((1u64 << 31) as f64)
     };
-    let margin = radius.ceil() + 2.0;
+    // Large dabs may hang off the target; the shader clips them.
+    let margin = (radius.ceil() + 2.0).min(TARGET_H as f32 / 2.0 - 8.0);
     (0..n)
         .map(|i| {
             let x = margin + next() as f32 * (TARGET_W as f32 - 2.0 * margin);

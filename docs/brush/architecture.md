@@ -120,57 +120,69 @@ For a deeper trace look at
 
 ## How dabs accumulate in the scratch
 
-The scratch is written by one instanced draw per flush, so the law that
-combines overlapping dabs is a *blend state*, not shader code. Two exist,
-both in [`brush/node.rs`](../../crates/darkly/src/brush/node.rs).
+The `paint` terminal writes the scratch from one compute dispatch per dab,
+one thread per pixel of the dab's layer-clamped footprint, so the law that
+combines overlapping dabs is *shader code* applied against the live ground:
+each thread loads its texel, folds the dab in, and stores it. The scratch
+is a packed ground (`PACKED_GROUND_FORMAT`, premultiplied RGBA8 in one
+`r32uint` texel) because core WebGPU reads and writes storage only in the
+32-bit single-channel formats. Dispatches in a pass are ordered and a
+dispatch's stores are visible to the next, so every dab sees the previous
+dab's output. Two laws exist, both in
+[`shaders/brush/paint_accumulate.wgsl`](../../crates/darkly/shaders/brush/paint_accumulate.wgsl),
+which the terminal emits into every brush it ends.
 
-**`PREMULTIPLIED_SOURCE_OVER`** composites each dab over the last.
-Coverage accumulates as `1 - prod(1 - a_i)`, so a pixel's density rises
-with however many dabs the spacing happened to stack on it. Its density is
-therefore a function of `spacing`, not only of pressure: the Pencil
-measured 0.714 peak alpha at `spacing: 0.10` and 0.984 at `spacing: 0.01`,
-same path, same pressure.
+**`accumulate_build`** composites each dab over the last (premultiplied
+source-over). Coverage accumulates as `1 - prod(1 - a_i)`, so a pixel's
+density rises with however many dabs the spacing happened to stack on it.
+Its density is therefore a function of `spacing`, not only of pressure: the
+Pencil measured 0.714 peak alpha at `spacing: 0.10` and 0.984 at
+`spacing: 0.01`, same path, same pressure.
 
-**`COVERAGE_CEILING`** uses `BlendOperation::Max` instead, so a pixel takes
-its strongest dab rather than the sum of its dabs. A stroke cannot darken
-itself by crossing back over its own path, density stops depending on
-spacing (identical to the byte across a 30x spacing spread), and pressure
-becomes the only thing setting it.
+**`accumulate_wash`** applies the deposit ceiling (below, "How the commit
+decides") per dab against the live ground, so a pixel takes its strongest
+dab rather than the sum of its dabs. For one pigment this is exactly a
+per-pixel maximum of coverage: a dab no stronger than what is already
+there finds no room and changes nothing, bit for bit, and a stronger one
+re-targets the pixel to its own coverage. A stroke cannot darken itself by
+crossing back over its own path, density stops depending on spacing
+(identical to the byte across a 30x spacing spread), and pressure becomes
+the only thing setting it.
 
 ### The accumulation dial
 
-A blend state cannot be interpolated: fixed-function blending offers one
-equation per attachment with no midpoint between `Add` and `Max`, and
-WebGPU has no framebuffer fetch, so no single attachment can be made to
-accumulate part-way between the two. What *is* continuous is the input.
+The commit lays the wash slot through the ceiling and the build slot over
+it, and a single ground mixing both halves could not be split there, so
+there is no midpoint between the two laws. What *is* continuous is the
+input.
 
 The `paint` terminal's `buildup` port is a scalar in `[0, 1]`, and the
 share it names splits every dab between two accumulations that each run
 one law untouched:
 
-| `buildup` | the scratch | second accumulation | the dab |
+| `buildup` | the scratch (the ground) | second accumulation | the dab |
 | --- | --- | --- | --- |
-| `0` | `COVERAGE_CEILING` | none | all of it washes |
-| `1` | `PREMULTIPLIED_SOURCE_OVER` | none | all of it stacks |
-| between | `COVERAGE_CEILING` | `build` (`Rgba8Unorm`, source-over) | `1 - b` washes, `b` stacks |
+| `0` | `accumulate_wash` | none | all of it washes |
+| `1` | `accumulate_build` | none | all of it stacks |
+| between | `accumulate_wash` | `build` (a second packed ground, `accumulate_build`) | `1 - b` washes, `b` stacks |
 
-Both halves ride the one instanced draw as two colour attachments, so 1px
-spacing stays as affordable as it was, and a brush at either end declares
-no channel and pays nothing. The port is stroke-constant: its value picks
-blend states and colour targets when the brush compiles, so no per-dab wire
+Both halves ride the one dispatch as two storage textures, so 1px spacing
+stays as affordable as it was, and a brush at either end declares no
+channel and pays nothing. The port is stroke-constant: its value picks the
+laws and the storage bindings when the brush compiles, so no per-dab wire
 can drive it, and `PortDef::stroke_constant` is what says so.
 
 Each half has its own per-dab intensity, `wash_flow` ("Flow (Wash)") and
 `build_flow` ("Flow (Build-up)"), so an author can scale one without the
 other. They matter because the two ends deposit different amounts on
-untouched ground: `Max` takes one dab where source-over stacks every dab
-that lands, which at 1px spacing is tens of them. A pass on fresh ground
-therefore darkens as the dial rises (measured on the Pencil at pressure
-0.7, darkest over white: 149 / 74 / 30 / 9 / 1 across the dial), and
-lowering `build_flow` against `wash_flow` is how a brush holds it level.
-The terminal does not correct it automatically: the only correction that
-would is a per-dab normalisation by the overlap count, and that removes
-the per-dab stacking the top of the dial exists to provide.
+untouched ground: the ceiling takes one dab where source-over stacks every
+dab that lands, which at 1px spacing is tens of them. A pass on fresh
+ground therefore darkens as the dial rises (measured on the Pencil at
+pressure 0.7, darkest over white: 149 / 74 / 30 / 9 / 1 across the dial),
+and lowering `build_flow` against `wash_flow` is how a brush holds it
+level. The terminal does not correct it automatically: the only correction
+that would is a per-dab normalisation by the overlap count, and that
+removes the per-dab stacking the top of the dial exists to provide.
 
 What the dial buys is that the two places overlap can happen agree.
 Retracing a path inside one stroke and drawing a second stroke over it
@@ -181,27 +193,26 @@ compounds at both, and the commit is what keeps them in step.
 
 ### What `Wash` requires, and what it changes
 
-**One chroma per stroke.** `Max` runs per channel. For a brush whose
-`stamp.color` comes from the stroke-constant `paint_color` uniform, all
-four channels scale by the same per-dab factor, and since rounding to 8
-bits is monotone, all four take their maximum from the *same* dab, which
-is the property this relies on. A graph that varies dab colour per dab
-(via `random`, `split_color`, or an `image` tip) would take per-channel
-maxima from different dabs and would fringe; such brushes must stay on
-`Build-up`. This is not checked automatically.
+**Whole pigments, any chroma.** The ceiling deposits a dab's colour as a
+whole: room is measured along the dab's own pigment, so a graph that varies
+dab colour per dab (via `random`, `split_color`, or an `image` tip) lays
+each colour down intact, and a later pigment far from an earlier one finds
+room and replaces it rather than fringing. (The `Max` blend state the
+instanced terminal ran took each channel's maximum from a different dab,
+which is why such brushes once had to stay on `Build-up`.)
 
-**Canvas-space fields survive; dab-space fields do not.** Anything fixed
-per canvas pixel factors straight out of the max (`max_i(g(x) * k_i) =
-g(x) * max_i k_i` for `g >= 0`), so canvas-space noise and the selection
-mask modulate the finished mark instead of being saturated through. That
-is an improvement for selection in particular: under source-over a
-50%-selected region still converges toward 1 as dabs accumulate, where
-under `Max` it converges to `0.5 * max a_i`, so feathering is properly
-respected. The converse is the trap: a *dab*-space field draws an
-independent sample per dab, and with 17 to 35 samples the max saturates it
-to near 1 across the whole dab interior. Dab-space grain goes inert under
-`Wash`. The Pencil's paper grain is authored in canvas space for exactly
-this reason.
+**Canvas-space fields survive; dab-space fields do not.** For one pigment
+the law is a per-pixel maximum of coverage, and anything fixed per canvas
+pixel factors straight out of it (`max_i(g(x) * k_i) = g(x) * max_i k_i`
+for `g >= 0`), so canvas-space noise and the selection mask modulate the
+finished mark instead of being saturated through. That is an improvement
+for selection in particular: under source-over a 50%-selected region still
+converges toward 1 as dabs accumulate, where under the ceiling it converges
+to `0.5 * max a_i`, so feathering is properly respected. The converse is
+the trap: a *dab*-space field draws an independent sample per dab, and with
+17 to 35 samples the max saturates it to near 1 across the whole dab
+interior. Dab-space grain goes inert under `Wash`. The Pencil's paper grain
+is authored in canvas space for exactly this reason.
 
 **Erase inherits the law.** Erase reads the same scratch
 (`composite.wgsl`'s `destination_out` branch takes `fg_a` from it), so a
@@ -212,9 +223,12 @@ deliberate.
 ### The ceiling also applies across strokes
 
 `Wash` caps overlapping deposit at both places it accumulates. The per-dab
-blend above handles one stroke's own dabs; the commit
+law above handles one stroke's own dabs; the commit
 (`shaders/brush/composite.wgsl`) caps a stroke against what the layer already
-holds. One invariant covers both: **a pixel never takes more deposit than a
+holds. Both call the same `ceiling_t`
+([`shaders/lib/deposit_ceiling.wgsl`](../../crates/darkly/shaders/lib/deposit_ceiling.wgsl)),
+one against the premultiplied ground and one against the straight-alpha
+layer. One invariant covers both: **a pixel never takes more deposit than a
 single pass over it would have laid down.**
 
 The two are different mechanisms and have to be, and the ceiling is hard at
@@ -254,8 +268,10 @@ out    = source_over(C * t, t, bg)
 
 It stays ordinary source-over, with an effective coverage computed from how
 close the pixel already is to the pigment. On untouched ground `d == reach` and
-`t == s`, the full deposit. At saturation `t == 0`. A heavier pass shrinks the
-saturation distance and reopens room, so pressure still works.
+`t == s`, the full deposit. At saturation `t == 0`, and the pixel is returned
+exactly as it was rather than re-derived through a zero-alpha source-over
+(whose division would perturb it). A heavier pass shrinks the saturation
+distance and reopens room, so pressure still works.
 
 Three properties fall out of that shape, and each was a bug in an earlier
 version of this code:
@@ -310,8 +326,8 @@ rather than silently doing nothing on opaque ground.
 
 **Erase is deliberately not capped.** `destination_out` returns before the
 ceiling, so removal stays fully accumulative across strokes and an eraser can
-always reach zero. Within a stroke the scratch's `Max` still applies, so a soft
-eraser stops punching further through on self-overlap. Deposit saturates;
+always reach zero. Within a stroke the ground's wash law still applies, so a
+soft eraser stops punching further through on self-overlap. Deposit saturates;
 removal does not.
 
 Prior art informs the shape but not the default. Krita's `KoCompositeOpGreater`
@@ -335,19 +351,29 @@ lifecycle hooks; their default impls are no-ops.
 
 ### `paint` (paint terminal)
 
-- `begin_stroke`: clears `stroke_scratch_view` to transparent.
-- `evaluate_gpu` (per dab):
-  1. `gpu.ensure_canvas_copy(rect)` copies the current *scratch* region
-     into `canvas_copy_texture`. That's the background for the shader's
-     Porter-Duff math (why we need the copy: WebGPU can't read and write
-     the same texture in one pass).
-  2. Render into `stroke_scratch_view`, reading `canvas_copy` as bg. Manual
-     source-over in `composite.wgsl`: REPLACE blend at the hardware level.
-- `commit`: source-over composite `stroke_scratch_texture` over
-  `pre_stroke_texture`, write to `layer_view`. Applies `gpu.blend_mode`
-  (paint / erase toggle).
+Its registration declares `dab_pass: DispatchPerDab` and
+`scratch_format: PACKED_GROUND_FORMAT`, which is what makes the stroke
+buffer allocate the ground as read-write storage and the assembler emit
+the compute skeleton.
 
-It bails immediately in `render_mode == Preview` at every hook.
+- `begin_stroke` (framework, `Lifecycle::ClearScratchToTransparent`):
+  clears the ground to transparent.
+- `evaluate_gpu` (per dab): records the dab's layer-clamped footprint,
+  pushes its size onto the batch's per-dab meta, and queues the dab record.
+- `flush_dabs` (per event): uploads the records once, opens one compute
+  pass, and per dab binds the dab's index through a static index buffer at
+  a dynamic offset and dispatches `ceil(w / 8) x ceil(h / 8)` workgroups
+  over the footprint. Each thread derives the footprint's corner from the
+  record exactly as the CPU did, rejects pixels off the layer and past the
+  dab's bbox, evaluates the compiled graph at the pixel centre, and stores
+  through the brush's law. Selection is sampled per dab inside the law.
+- `commit`: `commit_brush_dab` with the ground (and the build channel,
+  inside the dial) as packed foregrounds, through `composite.wgsl`'s
+  `fs_packed` entry. Applies `gpu.blend_mode` (paint / erase toggle).
+
+The hover preview is a fragment module for every terminal; `paint`'s
+preview body shows the one dab as the stroke would deposit it on blank
+ground.
 
 ### `liquify` (warp terminal)
 

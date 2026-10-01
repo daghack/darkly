@@ -103,7 +103,14 @@ fn run_begin_stroke(graph: &Graph<BrushWireType>, setup: Setup) -> Vec<u8> {
     // Compile first: the terminal's declared scratch format decides how
     // the scratch is allocated, and a warp terminal's is not colour.
     let mut runner: BrushGraphRunner = compile_graph(graph).expect("brush compiles");
-    let mut stroke_buffer = StrokeBuffer::new(&device, W, H, &pipelines, runner.scratch_format());
+    let mut stroke_buffer = StrokeBuffer::new(
+        &device,
+        W,
+        H,
+        &pipelines,
+        runner.scratch_format(),
+        runner.dab_pass(),
+    );
     // Dummy paint target: `apply_lifecycle` never reads it, but the new
     // `StrokeResources` shape requires it. Reuse the pre-stroke texture as
     // a stand-in (same RGBA8 / W×H format).

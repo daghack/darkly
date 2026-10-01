@@ -1,22 +1,35 @@
-//! Paint terminal: single-pass instanced fragment with a per-brush
+//! Paint terminal: one compute dispatch per dab with a per-brush
 //! compiled WGSL shader.
 //!
 //! ## What this terminal does
 //!
-//! Per-dab records queue up on [`BrushGpuContext::dab_batch`];
-//! one instanced render pass drains them at phase end.
+//! Per-dab records queue up on [`BrushGpuContext::dab_batch`]; one
+//! compute pass drains them at phase end, one `dispatch_workgroups` per
+//! dab over the dab's layer-clamped footprint, one thread per pixel.
 //!
-//! - **The fragment shader is generated per-brush at brush load** by
+//! - **The compute shader is generated per-brush at brush load** by
 //!   walking the upstream graph and asking each node to emit WGSL.
 //!   See [`crate::brush::wgsl`].
 //! - **The per-dab record schema is dynamic**, sized by what fields
 //!   the brush's nodes contribute. No fixed `PaintDabRecord` struct.
 //! - **The uniform buffer carries stroke-constant values** from any
 //!   upstream nodes that declared `uniform_fields` (e.g. `paint_color`).
+//! - **The ground is the stroke scratch**, a read-write `r32uint`
+//!   storage texture holding packed premultiplied RGBA8
+//!   ([`PACKED_GROUND_FORMAT`]). Each thread loads its texel, applies
+//!   the brush's accumulation law (`shaders/brush/paint_accumulate.wgsl`)
+//!   and stores it; dispatches in a pass are ordered and a dispatch's
+//!   stores are visible to the next, so every dab sees the previous
+//!   dab's output. The framework allocates, clears, checkpoints, restores
+//!   and grows the ground as it does any scratch.
+//! - **The dab index** reaches a dispatch through a static index buffer
+//!   (slot `i` holds `i`, written once at build) bound with a dynamic
+//!   offset: immediates are unavailable on the `webgpu` backend, and this
+//!   is the cheapest legal mechanism there.
 //!
 //! Upstream nodes (`circle`, `stamp`, etc.) compile inline into the
-//! fragment shader and evaluate per-fragment-per-dab, with no
-//! intermediate textures.
+//! compute shader and evaluate per-pixel-per-dab, with no intermediate
+//! textures.
 //!
 //! ## Pipeline cache
 //!
@@ -35,17 +48,19 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 
 use crate::brush::eval::{BrushNodeEvaluator, EvalContext};
 use crate::brush::gpu_context::{BrushGpuContext, MAX_DABS_PER_PHASE};
-use crate::brush::node::BrushNodeRegistration;
-use crate::brush::paint_target_ext::BrushPaintTargetExt;
+use crate::brush::node::{BrushNodeRegistration, DabPass, PACKED_GROUND_FORMAT};
+use crate::brush::paint_target_ext::{BrushPaintTargetExt, CommitForegrounds};
 use crate::brush::pipeline::{
     BrushPipelineEntry, BrushPipelineRegistration, BuildContext, DynamicUniformRing,
 };
+use crate::brush::scratch::{ChannelUse, StrokeChannel};
 use crate::brush::wgsl::{
     pack_intrinsic_uniforms, pack_uniforms, CompileWgslCtx, CompiledBrush, InputBinding, NodeWgsl,
-    INTRINSIC_UNIFORMS_SIZE,
+    DAB_WORKGROUP, GROUND_NAME, INTRINSIC_UNIFORMS_SIZE,
 };
 use crate::brush::wire::{BrushWireType, ScalarValue};
 use crate::nodegraph::{NodeRegistration, PortDef, UnitType};
@@ -55,26 +70,47 @@ use crate::nodegraph::{NodeRegistration, PortDef, UnitType};
 /// Maximum uniform buffer size we'll allocate per brush pipeline.
 const MAX_UNIFORM_BYTES: usize = 1024;
 
+/// Stride of the static dab index buffer: WebGPU's default
+/// `min_uniform_buffer_offset_alignment`, so a dynamic offset can select
+/// any slot on the web.
+const INDEX_STRIDE: u64 = 256;
+
 /// The accumulation the stacking half of a dab goes into when the brush sits
 /// strictly inside the dial. Its law is the one the original terminal always
 /// had: every dab composites over the last, so the dabs of a pass compound
-/// and a stroke builds on itself.
+/// and a stroke builds on itself. A second packed ground beside the
+/// scratch, written by the same dispatch.
 ///
 /// Declared only between the ends, where both halves exist. At either end the
 /// single scratch carries everything and no channel is allocated.
-const BUILD_CHANNEL: crate::brush::scratch::StrokeChannel = crate::brush::scratch::StrokeChannel {
+const BUILD_CHANNEL: StrokeChannel = StrokeChannel {
     name: "build",
-    format: wgpu::TextureFormat::Rgba8Unorm,
-    kind: crate::brush::scratch::ChannelUse::Attachment {
-        blend: crate::brush::node::PREMULTIPLIED_SOURCE_OVER,
-    },
+    format: PACKED_GROUND_FORMAT,
+    kind: ChannelUse::Storage,
 };
+
+/// The laws a `paint` body stores through, with the ceiling's room
+/// arithmetic they share with the commit.
+const ACCUMULATE_WGSL: &str = concat!(
+    include_str!("../../../shaders/lib/deposit_ceiling.wgsl"),
+    "\n",
+    include_str!("../../../shaders/brush/paint_accumulate.wgsl"),
+);
+
+/// Per-dab grid size, in lockstep with the dab records: the dab's
+/// layer-clamped footprint, which the dispatch covers.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DabGrid {
+    width: u32,
+    height: u32,
+}
 
 /// How much of each dab goes to each half, from the `buildup` dial.
 ///
 /// `(wash, build)`. At `0` the whole dab washes, at `1` the whole dab stacks,
 /// and between it splits. A share of exactly zero means that half does not
-/// exist for this brush: no channel, no colour target, no commit slot.
+/// exist for this brush: no channel, no storage binding, no commit slot.
 /// The upstream graph's premultiplied RGBA expression for one dab.
 ///
 /// Unwired, it falls back to opaque white modulated by the soft disc the
@@ -97,20 +133,22 @@ fn shares(buildup: f32) -> (f32, f32) {
 /// Per-brush resources built on the first `flush_dabs` call for a
 /// brush with a given `topology_hash`. Cached on [`PaintPipeline`].
 struct PerBrushPipeline {
-    /// Per-dab pipeline. The scratch is a coverage accumulator and only
+    /// Per-dab pipeline. The ground is a coverage accumulator and only
     /// paints alpha *up*; which law it accumulates under is the brush's
-    /// `buildup` choice, baked in here at build time from
-    /// [`CompiledBrush::dab_blend`]. Engine-level paint-vs-erase is a
-    /// stroke decision applied at commit by `commit_brush_dab`, not here.
-    /// (Branching the per-dab pass on `blend_mode` to a destination-out
-    /// blend was a regression: the scratch starts at (0,0,0,0), so
-    /// `dst*(1-src.a)` stays zero and the commit's `destination_out` then
-    /// sees zero alpha and no-ops.)
-    paint_pipeline: wgpu::RenderPipeline,
+    /// `buildup` choice, compiled into the body. Engine-level
+    /// paint-vs-erase is a stroke decision applied at commit by
+    /// `commit_brush_dab`, not here. (Branching the per-dab pass on
+    /// `blend_mode` to a destination-out law was a regression: the ground
+    /// starts at (0,0,0,0), so `dst*(1-src.a)` stays zero and the commit's
+    /// `destination_out` then sees zero alpha and no-ops.)
+    pipeline: wgpu::ComputePipeline,
     uniform_ring: DynamicUniformRing,
     uniform_bind_group: wgpu::BindGroup,
     dabs_buffer: wgpu::Buffer,
-    dabs_bind_group: wgpu::BindGroup,
+    /// `@group(1)`: the dab records, the dab slot, the ground and the
+    /// storage channels. The bind group is built per flush, because the
+    /// scratch and its channels can be reallocated by a grow.
+    dabs_bgl: wgpu::BindGroupLayout,
     /// Total size of the uniform block (intrinsic + node fields), in bytes.
     uniform_size: usize,
     /// `@group(3)` graph-texture bind group, present when the brush
@@ -131,23 +169,50 @@ impl PerBrushPipeline {
                 source: wgpu::ShaderSource::Wgsl(compiled.stroke_wgsl.clone().into()),
             });
 
-        // group(1): dabs storage buffer. Same VERTEX_FRAGMENT visibility
-        // as `paint`: vertex stage reads `pos`/`bbox_target_px` to build the
-        // quad, fragment stage reads the rest.
+        // group(1): the dab records, the dab slot (a dynamic offset into
+        // the static index buffer) and one read-write storage texture per
+        // binding the compiled module declares: the ground, then the
+        // storage channels. The list comes from the compile output, so
+        // the layout matches the shader by construction.
+        let mut entries = vec![
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: NonZeroU64::new(16),
+                },
+                count: None,
+            },
+        ];
+        entries.extend(compiled.storage_bindings().into_iter().map(|b| {
+            wgpu::BindGroupLayoutEntry {
+                binding: b.binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::ReadWrite,
+                    format: b.format,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            }
+        }));
         let dabs_bgl = ctx
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("paint-dabs-bgl"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
+                entries: &entries,
             });
 
         // Optional `@group(3)` graph-texture bind group. Present only
@@ -197,36 +262,14 @@ impl PerBrushPipeline {
                 }),
         };
 
-        // What the per-dab pass writes: the scratch under the brush's
-        // accumulation law, then one target per declared channel, all from
-        // the compile output. See the `paint_pipeline` field doc above for
-        // why there's no erase variant at this stage.
-        let paint_targets = compiled.color_targets(wgpu::TextureFormat::Rgba8Unorm);
-
-        let paint_pipeline = ctx
+        let pipeline = ctx
             .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("paint"),
                 layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &paint_targets,
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
+                module: &shader,
+                entry_point: Some("cs_main"),
+                compilation_options: Default::default(),
                 cache: None,
             });
 
@@ -254,26 +297,12 @@ impl PerBrushPipeline {
 
         // Dab record buffer sized for this brush's record stride.
         let dab_record_size = compiled.dab_record_size.max(16);
-        let dabs_buffer_size = (MAX_DABS_PER_PHASE as u64) * (dab_record_size as u64);
         let dabs_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("paint-dabs-buffer"),
-            size: dabs_buffer_size,
+            size: (MAX_DABS_PER_PHASE as u64) * (dab_record_size as u64),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let dabs_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("paint-dabs-bg"),
-            layout: &dabs_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: dabs_buffer.as_entire_binding(),
-            }],
-        });
-
-        // Avoid the unused-let warning while keeping the variable
-        // for documentation: `dab_record_size` is what determines
-        // `dabs_buffer_size` above.
-        let _ = dab_record_size;
 
         // Resolve the brush's named graph textures against the
         // engine registry and build the `@group(3)` bind group.
@@ -301,14 +330,58 @@ impl PerBrushPipeline {
         };
 
         Self {
-            paint_pipeline,
+            pipeline,
             uniform_ring,
             uniform_bind_group,
             dabs_buffer,
-            dabs_bind_group,
+            dabs_bgl,
             uniform_size,
             graph_textures_bind_group,
         }
+    }
+
+    /// The `@group(1)` bind group for this flush: the records, the index
+    /// buffer's first slot (the dynamic offset selects the rest), and the
+    /// scratch's current views for the ground and each storage channel.
+    fn dabs_bind_group(
+        &self,
+        device: &wgpu::Device,
+        compiled: &CompiledBrush,
+        index_buffer: &wgpu::Buffer,
+        scratch: &crate::brush::scratch::Scratch,
+    ) -> wgpu::BindGroup {
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.dabs_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: index_buffer,
+                    offset: 0,
+                    size: NonZeroU64::new(16),
+                }),
+            },
+        ];
+        for b in compiled.storage_bindings() {
+            let view = if b.name == GROUND_NAME {
+                scratch.write_view()
+            } else {
+                scratch
+                    .channel_view(b.name)
+                    .expect("a declared storage channel is allocated before the flush")
+            };
+            entries.push(wgpu::BindGroupEntry {
+                binding: b.binding,
+                resource: wgpu::BindingResource::TextureView(view),
+            });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint-dabs-bg"),
+            layout: &self.dabs_bgl,
+            entries: &entries,
+        })
     }
 }
 
@@ -319,12 +392,29 @@ impl PerBrushPipeline {
 /// are built lazily on first use.
 pub struct PaintPipeline {
     cache: RefCell<HashMap<u64, PerBrushPipeline>>,
+    /// The static dab index: slot `i` holds `i`, one slot per
+    /// [`MAX_DABS_PER_PHASE`], written once. A dispatch selects its dab
+    /// by binding the slot at a dynamic offset of `i * INDEX_STRIDE`.
+    index_buffer: wgpu::Buffer,
 }
 
 impl PaintPipeline {
-    fn build(_ctx: &BuildContext) -> Self {
+    fn build(ctx: &BuildContext) -> Self {
+        let mut index_bytes = vec![0u8; (INDEX_STRIDE * MAX_DABS_PER_PHASE as u64) as usize];
+        for i in 0..MAX_DABS_PER_PHASE {
+            let at = (i as u64 * INDEX_STRIDE) as usize;
+            index_bytes[at..at + 4].copy_from_slice(&i.to_le_bytes());
+        }
+        let index_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("paint-dab-index"),
+            size: index_bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&index_buffer, 0, &index_bytes);
         Self {
             cache: RefCell::new(HashMap::new()),
+            index_buffer,
         }
     }
 
@@ -386,7 +476,8 @@ pub fn register() -> BrushNodeRegistration {
         pipelines: vec![paint_pipeline_reg()],
         evaluator: || Box::new(PaintEvaluator),
         lifecycle: crate::brush::node::Lifecycle::ClearScratchToTransparent,
-        scratch_format: crate::brush::node::COLOR_SCRATCH_FORMAT,
+        scratch_format: PACKED_GROUND_FORMAT,
+        dab_pass: DabPass::DispatchPerDab,
         node: NodeRegistration {
             type_id: TYPE_ID,
             category: "output",
@@ -431,15 +522,13 @@ pub fn register() -> BrushNodeRegistration {
                     .with_icon("mdi:texture-box")
                     .exposed()
                     .with_description("Stroke-level opacity cap (applied at commit)"),
-                // A share of each dab, not an interpolated blend state.
-                // Fixed-function blending offers one equation per attachment
-                // with no interpolation between `Add` and `Max`, and WebGPU
-                // has no framebuffer fetch, so no single attachment can be
-                // made to accumulate part-way between the two laws. What is
-                // continuous is the *input*: the dab is split between two
-                // accumulations, each running its own law untouched, and the
-                // commit lays one over the other. Both halves ride the one
-                // instanced draw, so 1px spacing stays affordable.
+                // A share of each dab, not an interpolated law. The commit
+                // lays the wash slot through the ceiling and the build slot
+                // over it, and a single ground mixing both halves could not
+                // be split there, so what is continuous is the *input*: the
+                // dab is split between two accumulations, each running its
+                // own law untouched. Both halves ride the one dispatch, so
+                // 1px spacing stays affordable.
                 PortDef::input("buildup", BrushWireType::Scalar)
                     .with_range(0.0, 1.0, 1.0)
                     .with_natural_range(0.0, 1.0)
@@ -515,14 +604,20 @@ impl BrushNodeEvaluator for PaintEvaluator {
         // mid-stroke rewinds can't truncate previous dabs.
         let bbox_radius = radius * compiled.brush_extent_factor + compiled.brush_extent_extra_px;
         // Publish the footprint; `None` means the dab is entirely off-extent
-        // and has no pixels to draw.
-        if gpu
-            .dab_batch
-            .record_dab_footprint(paint_target, position, bbox_radius)
-            .is_none()
-        {
+        // and has no pixels to draw. The dispatch grid covers the clamped
+        // rect, so its size rides the batch's per-dab meta beside the record.
+        let Some(footprint) =
+            gpu.dab_batch
+                .record_dab_footprint(paint_target, position, bbox_radius)
+        else {
             return vec![("dab_size".into(), ScalarValue::Vec2([diameter, diameter]))];
-        }
+        };
+        gpu.dab_batch
+            .meta_bytes
+            .extend_from_slice(bytemuck::bytes_of(&DabGrid {
+                width: footprint.width,
+                height: footprint.height,
+            }));
 
         gpu.dab_batch
             .queue_dab(&compiled, position, bbox_radius, radius);
@@ -541,11 +636,18 @@ impl BrushNodeEvaluator for PaintEvaluator {
 
         let (union_w, union_h) = gpu.dab_batch.batch_extent();
         let (dab_bytes, total_dabs) = gpu.dab_batch.take();
+        let meta_bytes = gpu.dab_batch.take_meta();
         if total_dabs == 0 {
             return;
         }
         gpu.perf
             .record_dab_flush_workload(total_dabs, union_w, union_h);
+        let grids: &[DabGrid] = bytemuck::cast_slice(&meta_bytes);
+        debug_assert_eq!(
+            grids.len(),
+            total_dabs as usize,
+            "paint queues one grid per dab record"
+        );
 
         let pipeline_ref = gpu.pipelines.get::<PaintPipeline>("paint");
 
@@ -638,28 +740,27 @@ impl BrushNodeEvaluator for PaintEvaluator {
             gpu.queue
                 .write_buffer(&per_brush.dabs_buffer, 0, &dab_bytes);
 
-            // The accumulation law is baked into this pipeline at build
-            // time. Paint-vs-erase routes through `gpu.blend_mode` in
-            // `commit_brush_dab`; see `paint_pipeline`'s doc on
-            // `PerBrushPipeline`.
-            let pipeline = &per_brush.paint_pipeline;
-            let attachments = scratch.color_attachments(wgpu::LoadOp::Load);
-            let mut pass = gpu.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("paint-flush"),
-                color_attachments: &attachments,
-                ..Default::default()
-            });
-            pass.set_viewport(
-                0.0,
-                0.0,
-                layer_size[0] as f32,
-                layer_size[1] as f32,
-                0.0,
-                1.0,
+            // Rebuilt per flush: a grow can have reallocated the ground
+            // and the channels since the last one.
+            let dabs_bind_group = per_brush.dabs_bind_group(
+                gpu.device,
+                &compiled,
+                &pipeline_ref.index_buffer,
+                scratch,
             );
-            pass.set_pipeline(pipeline);
+
+            // The accumulation law is compiled into this pipeline.
+            // Paint-vs-erase routes through `gpu.blend_mode` in
+            // `commit_brush_dab`; see the `pipeline` field's doc on
+            // `PerBrushPipeline`.
+            let mut pass = gpu
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("paint-flush"),
+                    timestamp_writes: None,
+                });
+            pass.set_pipeline(&per_brush.pipeline);
             pass.set_bind_group(0, &per_brush.uniform_bind_group, &[uniform_offset]);
-            pass.set_bind_group(1, &per_brush.dabs_bind_group, &[]);
             pass.set_bind_group(2, gpu.selection_bind_group, &[]);
             // `@group(3)` holds the brush's graph textures: paper grain,
             // baked noise, the `clone_source` snapshot, the `pickup`
@@ -671,11 +772,18 @@ impl BrushNodeEvaluator for PaintEvaluator {
             } else if let Some(graph_bg) = per_brush.graph_textures_bind_group.as_ref() {
                 pass.set_bind_group(3, graph_bg, &[]);
             }
-            pass.draw(0..6, 0..total_dabs);
+            // One dispatch per dab over its clamped footprint; the shader
+            // rejects the threads past the footprint's rounding and
+            // outside the dab's bbox. Dispatches in a pass are ordered.
+            for (i, grid) in grids.iter().enumerate() {
+                let groups = |px: u32| px.div_ceil(DAB_WORKGROUP).max(1);
+                pass.set_bind_group(1, &dabs_bind_group, &[(i as u64 * INDEX_STRIDE) as u32]);
+                pass.dispatch_workgroups(groups(grid.width), groups(grid.height), 1);
+            }
         });
 
         gpu.perf.record_dab_flush(total_dabs);
-        gpu.perf.record_dispatches(1);
+        gpu.perf.record_dispatches(total_dabs);
     }
 
     fn commit(&self, ctx: &EvalContext, gpu: &mut BrushGpuContext) {
@@ -684,8 +792,8 @@ impl BrushNodeEvaluator for PaintEvaluator {
         };
         let opacity = ctx.input_f32("opacity").clamp(0.0, 1.0);
         // Each half this brush accumulated goes in the slot that commits
-        // under its law. At either end the scratch is the only
-        // accumulation and fills its own slot; between, the scratch is the
+        // under its law. At either end the ground is the only
+        // accumulation and fills its own slot; between, the ground is the
         // wash half and the declared channel is the build half.
         let (wash_share, build_share) = shares(ctx.input_f32("buildup"));
         let scratch = stroke.scratch.write_bind_group();
@@ -706,8 +814,11 @@ impl BrushNodeEvaluator for PaintEvaluator {
             &mut gpu.encoder,
             gpu.pipelines,
             gpu.queue,
-            wash,
-            build,
+            CommitForegrounds {
+                format: stroke.scratch.format(),
+                wash,
+                build,
+            },
             stroke.pre_stroke_bind_group,
             opacity,
             gpu.blend_mode,
@@ -730,14 +841,18 @@ impl BrushNodeEvaluator for PaintEvaluator {
         vec![]
     }
 
-    /// Emit the fragment-shader body's terminal: multiplies the
-    /// upstream graph's premultiplied RGBA expression by the
-    /// selection mask and returns. The framework's
-    /// [`crate::brush::wgsl::assemble_shader`] places the
-    /// node bodies inside `fs_main` already bound with `d`, `u`,
-    /// `local_uv`, `local_dist`, `theta`, `target_pos`, and `sel`.
+    /// Emit the compute body's terminal: multiplies the upstream graph's
+    /// premultiplied RGBA expression by the flow and the selection mask
+    /// and stores it through the brush's law. The framework's
+    /// [`crate::brush::wgsl::assemble_shader`] places the node bodies
+    /// inside `cs_main` already bound with `d`, `u`, `local_uv`,
+    /// `local_dist`, `theta`, `target_pos`, `sel`, `layer_px` and the
+    /// `ground`.
     fn compile_wgsl(&self, cctx: &CompileWgslCtx) -> Result<NodeWgsl, String> {
-        let mut wgsl = NodeWgsl::default();
+        let mut wgsl = NodeWgsl {
+            decls: ACCUMULATE_WGSL.to_string(),
+            ..NodeWgsl::default()
+        };
         let rgba_expr = rgba_expr(cctx);
         // Per-dab flow, one per half, folded into the premultiplied rgba
         // (multiply all four components) the way the original terminal's
@@ -745,11 +860,12 @@ impl BrushNodeEvaluator for PaintEvaluator {
         // field; unwired ones are the port default literal.
         //
         // The dial is stroke-constant, so it is always a literal here, and
-        // the shares it yields decide the shape of the pass: which blend
-        // state the scratch runs under, whether a second accumulation
-        // exists, and what the body returns.
+        // the shares it yields decide the shape of the pass: which law the
+        // ground accumulates under, whether a second accumulation exists,
+        // and what the body stores.
         let buildup = cctx.input("buildup").as_f32_literal().ok_or_else(|| {
-            "paint.buildup picks the pass's blend states and colour targets when the              brush compiles, so a per-dab wire cannot drive it"
+            "paint.buildup picks the pass's accumulation laws and storage bindings when the \
+             brush compiles, so a per-dab wire cannot drive it"
                 .to_string()
         })?;
         let (wash_share, build_share) = shares(buildup);
@@ -762,21 +878,30 @@ impl BrushNodeEvaluator for PaintEvaluator {
             let expr = cctx.input("build_flow").as_f32();
             body.push_str(&format!("    let build_flow = clamp({expr}, 0.0, 1.0);\n"));
         }
+        let store = |target: &str, law: &str, src: &str| {
+            format!(
+                "    textureStore({target}, layer_px, pack_ground({law}({src}, unpack_ground(textureLoad({target}, layer_px)))));\n"
+            )
+        };
         if build_share <= 0.0 {
-            // Wash alone: the scratch takes the strongest dab.
-            body.push_str("    return rgba * wash_flow * sel;\n");
-            wgsl.dab_blend = Some(crate::brush::node::COVERAGE_CEILING);
+            // Wash alone: the ground takes the strongest dab.
+            body.push_str("    let src = rgba * wash_flow * sel;\n");
+            body.push_str(&store(GROUND_NAME, "accumulate_wash", "src"));
         } else if wash_share <= 0.0 {
-            // Build-up alone: the scratch composites every dab over the last.
-            body.push_str("    return rgba * build_flow * sel;\n");
-            wgsl.dab_blend = Some(crate::brush::node::PREMULTIPLIED_SOURCE_OVER);
+            // Build-up alone: the ground composites every dab over the last.
+            body.push_str("    let src = rgba * build_flow * sel;\n");
+            body.push_str(&store(GROUND_NAME, "accumulate_build", "src"));
         } else {
-            // Both: one instanced draw writes each half into the
+            // Both: the one dispatch writes each half into the
             // accumulation that runs its law, scaled by its share.
             body.push_str(&format!(
-                "    return FsOut(rgba * wash_flow * sel * {wash_share:.6}, rgba * build_flow * sel * {build_share:.6});\n"
+                "    let wash_src = rgba * wash_flow * sel * {wash_share:.6};\n"
             ));
-            wgsl.dab_blend = Some(crate::brush::node::COVERAGE_CEILING);
+            body.push_str(&format!(
+                "    let build_src = rgba * build_flow * sel * {build_share:.6};\n"
+            ));
+            body.push_str(&store(GROUND_NAME, "accumulate_wash", "wash_src"));
+            body.push_str(&store(BUILD_CHANNEL.name, "accumulate_build", "build_src"));
             wgsl.channels = vec![BUILD_CHANNEL];
         }
         wgsl.body = body;
@@ -785,12 +910,12 @@ impl BrushNodeEvaluator for PaintEvaluator {
 
     /// Hover-cursor preview body.
     ///
-    /// The preview skeleton renders one dab to a thumbnail and keeps the
-    /// single-output signature, so it cannot take the two-accumulation
-    /// return the stroke body uses inside the dial. It shows the one dab as
-    /// the stroke would deposit it on blank ground, blending the two flows
-    /// by the dial: exact at either end, and to first order between (it
-    /// drops the cross term of compositing a dab's own two halves).
+    /// The preview skeleton is a fragment module rendering one dab to a
+    /// thumbnail with a single output, so it has no ground to store into.
+    /// It shows the one dab as the stroke would deposit it on blank
+    /// ground, blending the two flows by the dial: exact at either end,
+    /// and to first order between (it drops the cross term of compositing
+    /// a dab's own two halves).
     fn compile_cursor_preview_body(&self, cctx: &CompileWgslCtx) -> Result<NodeWgsl, String> {
         let mut wgsl = NodeWgsl::default();
         let rgba_expr = rgba_expr(cctx);
@@ -828,8 +953,8 @@ fn ensure_per_brush_pipeline(
         queue: gpu.queue,
         uniform_bgl: gpu.pipelines.uniform_bind_group_layout(),
         selection_bgl: gpu.pipelines.selection_bind_group_layout(),
-        canvas_copy_bgl: gpu.pipelines.canvas_copy_bind_group_layout(),
-        canvas_copy_sampler: gpu.pipelines.canvas_copy_sampler(),
+        canvas_copy: gpu.pipelines.canvas_copy_layout(),
+        canvas_copy_layouts: gpu.pipelines.canvas_copy_layouts(),
         min_uniform_align: gpu.device.limits().min_uniform_buffer_offset_alignment,
         texture_registry: gpu.pipelines.texture_registry(),
         baked_sources: gpu.pipelines.baked_sources(),

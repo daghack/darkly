@@ -186,6 +186,12 @@ impl StrokeEngine {
         self.runner.scratch_format()
     }
 
+    /// How the stroke's terminal writes its scratch per dab: see
+    /// [`BrushGraphRunner::dab_pass`](crate::brush::eval::BrushGraphRunner::dab_pass).
+    pub fn dab_pass(&self) -> crate::brush::node::DabPass {
+        self.runner.dab_pass()
+    }
+
     pub fn random_seed() -> u32 {
         web_time::SystemTime::now()
             .duration_since(web_time::SystemTime::UNIX_EPOCH)

@@ -7,8 +7,9 @@
 //! never branch on R8 vs RGBA8.
 //!
 //! Three operations bridge:
-//!   - **`commit_brush_dab`** (write): RGBA8 scratch + RGBA8 pre-stroke →
-//!     paint target. Same WGSL shader; pipeline picked by `self.format`.
+//!   - **`commit_brush_dab`** (write): stroke accumulations + RGBA8
+//!     pre-stroke → paint target. Same WGSL shader; pipeline picked by
+//!     `self.format` and by the accumulations' format (float or packed).
 //!     The GPU silently writes only `.r` to R8 targets.
 //!   - **`save_pre_stroke_snapshot`** (read): paint target → RGBA8 snapshot.
 //!     RGBA8 source → `copy_texture_to_texture` (hardware-fast). R8 source →
@@ -27,20 +28,30 @@ use crate::brush::composite_pipeline::{CompositePipeline, CompositeUniforms};
 use crate::brush::pipeline::BrushPipelines;
 use crate::gpu::paint_target::GpuPaintTarget;
 
+/// The accumulations a stroke commits, by slot.
+///
+/// Two foreground slots, each with a fixed law. `wash` is laid down
+/// through the per-pigment deposit ceiling, which refuses anything past
+/// what one pass over the pixel would deposit; `build` is then composited
+/// on top with plain Porter-Duff source-over. `None` is an absent slot,
+/// which the shader never reads. Both foregrounds must be premultiplied,
+/// which is how every terminal accumulates, and both are in `format`, the
+/// scratch's, which picks whether the commit samples them as float or
+/// loads them as the packed ground.
+///
+/// Which accumulation goes in which slot is the terminal's knowledge: a
+/// brush under `Wash` fills the first, one under `Build-up` (and
+/// watercolor) fills the second, and a brush inside the accumulation dial
+/// fills both, its wash ground and its build channel.
+pub struct CommitForegrounds<'a> {
+    /// Texel format of both slots: the scratch's.
+    pub format: wgpu::TextureFormat,
+    pub wash: Option<&'a wgpu::BindGroup>,
+    pub build: Option<&'a wgpu::BindGroup>,
+}
+
 pub trait BrushPaintTargetExt {
     /// Commit a stroke's finished accumulations onto the paint target.
-    ///
-    /// Two foreground slots, each with a fixed law. `wash` is laid down
-    /// through the per-pigment deposit ceiling, which refuses anything past
-    /// what one pass over the pixel would deposit; `build` is then
-    /// composited on top with plain Porter-Duff source-over. `None` is an
-    /// absent slot, which the shader never reads. Both foregrounds must be
-    /// premultiplied, which is how every terminal accumulates.
-    ///
-    /// Which accumulation goes in which slot is the terminal's knowledge:
-    /// a brush under `Wash` fills the first, one under `Build-up` (and
-    /// watercolor) fills the second, and a brush inside the accumulation
-    /// dial fills both, its `Max` scratch and its source-over channel.
     ///
     /// `opacity` is the stroke-level cap, applied to every present slot.
     /// `blend_mode` is 0 for paint and 1 for erase, where each slot removes
@@ -54,8 +65,7 @@ pub trait BrushPaintTargetExt {
         encoder: &mut wgpu::CommandEncoder,
         brush_pipelines: &BrushPipelines,
         queue: &wgpu::Queue,
-        wash: Option<&wgpu::BindGroup>,
-        build: Option<&wgpu::BindGroup>,
+        foregrounds: CommitForegrounds<'_>,
         pre_stroke_bg: &wgpu::BindGroup,
         opacity: f32,
         blend_mode: u32,
@@ -97,12 +107,16 @@ impl BrushPaintTargetExt for GpuPaintTarget<'_> {
         encoder: &mut wgpu::CommandEncoder,
         brush_pipelines: &BrushPipelines,
         queue: &wgpu::Queue,
-        wash: Option<&wgpu::BindGroup>,
-        build: Option<&wgpu::BindGroup>,
+        foregrounds: CommitForegrounds<'_>,
         pre_stroke_bg: &wgpu::BindGroup,
         opacity: f32,
         blend_mode: u32,
     ) {
+        let CommitForegrounds {
+            format,
+            wash,
+            build,
+        } = foregrounds;
         // An absent slot still needs something bound to satisfy the
         // pipeline layout, so it borrows the present one and is switched
         // off by its opacity. With neither there is nothing to commit.
@@ -143,7 +157,7 @@ impl BrushPaintTargetExt for GpuPaintTarget<'_> {
             ..Default::default()
         });
         pass.set_viewport(0.0, 0.0, layer_w, layer_h, 0.0, 1.0);
-        pass.set_pipeline(composite.pipeline(self.format()));
+        pass.set_pipeline(composite.pipeline(self.format(), format));
         pass.set_bind_group(0, composite.uniform_bind_group(), &[offset]);
         pass.set_bind_group(1, wash_bg, &[]);
         pass.set_bind_group(2, build_bg, &[]);

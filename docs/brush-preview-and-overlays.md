@@ -31,8 +31,12 @@ fight frame-to-frame.
 
 A brush graph compiles (`compile_brush_to_wgsl` → `assemble_shader`,
 [`crates/darkly/src/brush/wgsl/mod.rs`](../crates/darkly/src/brush/wgsl/mod.rs))
-into **two** WGSL fragment shaders on one `CompiledBrush`: `stroke_wgsl` and
-`cursor_preview_wgsl`.
+into **two** WGSL shaders on one `CompiledBrush`: `stroke_wgsl` and
+`cursor_preview_wgsl`. The stroke variant's skeleton is the terminal's
+declared `DabPass`: a compute module (`cs_main`, one thread per pixel of
+each dab, the scratch bound as read-write storage) for `paint`, an
+instanced fragment module (`fs_main`) for the other terminals. The preview
+variant is a fragment module for every terminal.
 
 - **Non-terminal node bodies are spliced verbatim into both variants.** Only the
   *terminal* differs: it emits the stroke body from `compile_wgsl` and the preview
@@ -41,9 +45,11 @@ into **two** WGSL fragment shaders on one `CompiledBrush`: `stroke_wgsl` and
   default returns the same body; `watercolor`/`smudge`/`liquify` override it to
   emit a neutral fill that samples no stroke-only bindings.
 - **The preview variant has no live stroke.** It drops `@group(2)` selection
-  (hard-codes `sel = 1.0`) and swaps every stroke-only binding (scratch,
-  selection, the frozen clone source snapshot) for a registry fallback (e.g. the
-  1×1 white `_fallback` tile); stroke-seeded uniforms read their unseeded defaults.
+  (hard-codes `sel = 1.0`), declares no ground or storage channel (a compute
+  terminal's preview body returns a colour, it has nothing to store into), and
+  swaps every stroke-only binding (scratch, selection, the frozen clone source
+  snapshot) for a registry fallback (e.g. the 1×1 white `_fallback` tile);
+  stroke-seeded uniforms read their unseeded defaults.
 
 **Gotcha:** a non-terminal node *cannot* render differently at hover; its single
 body runs in both modes. A non-terminal that samples a stroke-only resource will,

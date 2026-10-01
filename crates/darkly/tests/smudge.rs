@@ -89,12 +89,14 @@ fn render_smudge_dabs(size_override: f32, dabs: &[([f32; 2], [f32; 2])]) -> Vec<
         &queue,
         &darkly::gpu::selection::selection_mask_bgl(&device),
     );
+    let mut runner: BrushGraphRunner = compile_graph(&graph).expect("brush compiles");
     let mut stroke_buffer = StrokeBuffer::new(
         &device,
         CANVAS,
         CANVAS,
         &pipelines,
-        darkly::brush::node::COLOR_SCRATCH_FORMAT,
+        runner.scratch_format(),
+        runner.dab_pass(),
     );
 
     let pre_stroke = darkly::gpu::paint_target::GpuPaintTarget::from_canvas_texture(
@@ -109,7 +111,6 @@ fn render_smudge_dabs(size_override: f32, dabs: &[([f32; 2], [f32; 2])]) -> Vec<
     stroke_buffer.save_pre_stroke(&device, &mut enc, &pipelines, &pre_stroke);
     queue.submit([enc.finish()]);
 
-    let mut runner: BrushGraphRunner = compile_graph(&graph).expect("brush compiles");
     macro_rules! make_ctx {
         ($label:expr) => {{
             let (scratch, pre_stroke_tex, pre_stroke_bg, source_override) =

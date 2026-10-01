@@ -9,7 +9,7 @@
 //!
 //! The one quantity nobody had measured is the all-in cost of such a
 //! dispatch, barrier included, at a thousand per pass. This binary measures
-//! it directly, with no engine and no stroke, in three shapes over the same
+//! it directly, with no engine and no stroke, in five shapes over the same
 //! N dabs scattered on a 3840x2160 target:
 //!
 //! - **(a) dispatch, read-write**: one compute pass, N dispatches, each
@@ -21,12 +21,19 @@
 //!   `rgba8unorm` attachment with hardware source-over. The shape the
 //!   smudge pays today, reproduced on this machine in this harness.
 //!
+//! Two variants of (a) size the large-dab mitigations the compute paint
+//! terminal can choose between (the port plan's section on the large-dab
+//! regime): **(a16)**, the same shader from a 16x16 workgroup, and
+//! **(a-rows)**, an 8x2 workgroup whose threads each walk four rows. Both
+//! run on every cell, so the small-dab cost of each is measured beside its
+//! large-dab gain.
+//!
 //! Every shape hands its dispatch or draw its dab through the same
 //! mechanism the terminal would use: a static index buffer (slot `i` holds
 //! `i`, written once) bound with a dynamic offset, and a tight record array
 //! uploaded once per iteration.
 //!
-//! Each cell warms up untimed, then times the three shapes interleaved
+//! Each cell warms up untimed, then times the shapes interleaved
 //! within every iteration, so an integrated GPU's frequency scaling lands
 //! on all three alike; p50 and min are both reported.
 //!
@@ -138,6 +145,40 @@ fn cs_rw(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(ground_rw, px, vec4<u32>(pack4x8unorm(out), 0u, 0u, 0u));
 }
 
+// (a16): the same read-modify-write from a 16x16 workgroup, exactly
+// `max_compute_invocations_per_workgroup`.
+@compute @workgroup_size(16, 16, 1)
+fn cs_rw_16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dab = dabs[slot.i];
+    let px = pixel_of(dab, gid.xy);
+    if (!inside(px, vec2<i32>(textureDimensions(ground_rw)))) { return; }
+    let c = coverage(dab, vec2<f32>(px) + vec2<f32>(0.5));
+    if (c <= 0.0) { return; }
+    let src = dab.color * c;
+    let dst = unpack4x8unorm(textureLoad(ground_rw, px).r);
+    let out = src + dst * (1.0 - src.a);
+    textureStore(ground_rw, px, vec4<u32>(pack4x8unorm(out), 0u, 0u, 0u));
+}
+
+// (a-rows): the same read-modify-write with each thread walking four rows,
+// so an 8x2 workgroup covers the 8x8 tile of (a) with a quarter of the
+// threads and one record load per four pixels.
+@compute @workgroup_size(8, 2, 1)
+fn cs_rw_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dab = dabs[slot.i];
+    let dims = vec2<i32>(textureDimensions(ground_rw));
+    for (var r = 0u; r < 4u; r++) {
+        let px = pixel_of(dab, vec2<u32>(gid.x, gid.y * 4u + r));
+        if (!inside(px, dims)) { continue; }
+        let c = coverage(dab, vec2<f32>(px) + vec2<f32>(0.5));
+        if (c <= 0.0) { continue; }
+        let src = dab.color * c;
+        let dst = unpack4x8unorm(textureLoad(ground_rw, px).r);
+        let out = src + dst * (1.0 - src.a);
+        textureStore(ground_rw, px, vec4<u32>(pack4x8unorm(out), 0u, 0u, 0u));
+    }
+}
+
 // (b): the same read and blend from a read-only binding, no store. The
 // comparison against an impossible value keeps the load alive.
 @compute @workgroup_size(8, 8, 1)
@@ -188,6 +229,8 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     compute_rw: wgpu::ComputePipeline,
+    compute_rw_16: wgpu::ComputePipeline,
+    compute_rw_rows: wgpu::ComputePipeline,
     compute_ro: wgpu::ComputePipeline,
     render: wgpu::RenderPipeline,
     /// Two bind groups over one layout, because wgpu tracks a bind group's
@@ -213,6 +256,10 @@ struct Timestamps {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shape {
     DispatchRw,
+    /// (a) from a 16x16 workgroup.
+    DispatchRw16,
+    /// (a) with each thread walking four rows from an 8x2 workgroup.
+    DispatchRwRows,
     DispatchRo,
     RenderPass,
 }
@@ -221,8 +268,19 @@ impl Shape {
     fn label(self) -> &'static str {
         match self {
             Shape::DispatchRw => "(a) dispatch, read-write",
+            Shape::DispatchRw16 => "(a16) dispatch, read-write, 16x16",
+            Shape::DispatchRwRows => "(a-rows) dispatch, read-write, 4 rows per thread",
             Shape::DispatchRo => "(b) dispatch, read-only",
             Shape::RenderPass => "(c) render pass per dab",
+        }
+    }
+
+    /// Pixels per workgroup along each axis of the dispatch grid: the
+    /// side of the tile one workgroup covers, whatever its thread count.
+    fn tile(self) -> u32 {
+        match self {
+            Shape::DispatchRw16 => 16,
+            _ => WORKGROUP,
         }
     }
 }
@@ -259,7 +317,13 @@ fn main() {
     line("| radius_px | N | shape | wall p50 (ms) | wall min (ms) | wall per dab, p50 (us) | gpu p50 (ms) | gpu per dab, p50 (us) | parity max diff (LSB) |".into());
     line("|---:|---:|---|---:|---:|---:|---:|---:|---:|".into());
 
-    let shapes = [Shape::DispatchRw, Shape::DispatchRo, Shape::RenderPass];
+    let shapes = [
+        Shape::DispatchRw,
+        Shape::DispatchRw16,
+        Shape::DispatchRwRows,
+        Shape::DispatchRo,
+        Shape::RenderPass,
+    ];
     for &(radius, n) in &CELLS {
         {
             let dabs = scatter(n, radius);
@@ -416,6 +480,8 @@ impl Gpu {
             })
         };
         let compute_rw = compute("cs_rw");
+        let compute_rw_16 = compute("cs_rw_16");
+        let compute_rw_rows = compute("cs_rw_rows");
         let compute_ro = compute("cs_ro");
         let render = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("render-pass-per-dab"),
@@ -574,6 +640,8 @@ impl Gpu {
             device,
             queue,
             compute_rw,
+            compute_rw_16,
+            compute_rw_rows,
             compute_ro,
             render,
             bind_group_rw,
@@ -649,7 +717,7 @@ impl Gpu {
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, shape: Shape, dabs: &[Dab]) {
         let n = dabs.len() as u32;
         match shape {
-            Shape::DispatchRw | Shape::DispatchRo => {
+            Shape::DispatchRw | Shape::DispatchRw16 | Shape::DispatchRwRows | Shape::DispatchRo => {
                 let timestamp_writes =
                     self.timestamps
                         .as_ref()
@@ -662,14 +730,15 @@ impl Gpu {
                     label: Some(shape.label()),
                     timestamp_writes,
                 });
-                let (pipeline, bind_group) = if shape == Shape::DispatchRw {
-                    (&self.compute_rw, &self.bind_group_rw)
-                } else {
-                    (&self.compute_ro, &self.bind_group_ro)
+                let (pipeline, bind_group) = match shape {
+                    Shape::DispatchRw => (&self.compute_rw, &self.bind_group_rw),
+                    Shape::DispatchRw16 => (&self.compute_rw_16, &self.bind_group_rw),
+                    Shape::DispatchRwRows => (&self.compute_rw_rows, &self.bind_group_rw),
+                    _ => (&self.compute_ro, &self.bind_group_ro),
                 };
                 pass.set_pipeline(pipeline);
                 for (i, dab) in dabs.iter().enumerate() {
-                    let groups = (2.0 * dab.radius / WORKGROUP as f32).ceil() as u32 + 1;
+                    let groups = (2.0 * dab.radius / shape.tile() as f32).ceil() as u32 + 1;
                     pass.set_bind_group(0, bind_group, &[i as u32 * INDEX_STRIDE as u32]);
                     pass.dispatch_workgroups(groups, groups, 1);
                 }

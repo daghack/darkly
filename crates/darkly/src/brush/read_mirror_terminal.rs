@@ -181,7 +181,7 @@ impl PerBrushPipeline {
                     Some(ctx.uniform_bgl),
                     Some(&dabs_bgl),
                     Some(ctx.selection_bgl),
-                    Some(ctx.canvas_copy_bgl),
+                    Some(&ctx.canvas_copy.bgl),
                 ],
                 immediate_size: 0,
             });
@@ -705,15 +705,13 @@ fn ensure_per_brush_pipeline(
     }
     // `@group(3)` binds the scratch's own read-mirror bind group, so the
     // pipeline layout has to be the one that scratch was built against.
-    let (canvas_copy_bgl, canvas_copy_sampler) =
-        gpu.pipelines.canvas_copy_layout_for(target_format);
     let ctx = BuildContext {
         device: gpu.device,
         queue: gpu.queue,
         uniform_bgl: gpu.pipelines.uniform_bind_group_layout(),
         selection_bgl: gpu.pipelines.selection_bind_group_layout(),
-        canvas_copy_bgl,
-        canvas_copy_sampler,
+        canvas_copy: gpu.pipelines.canvas_copy_layout_for(target_format),
+        canvas_copy_layouts: gpu.pipelines.canvas_copy_layouts(),
         min_uniform_align: gpu.device.limits().min_uniform_buffer_offset_alignment,
         texture_registry: gpu.pipelines.texture_registry(),
         baked_sources: gpu.pipelines.baked_sources(),

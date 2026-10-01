@@ -42,6 +42,9 @@
 //! Ownership: owned by `StrokeBuffer`, allocated at stroke start, freed at
 //! stroke end.
 
+use crate::brush::node::DabPass;
+use crate::brush::pipeline::CanvasCopyLayouts;
+
 /// Per-dab read-mirror initial size.  1×1 is the smallest legal wgpu
 /// texture; the first dab's footprint will lazy-grow it.  Picking a small
 /// initial size avoids paying for layer-sized VRAM up front when most
@@ -80,19 +83,26 @@ pub struct Scratch {
     read_origin_cache: Option<[u32; 2]>,
 
     // --- Bind-group rebuild handles (cheap clones since wgpu types are Arc'd internally) ---
-    canvas_copy_bgl: wgpu::BindGroupLayout,
-    /// Linear sampler for the read mirror.  Stored so grow rebuilds can
-    /// reuse it instead of allocating per grow.  Liquify reads at
-    /// displaced sub-pixel UVs and needs bilinear interpolation.
-    read_mirror_sampler: wgpu::Sampler,
-    /// Sampler for the write-side bind group.  Nearest filter: no sub-
-    /// pixel reads in the consumers (commit blit is integer-aligned).
+    /// The canvas-copy layouts; every side binds through the one for its
+    /// own format, so a channel of another format than the write side is
+    /// readable all the same.  The float layouts carry the linear sampler
+    /// the read mirror uses (liquify reads at displaced sub-pixel UVs and
+    /// needs bilinear interpolation); the uint layout carries none, since
+    /// nothing samples a packed ground.
+    layouts: CanvasCopyLayouts,
+    /// Sampler for the write-side and channel bind groups.  Nearest
+    /// filter: no sub-pixel reads in the consumers (commit blit is
+    /// integer-aligned).  Ignored by a layout without a sampler entry.
     write_sampler: wgpu::Sampler,
     /// Texel format of both sides.  Color terminals use `Rgba8Unorm`;
     /// warp terminals store a two-channel displacement field instead of
     /// pixels (see [`crate::brush::warp_field`]) and declare their own
-    /// format on [`crate::brush::node::BrushNodeRegistration`].
+    /// format on [`crate::brush::node::BrushNodeRegistration`]; a compute
+    /// dab pass accumulates into a packed uint ground.
     format: wgpu::TextureFormat,
+    /// How the terminal's per-dab pass writes the write side; decides its
+    /// storage usage, here and on every grow.
+    pass: DabPass,
 
     /// Per-pixel quantities a terminal accumulates alongside the write
     /// side (see [`StrokeChannels`]).  `None` until a terminal asks via
@@ -138,9 +148,10 @@ pub enum ChannelUse {
     /// through [`Scratch::channel_bind_group`].
     Attachment { blend: wgpu::BlendState },
     /// A read-write storage texture written by a compute pass.  Not a
-    /// colour target of any draw, so it contributes no `FsOut` field and
-    /// no canvas-copy bind group (a non-float format cannot satisfy that
-    /// layout); the terminal binds it through [`Scratch::channel_view`].
+    /// colour target of any draw, so it contributes no `FsOut` field; the
+    /// terminal binds it for writing through [`Scratch::channel_view`]
+    /// and reads it back (at commit) through
+    /// [`Scratch::channel_bind_group`] like any channel.
     Storage,
 }
 
@@ -172,52 +183,47 @@ struct StrokeChannels {
     /// Attachment views, in declaration order: what the terminal hangs
     /// off its render pass after [`Scratch::write_view`].
     views: Vec<wgpu::TextureView>,
-    /// Canvas-copy bind groups, in declaration order: what a pass that
-    /// does not target a channel binds to read it.  `None` for a storage
-    /// channel, whose format the canvas-copy layout cannot sample.
-    bind_groups: Vec<Option<wgpu::BindGroup>>,
+    /// Canvas-copy bind groups, in declaration order, each over the
+    /// layout for its channel's format: what a pass that does not target
+    /// a channel binds to read it.
+    bind_groups: Vec<wgpu::BindGroup>,
 }
 
 impl Scratch {
     /// Allocate a new scratch.  Write side starts at `(layer_w, layer_h)`;
     /// read mirror starts at `1×1` and grows lazily on first dab.
     ///
-    /// `canvas_copy_bgl` is the per-dab read BGL the brush composite
-    /// shaders bind for the read mirror; the same BGL also holds the
-    /// write-side bind group (the composite shader's foreground at
-    /// commit time).
+    /// `layouts` are the canvas-copy layouts the brush composite shaders
+    /// bind the read mirror, the write side (the composite shader's
+    /// foreground at commit time) and each channel through, each by its
+    /// own format ([`CanvasCopyLayouts::for_format`]).
     ///
-    /// `canvas_copy_sampler` is shared across the canvas-copy BGL bind
-    /// groups.  Linear filter (liquify needs sub-pixel sampling).
-    ///
-    /// `format` is the terminal's declared scratch format.  For anything
-    /// other than `Rgba8Unorm` the caller must pass the matching
-    /// non-filtering BGL and sampler from
-    /// [`BrushPipelines::canvas_copy_layout_for`](crate::brush::pipeline::BrushPipelines::canvas_copy_layout_for),
-    /// since float32 formats are not filterable in core WebGPU.
+    /// `format` is the terminal's declared scratch format; `pass` is how
+    /// the terminal writes the write side per dab, and a compute pass
+    /// needs it bound as read-write storage.
     pub fn new(
         device: &wgpu::Device,
         layer_w: u32,
         layer_h: u32,
-        canvas_copy_bgl: &wgpu::BindGroupLayout,
-        canvas_copy_sampler: &wgpu::Sampler,
+        layouts: &CanvasCopyLayouts,
         format: wgpu::TextureFormat,
+        pass: DabPass,
     ) -> Self {
+        let layout = layouts.for_format(format);
         let write_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("scratch-write-sampler"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-        let read_mirror_sampler = canvas_copy_sampler.clone();
 
-        let (write_texture, write_view) = create_write_texture(device, layer_w, layer_h, format);
-        let write_bind_group = canvas_copy_bind_group(
+        let (write_texture, write_view) =
+            create_write_texture(device, layer_w, layer_h, format, pass);
+        let write_bind_group = layout.bind(
             device,
-            canvas_copy_bgl,
             "scratch-write-bg",
             &write_view,
-            &write_sampler,
+            Some(&write_sampler),
         );
 
         let (read_mirror_texture, read_mirror_view) = create_read_mirror_texture(
@@ -226,13 +232,8 @@ impl Scratch {
             READ_MIRROR_INITIAL_DIM,
             format,
         );
-        let read_mirror_bind_group = canvas_copy_bind_group(
-            device,
-            canvas_copy_bgl,
-            "scratch-read-mirror-bg",
-            &read_mirror_view,
-            canvas_copy_sampler,
-        );
+        let read_mirror_bind_group =
+            layout.bind(device, "scratch-read-mirror-bg", &read_mirror_view, None);
 
         Self {
             write_texture,
@@ -246,10 +247,10 @@ impl Scratch {
             read_w: READ_MIRROR_INITIAL_DIM,
             read_h: READ_MIRROR_INITIAL_DIM,
             read_origin_cache: None,
-            canvas_copy_bgl: canvas_copy_bgl.clone(),
-            read_mirror_sampler,
+            layouts: layouts.clone(),
             write_sampler,
             format,
+            pass,
             channels: None,
         }
     }
@@ -292,7 +293,7 @@ impl Scratch {
         }
         let channels = build_channels(
             device,
-            &self.canvas_copy_bgl,
+            &self.layouts,
             &self.write_sampler,
             self.write_w,
             self.write_h,
@@ -302,14 +303,15 @@ impl Scratch {
         self.channels = Some(channels);
     }
 
-    /// Read bind group for the channel a terminal declared under `name`.
+    /// Read bind group for the channel a terminal declared under `name`,
+    /// over the canvas-copy layout for the channel's format.
     ///
     /// By name, never by position: a terminal asks for the accumulation it
     /// declared, and gets `None` only if it never declared it.
     pub fn channel_bind_group(&self, name: &str) -> Option<&wgpu::BindGroup> {
         let channels = self.channels.as_ref()?;
         let i = channels.declared.iter().position(|c| c.name == name)?;
-        channels.bind_groups.get(i)?.as_ref()
+        channels.bind_groups.get(i)
     }
 
     /// The view of the channel a terminal declared under `name`, for a
@@ -377,6 +379,12 @@ impl Scratch {
     /// Texel format of both sides.
     pub fn format(&self) -> wgpu::TextureFormat {
         self.format
+    }
+
+    /// Usage the write side was allocated with: attachment, copy and
+    /// sampling always, plus storage under a compute dab pass.
+    pub fn write_usage(&self) -> wgpu::TextureUsages {
+        self.write_texture.usage()
     }
 
     /// Stroke-prologue helper: clear the write side to fully transparent
@@ -547,7 +555,8 @@ impl Scratch {
         let target_w = new_w.max(self.write_w);
         let target_h = new_h.max(self.write_h);
 
-        let (new_texture, new_view) = create_write_texture(device, target_w, target_h, self.format);
+        let (new_texture, new_view) =
+            create_write_texture(device, target_w, target_h, self.format, self.pass);
 
         // Copy existing scratch contents into the new texture at the
         // canvas-anchored offset.  Old regions outside the source rect
@@ -579,12 +588,11 @@ impl Scratch {
             );
         }
 
-        let new_bind_group = canvas_copy_bind_group(
+        let new_bind_group = self.layouts.for_format(self.format).bind(
             device,
-            &self.canvas_copy_bgl,
             "scratch-write-bg",
             &new_view,
-            &self.write_sampler,
+            Some(&self.write_sampler),
         );
 
         // Channels rebase identically: same target size, same canvas-
@@ -595,7 +603,7 @@ impl Scratch {
         if let Some(old) = self.channels.take() {
             let grown = build_channels(
                 device,
-                &self.canvas_copy_bgl,
+                &self.layouts,
                 &self.write_sampler,
                 target_w,
                 target_h,
@@ -631,12 +639,11 @@ impl Scratch {
     fn grow_read_mirror(&mut self, device: &wgpu::Device, new_w: u32, new_h: u32) {
         let (new_texture, new_view) = create_read_mirror_texture(device, new_w, new_h, self.format);
 
-        let new_read_bg = canvas_copy_bind_group(
+        let new_read_bg = self.layouts.for_format(self.format).bind(
             device,
-            &self.canvas_copy_bgl,
             "scratch-read-mirror-bg",
             &new_view,
-            &self.read_mirror_sampler,
+            None,
         );
 
         self.read_mirror_texture = new_texture;
@@ -655,7 +662,7 @@ impl Scratch {
 /// mirror so a dab can sample it without an origin translation.
 fn build_channels(
     device: &wgpu::Device,
-    canvas_copy_bgl: &wgpu::BindGroupLayout,
+    layouts: &CanvasCopyLayouts,
     sampler: &wgpu::Sampler,
     width: u32,
     height: u32,
@@ -690,16 +697,12 @@ fn build_channels(
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        bind_groups.push(match channel.kind {
-            ChannelUse::Attachment { .. } => Some(canvas_copy_bind_group(
-                device,
-                canvas_copy_bgl,
-                &format!("scratch-channel-{}-bg", channel.name),
-                &view,
-                sampler,
-            )),
-            ChannelUse::Storage => None,
-        });
+        bind_groups.push(layouts.for_format(channel.format).bind(
+            device,
+            &format!("scratch-channel-{}-bg", channel.name),
+            &view,
+            Some(sampler),
+        ));
         views.push(view);
         textures.push(texture);
     }
@@ -777,11 +780,15 @@ fn copy_region_offset(
     );
 }
 
+/// The write side: an attachment the framework clears, a copy source and
+/// destination for the checkpoint ring and the grow, a sampled foreground
+/// at commit, and under a compute dab pass a read-write storage texture.
 fn create_write_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    pass: DabPass,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("scratch-write"),
@@ -797,7 +804,8 @@ fn create_write_texture(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::TEXTURE_BINDING,
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | pass.write_side_usage(),
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -828,28 +836,98 @@ fn create_read_mirror_texture(
     (texture, view)
 }
 
-/// A `(texture, sampler)` bind group over the canvas-copy layout: what
-/// every side of the scratch (write, read mirror, each channel) is read
-/// through.
-fn canvas_copy_bind_group(
-    device: &wgpu::Device,
-    canvas_copy_bgl: &wgpu::BindGroupLayout,
-    label: &str,
-    view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout: canvas_copy_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brush::pipeline::BrushPipelines;
+    use crate::gpu::test_utils::test_device;
+
+    fn make_scratch(
+        format: wgpu::TextureFormat,
+        pass: DabPass,
+    ) -> (wgpu::Device, wgpu::Queue, Scratch) {
+        let (device, queue) = test_device();
+        let pipelines = BrushPipelines::new(
+            &device,
+            &queue,
+            &crate::gpu::selection::selection_mask_bgl(&device),
+        );
+        let scratch = Scratch::new(
+            &device,
+            32,
+            16,
+            pipelines.canvas_copy_layouts(),
+            format,
+            pass,
+        );
+        (device, queue, scratch)
+    }
+
+    /// A packed ground under a dispatch per dab is read-write storage, and
+    /// stays so through the framework's clear and grow; an instanced
+    /// scratch never is.
+    #[test]
+    fn dispatch_per_dab_write_side_has_storage_usage_and_a_uint_bind_group() {
+        let (device, queue, mut scratch) = make_scratch(
+            crate::brush::node::PACKED_GROUND_FORMAT,
+            DabPass::DispatchPerDab,
+        );
+        assert!(scratch
+            .write_usage()
+            .contains(wgpu::TextureUsages::STORAGE_BINDING));
+        assert!(scratch
+            .write_usage()
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        scratch.clear_to_transparent(&mut encoder);
+        scratch.grow_write(&device, &mut encoder, 48, 40, 16, 24);
+        queue.submit([encoder.finish()]);
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("the clear and the grow validate on a uint ground");
+        assert_eq!(scratch.write_dimensions(), (48, 40));
+        assert!(
+            scratch
+                .write_usage()
+                .contains(wgpu::TextureUsages::STORAGE_BINDING),
+            "the usage survives the grow"
+        );
+        // The write bind group is over the uint layout: binding it where a
+        // float layout is expected is a validation error, so the packed
+        // commit pipeline is what it pairs with.
+        let _ = scratch.write_bind_group();
+
+        let (_, _, instanced) = make_scratch(
+            crate::brush::node::COLOR_SCRATCH_FORMAT,
+            DabPass::InstancedDraw,
+        );
+        assert!(!instanced
+            .write_usage()
+            .contains(wgpu::TextureUsages::STORAGE_BINDING));
+    }
+
+    /// Every declared channel is readable through the canvas-copy layout
+    /// for its own format, a storage one included: the commit reads the
+    /// build ground back the same way it reads the scratch.
+    #[test]
+    fn storage_channels_get_a_read_bind_group() {
+        let (device, _queue, mut scratch) = make_scratch(
+            crate::brush::node::PACKED_GROUND_FORMAT,
+            DabPass::DispatchPerDab,
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        scratch.ensure_channels(
+            &device,
+            &mut encoder,
+            &[StrokeChannel {
+                name: "build",
+                format: crate::brush::node::PACKED_GROUND_FORMAT,
+                kind: ChannelUse::Storage,
+            }],
+        );
+        assert!(scratch.channel_view("build").is_some());
+        assert!(scratch.channel_bind_group("build").is_some());
+        assert!(scratch.channel_bind_group("deposit").is_none());
+    }
 }

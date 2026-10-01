@@ -245,12 +245,14 @@ pub struct DabBatch {
     pub batch_canvas_bbox: Option<crate::coord::CanvasRect>,
     /// Terminal-private per-dab CPU meta, packed by `evaluate_gpu` in
     /// lockstep with [`Self::bytes`] and drained by the terminal's
-    /// `flush_dabs` hook. Only used by per-dab-feedback terminals
-    /// (`smudge`, `liquify`) that need CPU-side state at flush time to
-    /// drive mirror-snapshot copies without re-deriving footprints from
-    /// GPU memory. The framework doesn't interpret these bytes: the
-    /// owning terminal reinterprets them via `bytemuck::cast_slice`
-    /// against its own meta record struct.
+    /// `flush_dabs` hook. Used by terminals that need CPU-side state per
+    /// dab at flush time: the per-dab-feedback terminals (`smudge`,
+    /// `liquify`) drive mirror-snapshot copies from it, and a
+    /// dispatch-per-dab terminal (`paint`) sizes each dab's dispatch
+    /// grid from it, neither re-deriving footprints from GPU memory.
+    /// The framework doesn't interpret these bytes: the owning terminal
+    /// reinterprets them via `bytemuck::cast_slice` against its own meta
+    /// record struct.
     pub meta_bytes: Vec<u8>,
     /// Union of canvas-pixel rects the current dab's passes write to.
     /// The node that issues the write is the only thing that knows the

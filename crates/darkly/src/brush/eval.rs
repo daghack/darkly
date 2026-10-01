@@ -806,24 +806,40 @@ impl BrushGraphRunner {
         self.plan.steps.iter().any(|step| step.is_terminal)
     }
 
-    /// Texel format the stroke scratch must be allocated in for this
-    /// brush: the terminal's declared
-    /// [`scratch_format`](crate::brush::node::BrushNodeRegistration::scratch_format).
+    /// The registration of this graph's terminal, which is what declares
+    /// how the stroke scratch is allocated and written. `None` for a
+    /// terminal-less graph, which never renders.
     ///
     /// Type-owned dispatch, same shape as [`Self::has_terminal`]: the
-    /// terminal answers what its scratch holds, and callers
-    /// (`StrokeBuffer::new`, the preview renderer) just pass the answer
-    /// through. A terminal-less graph gets the colour default; it never
-    /// renders anyway.
-    pub fn scratch_format(&self) -> wgpu::TextureFormat {
+    /// terminal answers what its scratch holds and how its pass writes it,
+    /// and callers (`StrokeBuffer::new`, the preview renderer, the WGSL
+    /// compiler) just pass the answer through.
+    pub fn terminal_registration(&self) -> Option<&'static super::node::BrushNodeRegistration> {
         let registry = crate::brush::registry();
         self.plan
             .steps
             .iter()
             .filter(|step| step.is_terminal)
             .find_map(|step| registry.get(&step.type_id))
+    }
+
+    /// Texel format the stroke scratch must be allocated in for this
+    /// brush: the terminal's declared
+    /// [`scratch_format`](crate::brush::node::BrushNodeRegistration::scratch_format).
+    /// A terminal-less graph gets the colour default.
+    pub fn scratch_format(&self) -> wgpu::TextureFormat {
+        self.terminal_registration()
             .map(|reg| reg.scratch_format)
             .unwrap_or(crate::brush::node::COLOR_SCRATCH_FORMAT)
+    }
+
+    /// How the terminal's per-dab pass writes the scratch: its declared
+    /// [`dab_pass`](crate::brush::node::BrushNodeRegistration::dab_pass).
+    /// A terminal-less graph gets the instanced default.
+    pub fn dab_pass(&self) -> super::node::DabPass {
+        self.terminal_registration()
+            .map(|reg| reg.dab_pass)
+            .unwrap_or_default()
     }
 
     /// Build a name → value map of every output slot in the graph,

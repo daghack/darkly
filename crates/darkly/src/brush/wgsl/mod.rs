@@ -1,16 +1,20 @@
-//! Framework for compiling brush graphs to a single WGSL fragment shader.
+//! Framework for compiling brush graphs to a single WGSL stroke shader.
 //!
 //! At brush-load time, the compiler walks the existing `ExecutionPlan`
 //! and asks each node to emit its WGSL contribution. The pieces are
 //! concatenated into one shader that evaluates the whole graph per
-//! fragment, per dab: no per-dab GPU dispatch, no inter-node textures.
+//! pixel, per dab: no inter-node textures.
 //!
-//! ## Two execution models, chosen per brush at the terminal
+//! ## Two skeletons, chosen by the terminal's registration
 //!
-//! A brush graph compiles its entire upstream chain into one fragment
-//! shader per terminal: `circle`, `stamp`, `paint_color`, etc. fuse
-//! inline, evaluated per-fragment-per-dab. No upstream per-dab GPU
-//! dispatch happens.
+//! A brush graph compiles its entire upstream chain into one shader per
+//! terminal: `circle`, `stamp`, `paint_color`, etc. fuse inline,
+//! evaluated per-pixel-per-dab. The outer skeleton is the terminal's
+//! declared [`DabPass`]: an instanced quad per dab with a fragment entry
+//! (`fs_main`), or one compute dispatch per dab over the dab's footprint
+//! with a compute entry (`cs_main`) that reads and writes the stroke
+//! scratch as storage. Every node body is spliced into either unchanged;
+//! the hover preview is always a fragment module.
 //!
 //! There is **no runtime fallback** and **no partial compilation**: a
 //! brush must have every upstream node implement
@@ -24,10 +28,10 @@
 //! 2. For each step, build a [`CompileWgslCtx`] with input bindings
 //!    resolved against upstream output expressions (or port defaults).
 //! 3. Call `evaluator.compile_wgsl(&cctx)`; abort on `Err`.
-//! 4. Concatenate `decls` into module scope, `body` into `fs_main`,
-//!    collect `dab_fields` + `uniform_fields`.
+//! 4. Concatenate `decls` into module scope, `body` into the entry
+//!    point, collect `dab_fields` + `uniform_fields`.
 //! 5. Emit the final shader: prelude + uniform/dab structs + decls +
-//!    fs_main wrapper that calls the terminal's emitted body.
+//!    the entry point wrapper that calls the terminal's emitted body.
 //!
 //! ## Per-dab record schema
 //!
@@ -74,6 +78,8 @@ pub use type_system::{DabField, DabPacker, UniformField, UniformPacker, ValuePac
 use std::collections::{HashMap, HashSet};
 
 use crate::brush::eval::BrushNodeEvaluator;
+use crate::brush::node::{BrushNodeRegistration, DabPass};
+use crate::brush::scratch::{ChannelUse, StrokeChannel};
 use crate::brush::wire::{BrushWireType, ScalarValue};
 use crate::nodegraph::{ExecutionPlan, NodeId, PortDir, PortRef};
 
@@ -86,13 +92,86 @@ use self::type_system::{compute_struct_size, compute_struct_size_for_uniforms};
 /// a canvas-to-target scale.
 const EPS_BBOX_CANVAS_PX: f32 = 1e-3;
 
+/// Threads per side of a dispatch-per-dab workgroup: the compute
+/// skeleton's `@workgroup_size`, and what a terminal divides a footprint
+/// by to size its dispatch grid. One constant, both sides. 8x8 was
+/// measured against 16x16 and a four-row-per-thread 8x2 by
+/// `dispatch_cost_bench` (`bench-results/dispatch-cost-bench-929928f9ab.md`):
+/// it wins at every small-dab cell, which is the stroke matrix's regime,
+/// and neither alternative beats it at 1000 px by enough to pay for that.
+pub const DAB_WORKGROUP: u32 = 8;
+
+/// `@group(1)` of the dispatch-per-dab skeleton: the dab records at 0, the
+/// dab slot at 1, the ground at 2, storage channels from 3.
+const GROUND_BINDING: u32 = 2;
+
+/// WGSL name of the stroke scratch in a dispatch-per-dab body.
+pub const GROUND_NAME: &str = "ground";
+
+/// One read-write storage texture of the dispatch-per-dab skeleton's
+/// `@group(1)`: what the generated declaration and the terminal's bind
+/// group layout entry both derive from, so the two cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageBinding {
+    pub binding: u32,
+    /// WGSL identifier the body reads and stores it by.
+    pub name: &'static str,
+    pub format: wgpu::TextureFormat,
+}
+
+impl StorageBinding {
+    /// The WGSL texel format of the `texture_storage_2d` declaration.
+    /// Core WebGPU allows read-write storage on the 32-bit single-channel
+    /// formats only, so those are the whole table.
+    pub fn wgsl_format(&self) -> Option<&'static str> {
+        match self.format {
+            wgpu::TextureFormat::R32Uint => Some("r32uint"),
+            wgpu::TextureFormat::R32Sint => Some("r32sint"),
+            wgpu::TextureFormat::R32Float => Some("r32float"),
+            _ => None,
+        }
+    }
+}
+
+/// The storage bindings a terminal's pass declares: none for an instanced
+/// draw; for a dispatch per dab the ground (the scratch, in its format) at
+/// [`GROUND_BINDING`] and then every storage channel in declaration order.
+fn storage_bindings(
+    dab_pass: DabPass,
+    scratch_format: wgpu::TextureFormat,
+    channels: &[StrokeChannel],
+) -> Vec<StorageBinding> {
+    if dab_pass != DabPass::DispatchPerDab {
+        return Vec::new();
+    }
+    std::iter::once(StorageBinding {
+        binding: GROUND_BINDING,
+        name: GROUND_NAME,
+        format: scratch_format,
+    })
+    .chain(
+        channels
+            .iter()
+            .filter(|c| c.kind == ChannelUse::Storage)
+            .enumerate()
+            .map(|(i, c)| StorageBinding {
+                binding: GROUND_BINDING + 1 + i as u32,
+                name: c.name,
+                format: c.format,
+            }),
+    )
+    .collect()
+}
+
 // ── Compiled output ─────────────────────────────────────────────────────
 
 /// A fully compiled brush graph: WGSL source + the schemas needed to
 /// pack per-dab records and stroke-constant uniforms.
 #[derive(Clone)]
 pub struct CompiledBrush {
-    /// Full WGSL source for the brush's stroke fragment shader.
+    /// Full WGSL source for the brush's stroke shader: a fragment module
+    /// under [`DabPass::InstancedDraw`], a compute module under
+    /// [`DabPass::DispatchPerDab`] (see `dab_pass`).
     pub stroke_wgsl: String,
     /// Full WGSL source for the brush's preview (hover-cursor) fragment
     /// shader. Same dab / uniform layouts as `stroke_wgsl`; differs
@@ -139,33 +218,37 @@ pub struct CompiledBrush {
     /// their producing node published this flush. Deduplicated by the
     /// compiler so two nodes requesting the same source share one binding.
     pub graph_sources: Vec<crate::brush::texture_source::ResolvedSource>,
-    /// Blend state the per-dab pipeline writes the stroke scratch with,
-    /// chosen by the terminal at compile time. See
-    /// [`crate::brush::node::PREMULTIPLIED_SOURCE_OVER`] and
-    /// [`crate::brush::node::COVERAGE_CEILING`].
-    pub dab_blend: wgpu::BlendState,
+    /// How the terminal's per-dab pass writes the scratch, from its
+    /// registration: decides which skeleton `stroke_wgsl` was assembled
+    /// with and which pipeline kind the terminal builds from it.
+    pub dab_pass: DabPass,
+    /// Texel format of the stroke scratch, from the terminal's
+    /// registration: the ground's format in a dispatch-per-dab module.
+    pub scratch_format: wgpu::TextureFormat,
     /// Extra per-texel accumulators this brush's terminal writes beside
     /// the stroke scratch, in the order the generated `FsOut` declares
-    /// them. Empty for the brushes that need only the scratch.
-    pub channels: Vec<crate::brush::scratch::StrokeChannel>,
+    /// them (attachments) or the storage bindings number them. Empty for
+    /// the brushes that need only the scratch.
+    pub channels: Vec<StrokeChannel>,
 }
 
 impl CompiledBrush {
-    /// Colour targets for the per-dab pipeline: the stroke scratch under
-    /// `scratch_format` and `self.dab_blend`, then one per declared
-    /// channel under its own format and blend.
+    /// Colour targets for an instanced per-dab pipeline: the stroke
+    /// scratch under `scratch_format` and `scratch_blend`, then one per
+    /// declared attachment channel under its own format and blend.
     ///
-    /// The single source for what a per-dab pass writes. A terminal that
-    /// declares a channel gets the target, the attachment
+    /// The single source for what an instanced pass writes. A terminal
+    /// that declares a channel gets the target, the attachment
     /// ([`Scratch::color_attachments`](crate::brush::scratch::Scratch::color_attachments))
     /// and the `FsOut` field from that one declaration.
     pub fn color_targets(
         &self,
         scratch_format: wgpu::TextureFormat,
+        scratch_blend: wgpu::BlendState,
     ) -> Vec<Option<wgpu::ColorTargetState>> {
         std::iter::once(wgpu::ColorTargetState {
             format: scratch_format,
-            blend: Some(self.dab_blend),
+            blend: Some(scratch_blend),
             write_mask: wgpu::ColorWrites::ALL,
         })
         .chain(
@@ -178,13 +261,21 @@ impl CompiledBrush {
         .map(Some)
         .collect()
     }
+
+    /// The read-write storage textures a dispatch-per-dab pipeline binds
+    /// in `@group(1)` after the dab records and the dab slot: the ground
+    /// (the scratch, named [`GROUND_NAME`]) and then every declared storage
+    /// channel by its name. Empty for an instanced terminal. The
+    /// assembled module declares exactly these, so a terminal's bind group
+    /// layout built from this list matches the shader by construction.
+    pub fn storage_bindings(&self) -> Vec<StorageBinding> {
+        storage_bindings(self.dab_pass, self.scratch_format, &self.channels)
+    }
 }
 
 /// The channels that are colour targets of the terminal's draw: every
 /// declared channel except the storage ones a compute pass writes.
-fn attachment_channels(
-    channels: &[crate::brush::scratch::StrokeChannel],
-) -> impl Iterator<Item = &crate::brush::scratch::StrokeChannel> {
+fn attachment_channels(channels: &[StrokeChannel]) -> impl Iterator<Item = &StrokeChannel> {
     channels.iter().filter(|c| c.attachment_blend().is_some())
 }
 
@@ -233,11 +324,14 @@ impl std::error::Error for CompileError {}
 /// `plan` must already be a topologically-sorted execution plan for
 /// `graph`. The compiler walks `plan.steps`; the last step's evaluator
 /// is the terminal and is responsible for emitting the `return` line
-/// in `body` (its `outputs` are unused).
+/// (or the stores, under a dispatch per dab) in `body` (its `outputs`
+/// are unused). `terminal` is that node's registration: its `dab_pass`
+/// picks the stroke skeleton and its `scratch_format` is the ground's.
 pub fn compile_brush_to_wgsl(
     graph: &crate::nodegraph::Graph<BrushWireType>,
     plan: &ExecutionPlan,
     evaluators: &HashMap<String, Box<dyn BrushNodeEvaluator>>,
+    terminal: &BrushNodeRegistration,
 ) -> Result<CompiledBrush, CompileError> {
     if plan.steps.is_empty() {
         return Err(CompileError::NoTerminal);
@@ -286,8 +380,7 @@ pub fn compile_brush_to_wgsl(
     // (e.g. `watercolor`'s pickup atlas). Preview mode omits
     // these: the preview body doesn't sample scratch / atlas.
     let mut terminal_bindings = String::new();
-    let mut channels: Vec<crate::brush::scratch::StrokeChannel> = Vec::new();
-    let mut dab_blend = crate::brush::node::PREMULTIPLIED_SOURCE_OVER;
+    let mut channels: Vec<StrokeChannel> = Vec::new();
 
     // `@group(3)` slots contributed by `image` / `noise` / live-texture
     // nodes, in the order each distinct source was first requested. Each
@@ -498,9 +591,6 @@ pub fn compile_brush_to_wgsl(
             terminal_bindings.push_str(&result.terminal_bindings);
         }
         channels.extend(result.channels);
-        if let Some(blend) = result.dab_blend {
-            dab_blend = blend;
-        }
 
         // Register this node's outputs so downstream nodes can resolve
         // their wires.
@@ -561,14 +651,41 @@ pub fn compile_brush_to_wgsl(
             ),
         });
     }
+    // A compute pass has no colour targets, so a channel it writes must
+    // be storage; and core WebGPU reads and writes storage only in the
+    // 32-bit single-channel formats.
+    if terminal.dab_pass == DabPass::DispatchPerDab {
+        if let Some(channel) = attachment_channels(&channels).next() {
+            return Err(CompileError::NodeNotCompilable {
+                type_id: terminal.type_id.to_string(),
+                reason: format!(
+                    "channel `{}` is a colour attachment, but a terminal that dispatches \
+                     per dab has no colour targets; declare it `ChannelUse::Storage`",
+                    channel.name
+                ),
+            });
+        }
+    }
+    let storage = storage_bindings(terminal.dab_pass, terminal.scratch_format, &channels);
+    if let Some(binding) = storage.iter().find(|b| b.wgsl_format().is_none()) {
+        return Err(CompileError::NodeNotCompilable {
+            type_id: terminal.type_id.to_string(),
+            reason: format!(
+                "`{}` is {:?}, which core WebGPU cannot bind as read-write storage \
+                 (r32uint, r32sint or r32float only)",
+                binding.name, binding.format
+            ),
+        });
+    }
     let stroke_wgsl = assemble_shader(
-        ShaderMode::Stroke,
+        ShaderMode::Stroke(terminal.dab_pass),
         &dab_fields,
         &uniform_fields,
         &decls,
         &stroke_body,
         &terminal_bindings,
         &channels,
+        &storage,
         &graph_sources,
     );
     // The preview skeleton writes no accumulators (it renders a cursor
@@ -582,6 +699,7 @@ pub fn compile_brush_to_wgsl(
         &preview_body,
         "",
         &[],
+        &[],
         &graph_sources,
     );
 
@@ -593,7 +711,8 @@ pub fn compile_brush_to_wgsl(
         compose_brush_extent(graph, plan, evaluators);
 
     Ok(CompiledBrush {
-        dab_blend,
+        dab_pass: terminal.dab_pass,
+        scratch_format: terminal.scratch_format,
         channels,
         stroke_wgsl,
         cursor_preview_wgsl,
@@ -896,9 +1015,10 @@ fn assemble_shader(
     dab_fields: &[DabField],
     uniform_fields: &[UniformField],
     node_decls: &str,
-    fs_body: &str,
+    body: &str,
     terminal_bindings: &str,
-    channels: &[crate::brush::scratch::StrokeChannel],
+    channels: &[StrokeChannel],
+    storage: &[StorageBinding],
     graph_sources: &[crate::brush::texture_source::ResolvedSource],
 ) -> String {
     let mut out = String::new();
@@ -939,13 +1059,29 @@ fn assemble_shader(
     }
 
     // Bind groups: group(0) = uniforms (both modes), group(1) = dabs
-    // storage (both modes). In stroke mode group(2) = selection and
+    // storage (both modes), plus under a dispatch per dab the dab slot
+    // and the storage textures. In stroke mode group(2) = selection and
     // optional terminal `@group(3)` bindings. Preview mode omits both:
     // the skeleton hard-codes `sel = 1.0` and the preview body never
     // samples scratch / atlas.
     out.push_str("@group(0) @binding(0) var<uniform> u: Uniforms;\n");
     out.push_str("@group(1) @binding(0) var<storage, read> dabs: array<DabRecord>;\n");
-    if mode == ShaderMode::Stroke {
+    if mode == ShaderMode::Stroke(DabPass::DispatchPerDab) {
+        // The dab a dispatch works on, reached through a static index
+        // buffer bound with a dynamic offset (slot `i` holds `i`).
+        out.push_str("struct DabSlot { i: u32, pad0: u32, pad1: u32, pad2: u32 };\n");
+        out.push_str("@group(1) @binding(1) var<uniform> slot: DabSlot;\n");
+        for b in storage {
+            let format = b
+                .wgsl_format()
+                .expect("compile_brush_to_wgsl rejects storage formats WGSL cannot bind");
+            out.push_str(&format!(
+                "@group(1) @binding({}) var {}: texture_storage_2d<{format}, read_write>;\n",
+                b.binding, b.name
+            ));
+        }
+    }
+    if matches!(mode, ShaderMode::Stroke(_)) {
         out.push_str("@group(2) @binding(0) var sel_tex: texture_2d<f32>;\n");
         out.push_str("@group(2) @binding(1) var sel_smp: sampler;\n");
         if !terminal_bindings.is_empty() {
@@ -988,34 +1124,90 @@ fn assemble_shader(
     }
     out.push('\n');
 
+    // The packed ground's texel convention, for every dispatch-per-dab
+    // body: premultiplied RGBA8 in one `u32`.
+    if mode == ShaderMode::Stroke(DabPass::DispatchPerDab) {
+        out.push_str(
+            "fn unpack_ground(texel: vec4<u32>) -> vec4<f32> { return unpack4x8unorm(texel.r); }\n",
+        );
+        out.push_str(
+            "fn pack_ground(c: vec4<f32>) -> vec4<u32> { return vec4<u32>(pack4x8unorm(c), 0u, 0u, 0u); }\n\n",
+        );
+    }
+
     // Node-level declarations (helper functions, const arrays).
     out.push_str(node_decls);
     out.push('\n');
 
-    // Vertex stage: paint.wgsl-style instanced quad in stroke mode,
-    // single quad at `dab.pos ± dab.bbox_target_px` mapped into the
-    // preview-mask viewport in preview mode.
     match mode {
-        ShaderMode::Stroke => out.push_str(STROKE_VERTEX_STAGE_WGSL),
-        ShaderMode::CursorPreview => out.push_str(PREVIEW_VERTEX_STAGE_WGSL),
+        ShaderMode::Stroke(DabPass::DispatchPerDab) => push_compute_entry(&mut out, body),
+        ShaderMode::Stroke(DabPass::InstancedDraw) => {
+            push_fragment_entry(&mut out, mode, STROKE_VERTEX_STAGE_WGSL, channels, body)
+        }
+        ShaderMode::CursorPreview => {
+            push_fragment_entry(&mut out, mode, PREVIEW_VERTEX_STAGE_WGSL, channels, body)
+        }
     }
-    out.push('\n');
 
-    // Fragment stage: header binds the fragment-local helpers, then
-    // splices in the node bodies, then ends with the terminal's
-    // `return` line (emitted into `fs_body`). The `sel` binding line
-    // differs between modes: stroke samples a real texture, preview
-    // hard-codes 1.0 (the full footprint, ignoring any active
-    // selection), matching master's preview behavior.
-    // A terminal that accumulates extra per-texel quantities alongside
-    // the scratch writes them as additional colour attachments on this
-    // same draw, so `fs_main` returns a struct instead of a bare vec4.
-    // The terminal's pipeline declares one colour target per output, in
-    // the same order, each with its own blend law.
-    // A storage channel is written by a compute pass, not by this draw,
-    // so it is neither an `FsOut` field nor a colour target.
-    let attachments: Vec<&crate::brush::scratch::StrokeChannel> =
-        attachment_channels(channels).collect();
+    out
+}
+
+/// The compute skeleton: one thread per pixel of the dab's layer-clamped
+/// footprint, the footprint's corner derived from the record exactly as
+/// the CPU derived it, every off-layer or past-bbox thread returning
+/// before the body.
+fn push_compute_entry(out: &mut String, body: &str) {
+    out.push_str(&format!(
+        "@compute @workgroup_size({DAB_WORKGROUP}, {DAB_WORKGROUP}, 1)\n"
+    ));
+    out.push_str("fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {\n");
+    out.push_str("    let d = dabs[slot.i];\n");
+    // The grid covers the dab's layer-clamped footprint from its corner:
+    // the same floor-and-clamp `record_dab_footprint` applied on the CPU
+    // (`Rect::clamp_f32`, which floors `position - bbox_radius` and
+    // intersects the paint target's extent), on the same f32 inputs. IEEE
+    // subtraction and `floor` are correctly rounded on both sides, so the
+    // corner is the rect's. Threads past the footprint's rounding or off
+    // the layer return here; the grid's size rides the terminal's per-dab
+    // meta.
+    out.push_str(
+        "    let origin = max(vec2<i32>(floor(d.pos - vec2<f32>(d.bbox_target_px))), u.intrinsic.layer_offset);\n",
+    );
+    out.push_str("    let canvas_px = origin + vec2<i32>(gid.xy);\n");
+    out.push_str("    let layer_px = canvas_px - u.intrinsic.layer_offset;\n");
+    out.push_str(
+        "    if (any(layer_px < vec2<i32>(0)) || any(layer_px >= vec2<i32>(u.intrinsic.layer_size))) {\n",
+    );
+    out.push_str("        return;\n");
+    out.push_str("    }\n");
+    // The pixel centre: the fragment skeleton evaluates at (i + 0.5,
+    // j + 0.5) too, so the two skeletons see the same `target_pos`.
+    out.push_str("    let target_pos = vec2<f32>(canvas_px) + vec2<f32>(0.5);\n");
+    push_pixel_locals(out, ShaderMode::Stroke(DabPass::DispatchPerDab));
+    out.push_str(body);
+    out.push_str("}\n");
+}
+
+/// The fragment skeleton: a vertex stage (instanced quads per dab for the
+/// stroke, one quad for the preview) and `fs_main`.
+///
+/// A terminal that accumulates extra per-texel quantities alongside the
+/// scratch writes them as additional colour attachments on this same
+/// draw, so `fs_main` returns a struct instead of a bare vec4. The
+/// terminal's pipeline declares one colour target per output, in the
+/// same order, each with its own blend law. A storage channel is written
+/// by a compute pass, not by this draw, so it is neither an `FsOut` field
+/// nor a colour target.
+fn push_fragment_entry(
+    out: &mut String,
+    mode: ShaderMode,
+    vertex_stage: &str,
+    channels: &[StrokeChannel],
+    body: &str,
+) {
+    out.push_str(vertex_stage);
+    out.push('\n');
+    let attachments: Vec<&StrokeChannel> = attachment_channels(channels).collect();
     if attachments.is_empty() {
         out.push_str("@fragment\n");
         out.push_str("fn fs_main(in: VsOut) -> @location(0) vec4<f32> {\n");
@@ -1039,10 +1231,24 @@ fn assemble_shader(
     // `d.pos` / `d.bbox_target_px` / `d.inv_radius_target_px` live in
     // the same frame, so `local` is unit-coherent regardless of mode.
     out.push_str("    let target_pos = in.target_pos;\n");
+    push_pixel_locals(out, mode);
+    out.push_str(body);
+    out.push_str("}\n");
+}
+
+/// The per-pixel bindings every node body relies on, from `target_pos`
+/// and `d` down to `sel`, shared by both skeletons so a body compiles
+/// into either unchanged. A thread or fragment past the dab's bbox leaves
+/// here: `discard` in a fragment, `return` in a compute thread.
+fn push_pixel_locals(out: &mut String, mode: ShaderMode) {
+    let reject = match mode {
+        ShaderMode::Stroke(DabPass::DispatchPerDab) => "return",
+        _ => "discard",
+    };
     out.push_str("    let local = target_pos - d.pos;\n");
     out.push_str("    let local_dist_px = length(local);\n");
     out.push_str("    if (local_dist_px >= d.bbox_target_px) {\n");
-    out.push_str("        discard;\n");
+    out.push_str(&format!("        {reject};\n"));
     out.push_str("    }\n");
     out.push_str("    let local_uv = local * d.inv_radius_target_px;\n");
     out.push_str("    let local_dist = length(local_uv);\n");
@@ -1067,16 +1273,13 @@ fn assemble_shader(
     match mode {
         // Stroke: `target_pos` is a plane position; the window-anchored
         // selection mask maps via `(target_pos - canvas_origin) / canvas_size`
-        // (see shaders/lib/canvas.wgsl).
-        ShaderMode::Stroke => out.push_str(
+        // (see shaders/lib/canvas.wgsl). Explicit LOD, so the sample is
+        // legal in a compute thread as well as a fragment.
+        ShaderMode::Stroke(_) => out.push_str(
             "    let sel = textureSampleLevel(sel_tex, sel_smp, plane_to_selection_uv(target_pos, canvas_origin, canvas_size), 0.0).r;\n",
         ),
         ShaderMode::CursorPreview => out.push_str("    let sel: f32 = 1.0;\n"),
     }
-    out.push_str(fs_body);
-    out.push_str("}\n");
-
-    out
 }
 
 /// Stroke-mode vertex stage: instanced quad per dab, mapped against

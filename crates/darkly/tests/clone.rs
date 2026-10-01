@@ -101,12 +101,14 @@ fn render_clone(p: &CloneParams) -> Vec<u8> {
         &queue,
         &darkly::gpu::selection::selection_mask_bgl(&device),
     );
+    let mut runner: BrushGraphRunner = compile_graph(&graph).expect("clone compiles");
     let mut stroke_buffer = StrokeBuffer::new(
         &device,
         W,
         W,
         &pipelines,
-        darkly::brush::node::COLOR_SCRATCH_FORMAT,
+        runner.scratch_format(),
+        runner.dab_pass(),
     );
 
     let layer_rect = CanvasRect::from_xywh(p.origin[0], p.origin[1], W, W);
@@ -122,7 +124,6 @@ fn render_clone(p: &CloneParams) -> Vec<u8> {
     stroke_buffer.save_pre_stroke(&device, &mut enc, &pipelines, &pre_stroke);
     queue.submit([enc.finish()]);
 
-    let mut runner: BrushGraphRunner = compile_graph(&graph).expect("clone compiles");
     assert!(
         runner.samples_source(),
         "Clone brush must report samples_source"

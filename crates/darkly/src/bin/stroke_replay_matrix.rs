@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use darkly::brush::builtin_brushes;
-use darkly::brush::portable::PortableBrush;
 use darkly::engine::DarklyEngine;
 use darkly::format::stroke_recording::{replay, ReplayPacing, StrokeRecording};
 use darkly::gpu::context::GpuContext;
@@ -59,11 +58,6 @@ const BRUSH_NAME_WATERCOLOR: &str = "Smooth Watercolor";
 const BRUSH_NAME_ROUGH_INK: &str = "Rough Ink";
 const BRUSH_NAME_SMUDGE: &str = "Smudge";
 const BRUSH_NAME_LIQUIFY: &str = "Liquify";
-const BRUSH_NAME_DISPATCH_SPIKE: &str = "Ink Pen (dispatch spike)";
-/// The Ink Pen with its terminal swapped for the spike; a fixture rather
-/// than a builtin so nothing shipped carries the measurement vehicle.
-const DISPATCH_SPIKE_FIXTURE: &str =
-    include_str!("../../tests/fixtures/ink_pen_dispatch_spike.yaml");
 
 /// Stabilizer strength override. The recorded stroke is what stresses
 /// the stabilizer; cranking this to 1.0 maximises the rewind workload.
@@ -98,12 +92,6 @@ enum Topology {
     /// per-dab regime scales with displacement padding (larger read
     /// footprint vs. smudge).
     Liquify,
-    /// The Ink Pen graph terminating in `paint_dispatch_spike`: one
-    /// compute dispatch per dab inside one compute pass, against a
-    /// stroke-resident `r32uint` ground. Attempt #5 of
-    /// `docs/paint-compute-perf-tracking.md`; the brush is a test
-    /// fixture, not a builtin.
-    PaintDispatchSpike,
 }
 
 impl Topology {
@@ -114,7 +102,6 @@ impl Topology {
             "rough-ink" | "rough_ink" | "compiled" => Some(Topology::RoughInk),
             "smudge" => Some(Topology::Smudge),
             "liquify" => Some(Topology::Liquify),
-            "paint-dispatch-spike" | "spike" => Some(Topology::PaintDispatchSpike),
             _ => None,
         }
     }
@@ -126,7 +113,6 @@ impl Topology {
             Topology::RoughInk => "rough-ink",
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
-            Topology::PaintDispatchSpike => "paint-dispatch-spike",
         }
     }
 
@@ -139,7 +125,6 @@ impl Topology {
             Topology::RoughInk => "paint",
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
-            Topology::PaintDispatchSpike => "paint_dispatch_spike",
         }
     }
 
@@ -150,19 +135,11 @@ impl Topology {
             Topology::RoughInk => BRUSH_NAME_ROUGH_INK,
             Topology::Smudge => BRUSH_NAME_SMUDGE,
             Topology::Liquify => BRUSH_NAME_LIQUIFY,
-            Topology::PaintDispatchSpike => BRUSH_NAME_DISPATCH_SPIKE,
         }
     }
 
-    /// The topology's brush: a builtin by name, or the spike's fixture.
+    /// The topology's brush, a builtin by name.
     fn brush(self) -> darkly::brush::metadata::Brush {
-        if self == Topology::PaintDispatchSpike {
-            let portable: PortableBrush =
-                serde_yaml_ng::from_str(DISPATCH_SPIKE_FIXTURE).expect("spike fixture parses");
-            return portable
-                .into_brush(darkly::brush::registry(), "paint-dispatch-spike")
-                .expect("spike fixture builds");
-        }
         let brush_name = self.brush_name();
         builtin_brushes::all()
             .into_iter()
@@ -198,20 +175,19 @@ fn parse_args() -> Args {
                 topology = Topology::parse(&v).unwrap_or_else(|| {
                     panic!(
                         "unknown topology `{v}`, expected `paint`, `watercolor`, `rough-ink`, \
-                         `smudge`, `liquify`, or `paint-dispatch-spike`"
+                         `smudge`, or `liquify`"
                     )
                 });
             }
             "-h" | "--help" => {
                 eprintln!(
                     "stroke_replay_matrix --input <path> [--output <tsv>] \
-                     [--topology paint|watercolor|rough-ink|smudge|liquify|paint-dispatch-spike]\n\n\
+                     [--topology paint|watercolor|rough-ink|smudge|liquify]\n\n\
                      Replays a recording across the configured (dab_radius × resolution) matrix.\n\
                      Axes are constants at the top of stroke_replay_matrix.rs.\n\
                      `paint` = Ink Pen (compiled). `watercolor` = Smooth Watercolor (compiled).\n\
                      `rough-ink` = the demo brush with the upstream random graph.\n\
-                     `smudge` / `liquify` = the read-mirror terminals, one pass per dab.\n\
-                     `paint-dispatch-spike` = the Ink Pen on the dispatch-per-dab spike terminal."
+                     `smudge` / `liquify` = the read-mirror terminals, one pass per dab."
                 );
                 std::process::exit(0);
             }

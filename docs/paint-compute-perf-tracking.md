@@ -599,8 +599,9 @@ equals its `dabs/ev`.
   must measure on a discrete GPU before committing to compute-only there.
 - **Parity holds.** `tests/paint_dispatch_spike.rs`: the same stroke
   through the Ink Pen and through the spike lands the same pixels within
-  4 LSB per channel in premultiplied space, 87% of painted pixels within
-  1 LSB (the pack's rounding against the blend unit's). Two replays of the
+  4 LSB per channel in premultiplied space, 97% of painted pixels within
+  1 LSB (1002 exact and 8291 at exactly 1 LSB of 9559; the pack's rounding
+  against the blend unit's). Two replays of the
   recorded stroke at full stabilisation agree byte for byte, which
   exercises the `r32uint` ground through the checkpoint ring's rewinds.
 - **The first spike run dispatched over the unclipped bounding box**, as
@@ -625,6 +626,119 @@ the pack and unpack), or measured again on a discrete GPU first.
 **Kept:** the spike stays in the tree behind its bench topology until the
 port replaces it, per the plan. `ChannelUse` and the `dispatches` counter
 are permanent.
+
+### #6: the compute paint terminal (shipped)
+
+**Shape:** `paint` ported to the stage 2 shape with the spike's artefacts
+removed (`crates/darkly/src/brush/nodes/paint.rs`, plan
+`docs/plans/compute-paint-terminal.md`). The terminal's registration
+declares `dab_pass: DispatchPerDab` and `scratch_format: R32Uint`; the
+ground *is* the stroke scratch, so the checkpoint ring, the clear, the
+grow and the commit act on one texture and the unpack pass and the doubled
+checkpoint copies are gone. The WGSL assembler emits a compute skeleton
+(`cs_main`, `@workgroup_size(8, 8, 1)`) for a terminal that declares the
+pass; every node body is spliced into it unchanged. The accumulation laws
+are shader code in `shaders/brush/paint_accumulate.wgsl`, applied per dab
+against the live ground: build-up is premultiplied source-over, wash is
+the commit's deposit ceiling (`shaders/lib/deposit_ceiling.wgsl`, shared
+with `composite.wgsl`), which for one pigment reproduces the `Max` blend
+exactly. Inside the dial the build half gets a second packed ground as a
+storage channel and the commit is unchanged. The commit reads the packed
+ground through a second fragment entry point (`fs_packed`). Selection is
+sampled per dab inside the law; erase stays at commit. The spike, its
+shader, fixture, test and bench topology are deleted.
+
+**Measurements before, on this machine** (Intel Raptor Lake-P iGPU,
+Vulkan, Mesa 26.2.3): `paint` twice at `929928f9ab`, which agree with the
+`746570670c` reference within the noise band on every cell but 4K at
+2000 px (+44 and +119 against +11; that cell is noisy here). The harness
+with two new variants of (a), `bench-results/dispatch-cost-bench-929928f9ab.md`:
+a 16x16 workgroup and an 8x2 workgroup whose threads each walk four rows.
+8x8 wins every small-dab cell (1.5 px and 10 px at 300 to 2000 dabs:
+16x16 is 15 to 45% slower on wall, four rows 30 to 70% slower); at
+1000 px the row loop gains about 20% of GPU time (1.0 to 0.8 ms per dab)
+and 16x16 gains nothing. `DAB_WORKGROUP` is 8.
+
+**Bench data after the port**, same session, `paint` twice
+(`bench-results/stroke-replay-matrix-paint-compute-after{,-rerun}-recorded_curvy_stroke-929928f9ab`),
+`dispatches/ev == dabs/ev` on every cell:
+
+| canvas | radius_px | dabs/ev | before behind (ms) | before rerun | after behind (ms) | after rerun | before cpu p50 (us) | after cpu p50 (us) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1280×720 | 1 | 321.4 | +7 | +5 | +5 | +4 | 6294 | 6330 |
+| 1280×720 | 10 | 321.5 | +5 | +4 | +5 | +6 | 5921 | 6630 |
+| 1280×720 | 100 | 32.3 | +9 | +5 | +6 | +6 | 3936 | 4272 |
+| 1280×720 | 250 | 13.0 | +9 | +8 | +10 | +10 | 3728 | 4303 |
+| 1280×720 | 500 | 6.5 | +9 | +8 | +10 | +10 | 3437 | 4056 |
+| 1280×720 | 1000 | 3.3 | +10 | +9 | +10 | +9 | 3290 | 3418 |
+| 1280×720 | 2000 | 1.7 | +9 | +9 | +5 | +8 | 2981 | 3535 |
+| 1920×1080 | 1 | 490.9 | +4 | +9 | +7 | +8 | 6578 | 7198 |
+| 1920×1080 | 10 | 491.0 | +8 | +5 | +9 | +6 | 6607 | 7313 |
+| 1920×1080 | 100 | 49.2 | +6 | +6 | +6 | +6 | 4378 | 5048 |
+| 1920×1080 | 250 | 19.7 | +10 | +9 | +11 | +9 | 3925 | 4824 |
+| 1920×1080 | 500 | 9.9 | +10 | +7 | +9 | +10 | 3881 | 4706 |
+| 1920×1080 | 1000 | 5.0 | +3 | +6 | +11 | +9 | 3518 | 4504 |
+| 1920×1080 | 2000 | 2.5 | +7 | +10 | +10 | +10 | 3312 | 4516 |
+| 2560×1440 | 1 | 666.8 | +2 | +4 | +9 | +8 | 7344 | 7552 |
+| 2560×1440 | 10 | 666.9 | +6 | +4 | +9 | +7 | 7167 | 7401 |
+| 2560×1440 | 100 | 66.8 | +5 | +4 | +6 | +7 | 4470 | 5812 |
+| 2560×1440 | 250 | 26.7 | +7 | +9 | +8 | +8 | 4054 | 5275 |
+| 2560×1440 | 500 | 13.3 | +8 | +10 | +9 | +10 | 3777 | 5301 |
+| 2560×1440 | 1000 | 6.7 | +7 | +8 | +11 | +12 | 3694 | 5438 |
+| 2560×1440 | 2000 | 3.3 | +9 | +8 | +11 | +11 | 3905 | 5320 |
+| 3840×2160 | 1 | 1021.4 | +4 | +11 | +8 | +7 | 7654 | 7997 |
+| 3840×2160 | 10 | 1021.5 | +7 | +7 | +7 | +8 | 7369 | 8097 |
+| 3840×2160 | 100 | 102.2 | +2 | +8 | +6 | +9 | 5289 | 6602 |
+| 3840×2160 | 250 | 40.9 | +8 | +8 | +11 | +10 | 4218 | 6153 |
+| 3840×2160 | 500 | 20.5 | +11 | +8 | +9 | +9 | 4173 | 6166 |
+| 3840×2160 | 1000 | 10.3 | +7 | +8 | +30 | +11 | 4869 | 6892 |
+| 3840×2160 | 2000 | 5.1 | +44 | +119 | +2986 | +1355 | 5743 | 25632 |
+
+**What it shows.**
+
+- **The gate is met.** Every cell at a radius of 500 px or less is within
+  a few ms of the baseline's `behind` (the band was +20 ms), with
+  `dispatches/ev` equal to `dabs/ev`. `cpu p50` sits 0 to 1.5 ms higher
+  than the instanced terminal's, which is the dispatch loop (two calls per
+  dab) and the per-flush bind group; it stays well inside the 16 ms event
+  budget at every cell, including 1021 dispatches per event at 4K.
+- **The large-dab regime is what stage 2 said it was.** 4K at 1000 px is
+  within noise (+30 and +11 against +7 and +8). 4K at 2000 px, five dabs
+  per event each clipped to most of an 8-megapixel canvas, is 1.4 to 3.0 s
+  behind over the 3.5 s stroke where the fragment path is +44 to +119; the
+  spike was +2688 with its unpack and doubled checkpoints. That cell's
+  noise is about ±800 ms here, and its `cpu p50` of 25 ms says the submit
+  is blocking on GPU work: the thread-per-pixel read-modify-write is
+  bandwidth-bound on this iGPU, about 2x the blend unit per pixel, as the
+  harness measured.
+- **The row loop, measured on the matrix and deferred.** Per the port
+  plan's commitment, the four-rows-per-thread skeleton was applied and the
+  matrix run once
+  (`bench-results/stroke-replay-matrix-paint-compute-after-four-rows-per-thread-recorded_curvy_stroke-929928f9ab.tsv`):
+  4K at 2000 px lands at +1115, 4K at 1000 px at +9, and every other cell
+  is unchanged, because the small-dab cells are CPU-bound and cannot show
+  the 30 to 70% GPU-time loss the harness measured there. It buys a
+  fraction of a second in a regime that is unusable on this GPU either way
+  and costs the regime artists paint in, so by the plan's rule it stays
+  deferred; `DAB_WORKGROUP` is the one knob, and a discrete-GPU session is
+  the place to revisit both.
+- **Parity holds.** Before the spike was deleted,
+  `spike_matches_paint_within_tolerance` measured the ported `paint`
+  against the spike on the 48-sample reversing stroke: 9559 painted
+  pixels, max 1 LSB in premultiplied space, none beyond 1 LSB. The
+  spike's own recorded distance from the fragment terminal (4 LSB max,
+  97% within 1 LSB) is the bridge to the old pixels. The exact
+  accumulation suite (`tests/brush_accumulation.rs`, 17 tests, the
+  within-stroke wash exactness and the mid-dial parity ladders) passes
+  unchanged.
+
+**Decision: shipped.** The instanced fragment terminal, its `Max` blend
+state, the `FsOut` build channel and the spike are gone; `paint` is one
+compute pass per flush, one dispatch per dab. What is deleted later, when
+its last user is a graph on `paint`: the read-mirror loop, the `smudge`
+and `blur` terminals, watercolor's atlas, the instanced skeleton and the
+float foreground entry in `composite.wgsl` (the port plan's "deleted
+later" list).
 
 ## Background changes that are NOT competing attempts
 
@@ -874,8 +988,9 @@ cells and the same recorded stroke as attempts #1 to #4. Result recorded
 here as attempt #5, kept or removed.
 
 **Status:** both stages passed their gates; see "#5, stage 1" and "#5,
-stage 2" under Attempts. The one regime where the fragment path wins,
-enormous dabs on an integrated GPU, is recorded there for the port's plan.
+stage 2" under Attempts, and the port of `paint` to this shape is attempt
+#6. The one regime where the fragment path wins, enormous dabs on an
+integrated GPU, is recorded there and under #6.
 
 ## What the user proposed
 
@@ -984,7 +1099,8 @@ along a different axis, with a different catastrophe regime:
 | **#1 fragment** | `dab_count` (per-pass driver overhead) + `Σ(dab_area)` (rasterized pixels) | many dabs/event: high stabilizer × tight spacing |
 | **#2 1-wg compute** | `union_bbox_area × dab_count` (64 threads chew tiles serially) + sync round-trip | large dabs anywhere: workgroup parallelism is the bottleneck |
 | **#3 thread-per-pixel** | `union_bbox_area` (sync copies + dispatch grid) | few large dabs spread over a big bbox |
-| **#4 instanced fragment** *(shipped)* | `Σ(dab_area)` (rasterized pixels): no per-pass overhead, no round-trip | heavy overdraw on huge overlapping dabs (theoretical; not reached in the matrix) |
+| **#4 instanced fragment** | `Σ(dab_area)` (rasterized pixels): no per-pass overhead, no round-trip | heavy overdraw on huge overlapping dabs (theoretical; not reached in the matrix) |
+| **#6 dispatch per dab** *(shipped)* | `dab_count` (one dispatch each, a few us) + `Σ(dab_area)` (one thread per pixel, a storage read-modify-write each): no pass per dab, no round-trip, the scratch is resident | huge dabs on a bandwidth-bound integrated GPU: about 2x the blend unit per pixel at 4K with 1000 px dabs |
 
 A 1px dab on a 4K canvas: #1 pays 1 render pass + ~1 pixel
 rasterized. #3 pays a sync round-trip of ~4 KB. #1 wins handily,
@@ -1041,10 +1157,11 @@ every cell.**
 | 3840×2160 | 1000 | +55 | **+33169** | **+3562** | **+20** |
 | 3840×2160 | 2000 | **+1249** | **+54099** | **+4200** | **+124** |
 
-#5 (dispatch per dab) was measured on a different machine and is not a
-column here; its same-session comparison against #4 is the table under
-"#5, stage 2" above. In short: within noise of #4 everywhere except 4K
-with dabs of 1000 px or more, where it loses on per-pixel cost.
+#5 (dispatch per dab) and #6 (the port of `paint` to that shape) were
+measured on a different machine and are not columns here; their
+same-session comparisons against #4 are the tables under "#5, stage 2" and
+"#6" above. In short: within noise of #4 everywhere except 4K with dabs of
+1000 px or more, where the compute shape loses on per-pixel cost.
 
 **Important framing: read radius as a spacing proxy.** Ink Pen's
 default spacing is a fraction of dab radius, so the matrix's radius

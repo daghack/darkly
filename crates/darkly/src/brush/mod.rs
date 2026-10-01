@@ -344,7 +344,10 @@ pub fn compile_graph(
         // Build a fresh evaluators map for the compiler; the runner
         // owns the live one. Cheap (just trait-object constructors).
         let compile_evals = registry.evaluators();
-        let compiled = wgsl::compile_brush_to_wgsl(&rewritten, &plan, &compile_evals)
+        let terminal = runner
+            .terminal_registration()
+            .ok_or_else(|| "graph has a terminal step with no registration".to_string())?;
+        let compiled = wgsl::compile_brush_to_wgsl(&rewritten, &plan, &compile_evals, terminal)
             .map_err(|e| format!("paint WGSL compilation failed: {e}"))?;
         runner.set_compiled_brush(std::sync::Arc::new(compiled));
     }

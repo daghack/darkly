@@ -690,7 +690,7 @@ impl DarklyEngine {
                     new_extent.height,
                     dx,
                     dy,
-                    self.brush_pipelines.canvas_copy_bind_group_layout(),
+                    self.brush_pipelines.canvas_copy_layout(),
                 );
             });
         }
@@ -1017,17 +1017,21 @@ impl DarklyEngine {
                 let layer_extent = layer_tex.layer_extent();
                 // The terminal decides what its scratch holds: colour for
                 // most brushes, a displacement field for liquify.
-                let scratch_format = self
+                let (scratch_format, dab_pass) = self
                     .brush_stroke_engine
                     .as_ref()
-                    .map(|e| e.scratch_format())
-                    .unwrap_or(crate::brush::node::COLOR_SCRATCH_FORMAT);
+                    .map(|e| (e.scratch_format(), e.dab_pass()))
+                    .unwrap_or((
+                        crate::brush::node::COLOR_SCRATCH_FORMAT,
+                        crate::brush::node::DabPass::InstancedDraw,
+                    ));
                 let mut stroke_buffer = StrokeBuffer::new(
                     &self.gpu.device,
                     layer_extent.width,
                     layer_extent.height,
                     &self.brush_pipelines,
                     scratch_format,
+                    dab_pass,
                 );
                 let paint_target = GpuPaintTarget::from_node(layer_tex, self.doc.canvas_rect());
                 self.gpu.encode("stroke-buffer-init", |encoder| {

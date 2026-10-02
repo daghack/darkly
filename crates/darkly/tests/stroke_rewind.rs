@@ -26,7 +26,7 @@ use darkly::brush::input_value::InputValue;
 use darkly::coord::CanvasRect;
 use darkly::engine::types::StrokeOp;
 use darkly::engine::DarklyEngine;
-use darkly::format::stroke_recording::{replay, ReplayPacing, StrokeRecording};
+use darkly::format::stroke_recording::{replay, EventTiming, ReplayPacing, StrokeRecording};
 use darkly::gpu::context::GpuContext;
 use darkly::gpu::test_utils::test_device;
 use darkly::layer::LayerId;
@@ -61,6 +61,16 @@ fn set_input(engine: &mut DarklyEngine, type_id: &str, port: &str, value: f32) {
     engine
         .brush_graph_set_input(&id, port, InputValue::Scalar(value))
         .unwrap_or_else(|e| panic!("{type_id}.{port}: {e:?}"));
+}
+
+/// A headless engine with `brush` installed at the given stabilizer
+/// strength.
+fn new_engine(canvas: (u32, u32), brush: &str, stabilize: f32) -> DarklyEngine {
+    let (device, queue) = test_device();
+    let mut engine = DarklyEngine::new(GpuContext::new_headless(device, queue), canvas.0, canvas.1);
+    install_builtin(&mut engine, brush);
+    set_input(&mut engine, "brush_settings", "stabilize", stabilize);
+    engine
 }
 
 fn event(x: f32, y: f32, t: f64) -> StrokeOp {
@@ -99,14 +109,7 @@ impl Cell<'_> {
         full_rerender: bool,
         drive: impl FnOnce(&mut DarklyEngine, LayerId),
     ) -> (Vec<u8>, CanvasRect) {
-        let (device, queue) = test_device();
-        let mut engine = DarklyEngine::new(
-            GpuContext::new_headless(device, queue),
-            self.canvas.0,
-            self.canvas.1,
-        );
-        install_builtin(&mut engine, self.brush);
-        set_input(&mut engine, "brush_settings", "stabilize", 0.0);
+        let mut engine = new_engine(self.canvas, self.brush, 0.0);
         if let Some(b) = self.buildup {
             set_input(&mut engine, "paint", "buildup", b);
         }
@@ -169,7 +172,11 @@ impl Cell<'_> {
     }
 }
 
-fn replay_recording(engine: &mut DarklyEngine, layer: LayerId, canvas: (u32, u32)) {
+fn replay_recording(
+    engine: &mut DarklyEngine,
+    layer: LayerId,
+    canvas: (u32, u32),
+) -> Vec<EventTiming> {
     let recording =
         StrokeRecording::load(&fixture("recorded_curvy_stroke.json")).expect("fixture parses");
     let timings = replay(
@@ -181,6 +188,36 @@ fn replay_recording(engine: &mut DarklyEngine, layer: LayerId, canvas: (u32, u32
         None,
     );
     assert_eq!(timings.len(), recording.events.len());
+    timings
+}
+
+/// A checkpoint save never submits on its own: it is recorded into the
+/// submission of the segment it snapshots. At `stabilize = 0` the
+/// synthetic tip correction rewinds to the checkpoint two indices below
+/// the tip and replays exactly two segments, so an event is at most four
+/// submissions: the stroke prologue or the rewind, the two segments
+/// (one may place no dab and still submits for its save), and the
+/// commit. A save in a submission of its own makes it six. Checked per
+/// event rather than as a stroke total, which could not tell one event
+/// over from another under.
+#[test]
+fn checkpoint_saves_share_their_segment_submission() {
+    let canvas = (1024, 512);
+    let mut engine = new_engine(canvas, "Ink Pen", 0.0);
+    let layer = engine.add_raster_layer(None);
+    let timings = replay_recording(&mut engine, layer, canvas);
+    engine.test_flush_readbacks();
+    assert_eq!(engine.test_stroke_full_rerender_events(), 0);
+    let over: Vec<(usize, u32)> = timings
+        .iter()
+        .filter(|t| t.submits > 4)
+        .map(|t| (t.index, t.submits))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "events with more submissions than rewind + two segments + commit (index, submits): \
+         {over:?}"
+    );
 }
 
 /// A stroke that walks inside the window, jumps off its left and top edges
@@ -237,7 +274,9 @@ fn recorded_stroke_rewinds_match_full_rerender() {
         canvas,
         crop: None,
     };
-    cell.assert_matches_oracle(|engine, layer| replay_recording(engine, layer, canvas));
+    cell.assert_matches_oracle(|engine, layer| {
+        replay_recording(engine, layer, canvas);
+    });
 }
 
 /// The same stroke with the `build` channel declared: the ring snapshots
@@ -252,7 +291,9 @@ fn two_grounds_rewind_together() {
         canvas,
         crop: None,
     };
-    cell.assert_matches_oracle(|engine, layer| replay_recording(engine, layer, canvas));
+    cell.assert_matches_oracle(|engine, layer| {
+        replay_recording(engine, layer, canvas);
+    });
 }
 
 /// A cropped window with a non-zero plane origin, a mid-stroke layer grow

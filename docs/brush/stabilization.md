@@ -195,7 +195,7 @@ Each tablet event follows one of three paths:
 3. Truncate save points and restore engine render state
 4. Invalidate stale checkpoints and mark what their textures still equal
 5. Compute segment boundaries based on divergence window
-6. Render each segment, saving a checkpoint at each boundary
+6. Render each segment and save a checkpoint at its boundary in the same submission (a copy recorded after the segment's pass reads the pass's result, so a save never submits on its own)
 7. Composite stroke buffer onto layer
 
 **Divergence without checkpoint (beginning of stroke):**
@@ -206,7 +206,7 @@ Each tablet event follows one of three paths:
 
 **No divergence (straight-line drawing, or strength=0):**
 1. Render only the new tail point
-2. Save a checkpoint if enough distance has passed since the last one
+2. Save a checkpoint in the same submission if enough distance has passed since the last one
 3. Composite
 
 ## Performance Characteristics

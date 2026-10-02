@@ -807,6 +807,65 @@ tracks the dispatch count, not the bbox; the handoff's remaining items
 (a full-layer pass that could be scissored to the rewound plus dirtied
 region, which the ring now computes) are where the 250 px residual lives.
 
+### #8: checkpoint saves in the segment's submission (shipped as stage one; the full fold is not worth it)
+
+**Shape:** not a terminal change; the submit count of the stabilized
+rewind-and-replay path in `crates/darkly/src/engine/painting.rs` (plan
+`docs/plans/stroke-replay-one-submit.md`, diagnosis
+`notes/handoffs/handoff-stabilized-stroke-perf.md`, item 1). At
+`stabilize = 0.6` an event replays 5.85 segments on average and used to
+submit each segment's dabs and then its checkpoint save separately, with
+the rewind and the commit in submissions of their own: about fourteen
+`queue.submit` calls per event. The handoff expected 1 to 3 ms per event
+in the browser from folding them into one. The plan staged the work so
+the submit cost could be measured before the invasive part: stage one
+records each save into its segment's encoder (a copy recorded after a
+pass reads the pass's result), removing the 5.85 save submits per event
+with no other change and keeping every segment's CPU/GPU overlap; stage
+two (one context per event, with the dab-batching terminals' per-flush
+`write_buffer` uploads turned into per-submission ring slots) would
+remove the rest.
+
+**Measurements, on this machine** (Intel Raptor Lake-P iGPU, Mesa
+26.2.3), before at `b6155333` and after stage one, the recorded curvy
+stroke (204 events) at 1920x1080, Pencil, `stabilize = 0.6`, browser
+medians of three, native single runs
+(`bench-results/stroke-replay-matrix-pencil-*-b615533324-saves-folded*`).
+
+| cell | browser before | browser after | native before | native after |
+|---|---:|---:|---:|---:|
+| 250 px, build-only (`buildup=100`) | 9.8 ms | 9.8 ms | 8.8 ms | 9.1 ms |
+| 500 px, build-only | 12.4 ms | 12.6 ms | 10.6 ms | 10.6 ms |
+| 250 px, mid-dial | 10.4 ms | 10.9 ms | 9.2 ms | 9.2 ms |
+| 500 px, mid-dial | 12.8 ms | 12.9 ms | 11.0 ms | 11.1 ms |
+
+Submits per stroke in the browser fell from 3215 to 2021 (1194 fewer:
+5.85 per event, exactly the saves), `dispatches` unchanged (23770 and
+11886), full re-render fallbacks 0, the realtime cell's
+`long_frames_over_33ms` 1 before and after and `behind_by_ms` within
+noise. The individual runs scatter by about 0.5 ms around each median in
+both directions; the medians moved by -0.0, +0.2, +0.5 and +0.1 ms.
+
+**Decision: stop at stage one.** Twelve hundred submits per stroke cost
+nothing measurable, so the per-submit cost under Dawn on this machine is
+below the noise floor (under about 0.05 ms, against the 0.07 ms the
+earlier instrumentation in `docs/brush/stabilization.md` booked for a
+submit) and the remaining eight submits per event are worth well under
+the plan's 1 ms gate; the plan's decision rule (stage one under 0.3 ms:
+do not build stage two) applies. Stage one stays as a simplification:
+the saves share their segment's submission, the two hand-bumped submit
+counters and the two `self.gpu.encode("checkpoint-save")` blocks are
+gone, and the stroke frame and channels come from the live context
+(`StrokeResources::scratch_frame`, `channel_textures`). The
+`tests/stroke_rewind.rs` oracle gates the fold and
+`checkpoint_saves_share_their_segment_submission` asserts it. What this
+rules out: submit count is not where the stabilized event's time goes.
+What is left of the handoff's list is item 2 (prediction rendered as an
+overlay rather than committed paint, which removes replayed segments
+outright) and item 4 (several dabs per dispatch, since the 250 px cell's
+time tracks its 116 dispatches per event), plus the commit scissor
+(item 3) as its own small plan.
+
 ## Background changes that are NOT competing attempts
 
 These landed for different reasons over the same time window. Listed

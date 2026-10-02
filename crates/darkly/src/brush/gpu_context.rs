@@ -459,6 +459,21 @@ impl<'a> StrokeResources<'a> {
         self.source_texture()
             .create_view(&wgpu::TextureViewDescriptor::default())
     }
+
+    /// The scratch's write side as a canvas frame: what the checkpoint
+    /// ring saves and restores, anchored at the paint target's extent.
+    pub fn scratch_frame(&self) -> crate::gpu::atlas::CanvasFrame<'_> {
+        crate::gpu::atlas::CanvasFrame {
+            texture: self.scratch.write_texture(),
+            canvas_extent: self.paint_target.canvas_extent(),
+        }
+    }
+
+    /// The scratch's channel textures in declaration order, as the
+    /// checkpoint ring takes them alongside [`Self::scratch_frame`].
+    pub fn channel_textures(&self) -> Vec<&wgpu::Texture> {
+        self.scratch.channel_textures().iter().collect()
+    }
 }
 
 /// Everything a GPU brush node needs to record render passes.

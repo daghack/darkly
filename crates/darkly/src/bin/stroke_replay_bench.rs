@@ -275,6 +275,7 @@ fn main() {
         layer_id,
         target_canvas,
         ReplayPacing::Realtime,
+        None,
     );
     let wall_elapsed_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 

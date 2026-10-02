@@ -185,6 +185,7 @@ pub fn replay(
     layer_id: LayerId,
     target_canvas: (u32, u32),
     pacing: ReplayPacing,
+    mut after_event: Option<&mut dyn FnMut()>,
 ) -> Vec<EventTiming> {
     let scale = (
         target_canvas.0 as f32 / recording.canvas_width as f32,
@@ -212,6 +213,9 @@ pub fn replay(
         let op = ev.to_stroke_op(scale);
         let t = Instant::now();
         engine.stroke_to(op);
+        if let Some(hook) = after_event.as_deref_mut() {
+            hook();
+        }
         let cpu_us = t.elapsed().as_micros() as u64;
         let perf = engine.drain_brush_perf_delta();
 

@@ -16,12 +16,18 @@
 //!   upstream nodes that declared `uniform_fields` (e.g. `paint_color`).
 //! - **The ground is the stroke scratch**, a read-write `r32uint`
 //!   storage texture holding packed premultiplied RGBA8
-//!   ([`PACKED_GROUND_FORMAT`]). Each thread loads its texel, applies
-//!   the brush's accumulation law (`shaders/brush/paint_accumulate.wgsl`)
-//!   and stores it; dispatches in a pass are ordered and a dispatch's
-//!   stores are visible to the next, so every dab sees the previous
-//!   dab's output. The framework allocates, clears, checkpoints, restores
-//!   and grows the ground as it does any scratch.
+//!   ([`PACKED_GROUND_FORMAT`]). A thread whose dab has no coverage at
+//!   its pixel returns before touching any ground; every other thread
+//!   loads its texel, applies the brush's accumulation law
+//!   (`shaders/brush/paint_accumulate.wgsl`) and stores the packed
+//!   result only where it differs from what was loaded, so a dab the
+//!   wash's ceiling refuses costs a load and no store. Both are
+//!   identities at the texel: a zero source leaves either law's output
+//!   equal to its input, and storing an equal word changes nothing.
+//!   Dispatches in a pass are ordered and a dispatch's stores are visible
+//!   to the next, so every dab sees the previous dab's output. The
+//!   framework allocates, clears, checkpoints, restores and grows the
+//!   ground as it does any scratch.
 //! - **The dab index** reaches a dispatch through a static index buffer
 //!   (slot `i` holds `i`, written once at build) bound with a dynamic
 //!   offset: immediates are unavailable on the `webgpu` backend, and this
@@ -841,9 +847,11 @@ impl BrushNodeEvaluator for PaintEvaluator {
         vec![]
     }
 
-    /// Emit the compute body's terminal: multiplies the upstream graph's
-    /// premultiplied RGBA expression by the flow and the selection mask
-    /// and stores it through the brush's law. The framework's
+    /// Emit the compute body's terminal: returns when the upstream
+    /// graph's premultiplied RGBA has no coverage under the selection
+    /// mask, otherwise multiplies it by the flow and the mask and folds it
+    /// into each ground through the brush's law, storing a ground only
+    /// where the law changed its texel. The framework's
     /// [`crate::brush::wgsl::assemble_shader`] places the node bodies
     /// inside `cs_main` already bound with `d`, `u`, `local_uv`,
     /// `local_dist`, `theta`, `target_pos`, `sel`, `layer_px` and the
@@ -870,6 +878,9 @@ impl BrushNodeEvaluator for PaintEvaluator {
         })?;
         let (wash_share, build_share) = shares(buildup);
         let mut body = format!("    let rgba = {rgba_expr};\n");
+        // No coverage at this pixel: both laws would hand back the texel
+        // they were given, so the thread skips the flows and the grounds.
+        body.push_str("    if (rgba.a * sel == 0.0) {\n        return;\n    }\n");
         if wash_share > 0.0 {
             let expr = cctx.input("wash_flow").as_f32();
             body.push_str(&format!("    let wash_flow = clamp({expr}, 0.0, 1.0);\n"));
@@ -878,9 +889,16 @@ impl BrushNodeEvaluator for PaintEvaluator {
             let expr = cctx.input("build_flow").as_f32();
             body.push_str(&format!("    let build_flow = clamp({expr}, 0.0, 1.0);\n"));
         }
+        // A ground's read-modify-write. The store is skipped where the
+        // packed result equals the loaded word (a refused wash dab, say),
+        // which is exact: an equal store changes nothing.
         let store = |target: &str, law: &str, src: &str| {
             format!(
-                "    textureStore({target}, layer_px, pack_ground({law}({src}, unpack_ground(textureLoad({target}, layer_px)))));\n"
+                "    let {target}_was = textureLoad({target}, layer_px);\n\
+                 \x20   let {target}_now = pack_ground({law}({src}, unpack_ground({target}_was)));\n\
+                 \x20   if ({target}_now.r != {target}_was.r) {{\n\
+                 \x20       textureStore({target}, layer_px, {target}_now);\n\
+                 \x20   }}\n"
             )
         };
         if build_share <= 0.0 {

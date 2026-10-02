@@ -135,6 +135,7 @@ fn replay_is_deterministic_through_checkpoints_and_paints() {
             layer,
             canvas,
             ReplayPacing::AsFastAsPossible,
+            None,
         );
         assert_eq!(timings.len(), recording.events.len());
         engine.test_flush_readbacks();

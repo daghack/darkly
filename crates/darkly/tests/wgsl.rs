@@ -1923,14 +1923,30 @@ fn paint_terminal_compiles_the_accumulation_dial_to_storage_and_stores() {
         name: "ground",
         format: PACKED_GROUND_FORMAT,
     };
-    let build_store = |src: &str| {
-        format!("textureStore(build, layer_px, pack_ground(accumulate_build({src}, unpack_ground(textureLoad(build, layer_px)))));")
+    // A ground's read-modify-write: the law runs on the loaded texel and
+    // the packed result is stored only where it differs from what was
+    // there, so a refused dab costs a load and no store.
+    let guarded_store = |target: &str, law: &str, src: &str| {
+        format!(
+            "    let {target}_was = textureLoad({target}, layer_px);\n\
+             \x20   let {target}_now = pack_ground({law}({src}, unpack_ground({target}_was)));\n\
+             \x20   if ({target}_now.r != {target}_was.r) {{\n\
+             \x20       textureStore({target}, layer_px, {target}_now);\n\
+             \x20   }}\n"
+        )
     };
-    let wash_store = |src: &str| {
-        format!("textureStore(ground, layer_px, pack_ground(accumulate_wash({src}, unpack_ground(textureLoad(ground, layer_px)))));")
-    };
-    let ground_store = |src: &str| {
-        format!("textureStore(ground, layer_px, pack_ground(accumulate_build({src}, unpack_ground(textureLoad(ground, layer_px)))));")
+    let build_store = |src: &str| guarded_store("build", "accumulate_build", src);
+    let wash_store = |src: &str| guarded_store("ground", "accumulate_wash", src);
+    let ground_store = |src: &str| guarded_store("ground", "accumulate_build", src);
+    // A thread whose dab has no coverage at its pixel returns before it
+    // touches any ground: the first texture load comes after the return.
+    let returns_before_any_load = |wgsl: &str| {
+        let body = &wgsl[wgsl.find("fn cs_main").expect("compute entry")..];
+        let ret = body
+            .find("    if (rgba.a * sel == 0.0) {\n        return;\n    }\n")
+            .expect("empty-coverage return");
+        let load = body.find("textureLoad(").expect("ground load");
+        ret < load
     };
 
     // Rough Ink never mentions `buildup`, so it is on the registration
@@ -1945,6 +1961,8 @@ fn paint_terminal_compiles_the_accumulation_dial_to_storage_and_stores() {
         .contains("let src = rgba * build_flow * sel;"));
     assert!(default.stroke_wgsl.contains(&ground_store("src")));
     assert!(!default.stroke_wgsl.contains(&wash_store("src")));
+    assert!(returns_before_any_load(&default.stroke_wgsl));
+    naga_validate(&default.stroke_wgsl, "paint build-up stroke");
     assert!(!default.stroke_wgsl.contains("FsOut"));
     assert!(!default.stroke_wgsl.contains("@fragment"));
     // The laws reach the module through the terminal's decls, with the
@@ -1973,6 +1991,8 @@ fn paint_terminal_compiles_the_accumulation_dial_to_storage_and_stores() {
         .stroke_wgsl
         .contains("let src = rgba * wash_flow * sel;"));
     assert!(wash.stroke_wgsl.contains(&wash_store("src")));
+    assert!(returns_before_any_load(&wash.stroke_wgsl));
+    naga_validate(&wash.stroke_wgsl, "paint wash stroke");
     assert!(!wash.stroke_wgsl.contains("build_flow"));
     assert!(!wash.stroke_wgsl.contains("FsOut"));
 
@@ -2005,6 +2025,9 @@ fn paint_terminal_compiles_the_accumulation_dial_to_storage_and_stores() {
         .contains("let build_src = rgba * build_flow * sel * 0.500000;"));
     assert!(mid.stroke_wgsl.contains(&wash_store("wash_src")));
     assert!(mid.stroke_wgsl.contains(&build_store("build_src")));
+    assert_eq!(mid.stroke_wgsl.matches("textureStore(").count(), 2);
+    assert!(returns_before_any_load(&mid.stroke_wgsl));
+    naga_validate(&mid.stroke_wgsl, "paint mid-dial stroke");
     assert!(!mid.stroke_wgsl.contains("FsOut"));
     // The preview skeleton is a single-output fragment module and has no
     // ground to store into.
@@ -2245,11 +2268,12 @@ fn authored_buildup_picks_the_accumulation_shape() {
         compile_brush_to_wgsl(&graph, &plan, &evals(), terminal_of(&graph)).expect("compiles")
     };
 
-    // The store line of the law a ground accumulates under.
+    // The law a ground accumulates under, as the line that computes its
+    // next texel.
     let stores = |compiled: &darkly::brush::wgsl::CompiledBrush, target: &str, law: &str| {
-        compiled.stroke_wgsl.contains(&format!(
-            "textureStore({target}, layer_px, pack_ground({law}("
-        ))
+        compiled
+            .stroke_wgsl
+            .contains(&format!("let {target}_now = pack_ground({law}("))
     };
 
     let top = compiled_at(Some(1.0));

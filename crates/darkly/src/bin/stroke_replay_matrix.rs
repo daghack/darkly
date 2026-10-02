@@ -14,12 +14,20 @@
 //! Each cell:
 //!   - Builds a fresh `DarklyEngine` at the cell's canvas size.
 //!   - Loads the topology's brush (`Ink Pen` for paint-family
-//!     topologies, `Smooth Watercolor` for the watercolor topology),
-//!     sets `pen_input.stabilize = 1.0` and the `pen_input.size`
-//!     base-size knob to the cell's dab radius.
+//!     topologies, `Smooth Watercolor` for the watercolor topology,
+//!     `Pencil` for the mid-dial one), sets `brush_settings.stabilize` to
+//!     `--stabilize` (default 1.0), the `brush_settings.size` base-size
+//!     knob to the cell's dab radius, and `paint.buildup` to `--buildup`
+//!     when given.
 //!   - Adds a raster layer.
-//!   - Replays the recording at `ReplayPacing::Realtime`.
+//!   - Replays the recording at `ReplayPacing::Realtime`. With
+//!     `--gpu-sync` the replay blocks on the device after every event, so
+//!     the `cpu` columns cover the GPU's work for the event as well; it is
+//!     the test-only blocking escape hatch and never leaves this binary.
 //!   - Records per-event CPU + per-flush workload counters.
+//!
+//! `--only WxH:R` (repeatable) runs those cells instead of the whole
+//! matrix.
 //!
 //! Note on `dab_radius_px`: this is the `pen_input.size` base value at
 //! terminal modulation = 1.0. Ink Pen modulates the terminal's `size`
@@ -58,9 +66,11 @@ const BRUSH_NAME_WATERCOLOR: &str = "Smooth Watercolor";
 const BRUSH_NAME_ROUGH_INK: &str = "Rough Ink";
 const BRUSH_NAME_SMUDGE: &str = "Smudge";
 const BRUSH_NAME_LIQUIFY: &str = "Liquify";
+const BRUSH_NAME_PENCIL: &str = "Pencil";
 
-/// Stabilizer strength override. The recorded stroke is what stresses
-/// the stabilizer; cranking this to 1.0 maximises the rewind workload.
+/// Default stabilizer strength (`--stabilize` overrides it). The recorded
+/// stroke is what stresses the stabilizer; 1.0 maximises the rewind
+/// workload.
 const STABILIZE: f32 = 1.0;
 
 // ── CLI ─────────────────────────────────────────────────────────────────
@@ -92,6 +102,12 @@ enum Topology {
     /// per-dab regime scales with displacement padding (larger read
     /// footprint vs. smudge).
     Liquify,
+    /// Pencil: the mid-dial `paint` brush (`buildup: 0.1`, so the
+    /// dispatch loads and stores two packed grounds per thread), spacing
+    /// 0.03, a perlin disc with a soft edge, two baked noise tiles and
+    /// the curve/levels chain between them. Same terminal as Paint; the
+    /// regime an artist actually shades in.
+    Pencil,
 }
 
 impl Topology {
@@ -102,6 +118,7 @@ impl Topology {
             "rough-ink" | "rough_ink" | "compiled" => Some(Topology::RoughInk),
             "smudge" => Some(Topology::Smudge),
             "liquify" => Some(Topology::Liquify),
+            "pencil" => Some(Topology::Pencil),
             _ => None,
         }
     }
@@ -113,6 +130,7 @@ impl Topology {
             Topology::RoughInk => "rough-ink",
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
+            Topology::Pencil => "pencil",
         }
     }
 
@@ -125,6 +143,7 @@ impl Topology {
             Topology::RoughInk => "paint",
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
+            Topology::Pencil => "paint",
         }
     }
 
@@ -135,6 +154,7 @@ impl Topology {
             Topology::RoughInk => BRUSH_NAME_ROUGH_INK,
             Topology::Smudge => BRUSH_NAME_SMUDGE,
             Topology::Liquify => BRUSH_NAME_LIQUIFY,
+            Topology::Pencil => BRUSH_NAME_PENCIL,
         }
     }
 
@@ -153,12 +173,24 @@ struct Args {
     input: PathBuf,
     output: Option<PathBuf>,
     topology: Topology,
+    stabilize: f32,
+    /// `paint.buildup` override for the cell's brush, if given.
+    buildup: Option<f32>,
+    /// Block on the device after every event, so `cpu` covers the GPU's
+    /// work for the event too (native and `testing` only).
+    gpu_sync: bool,
+    /// Cells to run, as `WxH:R`; empty runs the whole matrix.
+    only: Vec<((u32, u32), f32)>,
 }
 
 fn parse_args() -> Args {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut topology = Topology::Paint;
+    let mut stabilize = STABILIZE;
+    let mut buildup: Option<f32> = None;
+    let mut gpu_sync = false;
+    let mut only: Vec<((u32, u32), f32)> = Vec::new();
     let mut argv = std::env::args().skip(1);
     while let Some(a) = argv.next() {
         match a.as_str() {
@@ -175,19 +207,40 @@ fn parse_args() -> Args {
                 topology = Topology::parse(&v).unwrap_or_else(|| {
                     panic!(
                         "unknown topology `{v}`, expected `paint`, `watercolor`, `rough-ink`, \
-                         `smudge`, or `liquify`"
+                         `smudge`, `liquify`, or `pencil`"
                     )
                 });
             }
+            "--stabilize" | "-s" => {
+                let v = argv.next().expect("--stabilize requires a value");
+                stabilize = v
+                    .parse::<f32>()
+                    .unwrap_or_else(|e| panic!("--stabilize `{v}` is not a number: {e}"));
+            }
+            "--buildup" => {
+                let v = argv.next().expect("--buildup requires a value");
+                buildup = Some(v.parse::<f32>().expect("--buildup is a number"));
+            }
+            "--gpu-sync" => gpu_sync = true,
+            "--only" => {
+                let v = argv.next().expect("--only requires WxH:R");
+                let (wh, r) = v.split_once(':').expect("--only WxH:R");
+                let (w, h) = wh.split_once('x').expect("--only WxH:R");
+                only.push(((w.parse().unwrap(), h.parse().unwrap()), r.parse().unwrap()));
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "stroke_replay_matrix --input <path> [--output <tsv>] \
-                     [--topology paint|watercolor|rough-ink|smudge|liquify]\n\n\
+                    "stroke_replay_matrix --input <path> [--output <tsv>] [--stabilize <0..1>] \
+                     [--buildup <0..1>] [--gpu-sync] [--only WxH:R]... \
+                     [--topology paint|watercolor|rough-ink|smudge|liquify|pencil]\n\n\
                      Replays a recording across the configured (dab_radius × resolution) matrix.\n\
-                     Axes are constants at the top of stroke_replay_matrix.rs.\n\
+                     Axes are constants at the top of stroke_replay_matrix.rs; `--only` picks cells.\n\
+                     `--buildup` overrides `paint.buildup`; `--gpu-sync` blocks on the device after\n\
+                     every event so `cpu` includes the GPU's work.\n\
                      `paint` = Ink Pen (compiled). `watercolor` = Smooth Watercolor (compiled).\n\
                      `rough-ink` = the demo brush with the upstream random graph.\n\
-                     `smudge` / `liquify` = the read-mirror terminals, one pass per dab."
+                     `smudge` / `liquify` = the read-mirror terminals, one pass per dab.\n\
+                     `pencil` = the mid-dial Pencil on `paint` (two grounds per thread, spacing 0.03)."
                 );
                 std::process::exit(0);
             }
@@ -201,6 +254,10 @@ fn parse_args() -> Args {
         }),
         output,
         topology,
+        stabilize,
+        buildup,
+        gpu_sync,
+        only,
     }
 }
 
@@ -208,7 +265,12 @@ fn parse_args() -> Args {
 
 /// Load the topology's built-in brush, override its terminal's `size`
 /// port and the `pen_input` stabilizer.
-fn brush_graph_json(topology: Topology, dab_radius_px: f32) -> String {
+fn brush_graph_json(
+    topology: Topology,
+    dab_radius_px: f32,
+    stabilize: f32,
+    buildup: Option<f32>,
+) -> String {
     let mut brush = topology.brush();
     let pen_id = darkly::brush::nodes::brush_settings::node_id(&brush.metadata.graph)
         .expect("brush must have a pen_input node");
@@ -220,8 +282,19 @@ fn brush_graph_json(topology: Topology, dab_radius_px: f32) -> String {
         .set_port_default(&pen_id, "size", size_port)
         .expect("set size port default");
     graph
-        .set_port_default(&pen_id, "stabilize", STABILIZE)
+        .set_port_default(&pen_id, "stabilize", stabilize)
         .expect("set stabilize port default");
+    if let Some(buildup) = buildup {
+        let paint_id = graph
+            .nodes()
+            .iter()
+            .find(|(_, n)| n.type_id == "paint")
+            .map(|(id, _)| id.clone())
+            .expect("brush must have a paint node for --buildup");
+        graph
+            .set_port_default(&paint_id, "buildup", buildup)
+            .expect("set buildup port default");
+    }
     serde_json::to_string(graph).expect("serialize brush graph")
 }
 
@@ -278,12 +351,16 @@ fn percentile(sorted: &[u64], pct: f64) -> f64 {
 
 fn run_cell(
     topology: Topology,
+    stabilize: f32,
+    buildup: Option<f32>,
+    gpu_sync: bool,
     recording: &StrokeRecording,
     canvas: (u32, u32),
     dab_radius_px: f32,
 ) -> CellResult {
-    let graph_json = brush_graph_json(topology, dab_radius_px);
+    let graph_json = brush_graph_json(topology, dab_radius_px, stabilize, buildup);
     let (device, queue) = bench_device();
+    let sync_device = device.clone();
     let info = device.adapter_info();
     let adapter = format!(
         "{} ({:?}, {} {})",
@@ -300,6 +377,9 @@ fn run_cell(
     let last_t = recording.events.last().unwrap().time_ms;
     let stroke_duration_ms = last_t - first_t;
 
+    let mut sync = || {
+        let _ = sync_device.poll(wgpu::PollType::wait_indefinitely());
+    };
     let wall_start = Instant::now();
     let timings = replay(
         &mut engine,
@@ -307,6 +387,7 @@ fn run_cell(
         layer_id,
         canvas,
         ReplayPacing::Realtime,
+        if gpu_sync { Some(&mut sync) } else { None },
     );
     let wall_total_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -443,6 +524,9 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
 
 fn write_markdown(
     topology: Topology,
+    stabilize: f32,
+    buildup: Option<f32>,
+    gpu_sync: bool,
     path: &Path,
     recording: &StrokeRecording,
     results: &[CellResult],
@@ -459,7 +543,8 @@ fn write_markdown(
     }
     writeln!(
         file,
-        "Brush: `{}` topology `{}` (terminal: `{}`, stabilize=`{STABILIZE}`). \
+        "Brush: `{}` topology `{}` (terminal: `{}`, stabilize=`{stabilize}`, \
+         buildup=`{}`, gpu_sync=`{gpu_sync}`). \
          Recording: {} events spanning {:.0} ms recorded at {}×{}. Replay pacing: \
          real-time. `behind_by_ms = wall_total - stroke_duration`: positive \
          means the engine fell behind the recorded cadence. \
@@ -468,6 +553,7 @@ fn write_markdown(
         topology.brush_name(),
         topology.slug(),
         topology.terminal_id(),
+        buildup.map_or("brush".to_string(), |b| b.to_string()),
         recording.events.len(),
         recording.events.last().unwrap().time_ms - recording.events[0].time_ms,
         recording.canvas_width,
@@ -528,13 +614,14 @@ fn main() {
         std::process::exit(1);
     });
     eprintln!(
-        "matrix: {} cells ({}×{}) on `{}` topology=`{}` stabilize={STABILIZE} \
+        "matrix: {} cells ({}×{}) on `{}` topology=`{}` stabilize={} \
          vs {} events spanning {:.0} ms",
         DAB_RADII_PX.len() * RESOLUTIONS.len(),
         DAB_RADII_PX.len(),
         RESOLUTIONS.len(),
         args.topology.brush_name(),
         args.topology.slug(),
+        args.stabilize,
         recording.events.len(),
         recording.events.last().unwrap().time_ms - recording.events[0].time_ms,
     );
@@ -542,11 +629,22 @@ fn main() {
     let mut results = Vec::new();
     for &canvas in RESOLUTIONS {
         for &dab_radius_px in DAB_RADII_PX {
+            if !args.only.is_empty() && !args.only.contains(&(canvas, dab_radius_px)) {
+                continue;
+            }
             eprint!(
                 "  canvas={}x{} radius={:>5}px ... ",
                 canvas.0, canvas.1, dab_radius_px
             );
-            let r = run_cell(args.topology, &recording, canvas, dab_radius_px);
+            let r = run_cell(
+                args.topology,
+                args.stabilize,
+                args.buildup,
+                args.gpu_sync,
+                &recording,
+                canvas,
+                dab_radius_px,
+            );
             eprintln!(
                 "wall={:>5.0}ms ({:+5.0}ms, worst-frame +{:>5.1}ms), \
                  cpu p50 = {:>5.0} µs, submit p50 = {:>5.0} µs, \
@@ -571,7 +669,15 @@ fn main() {
         Ok(_) => eprintln!("wrote {}", tsv_path.display()),
         Err(e) => eprintln!("failed to write {}: {e}", tsv_path.display()),
     }
-    match write_markdown(args.topology, &md_path, &recording, &results) {
+    match write_markdown(
+        args.topology,
+        args.stabilize,
+        args.buildup,
+        args.gpu_sync,
+        &md_path,
+        &recording,
+        &results,
+    ) {
         Ok(_) => eprintln!("wrote {}", md_path.display()),
         Err(e) => eprintln!("failed to write {}: {e}", md_path.display()),
     }

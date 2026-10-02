@@ -333,6 +333,10 @@ struct CellResult {
     dispatches_per_event_avg: f64,
     dabs_per_event_avg: f64,
     union_bbox_area_per_event_avg: f64,
+    /// Mid-stroke full re-render fallbacks over the stroke: zero when the
+    /// checkpoint ring served every rewind. A timing win that came from
+    /// falling back would show here.
+    full_rerender_events: u32,
 }
 
 fn percentile(sorted: &[u64], pct: f64) -> f64 {
@@ -390,6 +394,7 @@ fn run_cell(
         if gpu_sync { Some(&mut sync) } else { None },
     );
     let wall_total_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
+    let full_rerender_events = engine.test_stroke_full_rerender_events();
 
     let max_event_behind_ms = timings
         .iter()
@@ -442,6 +447,7 @@ fn run_cell(
         dispatches_per_event_avg,
         dabs_per_event_avg,
         union_bbox_area_per_event_avg,
+        full_rerender_events,
     }
 }
 
@@ -490,7 +496,8 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
          wall_total_ms\tbehind_by_ms\tmax_event_behind_ms\t\
          cpu_median_us\tcpu_p95_us\tcpu_max_us\t\
          submit_median_us\tsubmit_p95_us\tsubmit_max_us\t\
-         flushes_per_event_avg\tdispatches_per_event_avg\tdabs_per_event_avg\tunion_bbox_area_per_event_avg"
+         flushes_per_event_avg\tdispatches_per_event_avg\tdabs_per_event_avg\tunion_bbox_area_per_event_avg\t\
+         full_rerender_events"
     )?;
     for r in results {
         writeln!(
@@ -498,7 +505,7 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
             "{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t\
              {:.2}\t{:.2}\t{}\t\
              {:.2}\t{:.2}\t{}\t\
-             {:.3}\t{:.3}\t{:.3}\t{:.0}",
+             {:.3}\t{:.3}\t{:.3}\t{:.0}\t{}",
             r.canvas.0,
             r.canvas.1,
             r.dab_radius_px,
@@ -517,6 +524,7 @@ fn write_tsv(path: &Path, results: &[CellResult]) -> std::io::Result<()> {
             r.dispatches_per_event_avg,
             r.dabs_per_event_avg,
             r.union_bbox_area_per_event_avg,
+            r.full_rerender_events,
         )?;
     }
     Ok(())
@@ -577,16 +585,16 @@ fn write_markdown(
     writeln!(
         file,
         "| canvas | radius_px | events | wall (ms) | behind (ms) | worst-frame (ms) | \
-         cpu p50 (µs) | submit p50 (µs) | flushes/ev | dispatches/ev | dabs/ev | bbox px²/ev |"
+         cpu p50 (µs) | submit p50 (µs) | flushes/ev | dispatches/ev | dabs/ev | bbox px²/ev | fallbacks |"
     )?;
     writeln!(
         file,
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )?;
     for r in results {
         writeln!(
             file,
-            "| {}×{} | {} | {} | {:.0} | {:+.0} | {:.1} | {:.0} | {:.0} | {:.2} | {:.1} | {:.1} | {:.0} |",
+            "| {}×{} | {} | {} | {:.0} | {:+.0} | {:.1} | {:.0} | {:.0} | {:.2} | {:.1} | {:.1} | {:.0} | {} |",
             r.canvas.0,
             r.canvas.1,
             r.dab_radius_px,
@@ -600,6 +608,7 @@ fn write_markdown(
             r.dispatches_per_event_avg,
             r.dabs_per_event_avg,
             r.union_bbox_area_per_event_avg,
+            r.full_rerender_events,
         )?;
     }
     Ok(())

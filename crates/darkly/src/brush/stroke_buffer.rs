@@ -335,28 +335,14 @@ impl StrokeBuffer {
         // Copy existing pre-stroke contents into the new texture at the
         // canvas-anchored offset.
         if self.width > 0 && self.height > 0 {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.pre_stroke_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &new_pre_stroke_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: dst_offset_x,
-                        y: dst_offset_y,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
+            crate::gpu::blit_region(
+                encoder,
+                &self.pre_stroke_texture,
+                (0, 0),
+                &new_pre_stroke_tex,
+                (dst_offset_x, dst_offset_y),
+                self.width,
+                self.height,
             );
         }
 

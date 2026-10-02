@@ -217,7 +217,7 @@ macro_rules! make_ctx {
 impl Harness {
     fn begin_stroke(&mut self) {
         let mut ctx = make_ctx!(self, "rough-ink-test-begin");
-        self.runner.begin_stroke(&mut ctx);
+        self.runner.begin_stroke(&mut ctx, None);
         self.queue.submit([ctx.encoder.finish()]);
     }
 

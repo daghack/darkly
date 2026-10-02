@@ -610,6 +610,12 @@ pub struct DarklyEngine {
     pub(crate) transform_setup_error: Option<crate::document::TransformCapabilityError>,
     #[cfg(any(test, feature = "testing"))]
     pub(crate) transform_commit_failure: Option<floating::TransformCommitFailurePoint>,
+    /// Forces every mid-stroke rewind down the full re-render path by
+    /// clearing the checkpoint ring before it is consulted, so a test can
+    /// render the final polyline from scratch and compare the incremental
+    /// rewind path against it byte for byte.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) test_full_rerender: bool,
     /// Pending layer/selection flip waiting for the selection CPU cache.
     pub(crate) pending_flip: Option<PendingFlip>,
     /// Pending destructive filter waiting for the selection CPU cache.
@@ -824,6 +830,8 @@ impl DarklyEngine {
             layer_growth_capped: false,
             brush_perf: BrushPerfCounters::default(),
             brush_full_rerender_events: 0,
+            #[cfg(any(test, feature = "testing"))]
+            test_full_rerender: false,
             last_brush_perf: BrushPerfCounters::default(),
             last_frame_phases: FrameRenderPhases::default(),
             recorder: ProcessRecorder::new(),
@@ -1387,6 +1395,13 @@ impl DarklyEngine {
     /// they can prove the auto-queue path populated the cache.
     pub fn test_thumbnail_cache_peek(&self, node_id: LayerId) -> Option<Vec<u8>> {
         self.thumbnail_cache.get(node_id).cloned()
+    }
+
+    /// Route every rewind through the full re-render path (see the
+    /// `test_full_rerender` field). Test-only.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_set_full_rerender(&mut self, on: bool) {
+        self.test_full_rerender = on;
     }
 
     /// Count of mid-stroke full-re-render fallbacks observed during the

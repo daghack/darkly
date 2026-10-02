@@ -179,7 +179,7 @@ fn render_clone(p: &CloneParams) -> Vec<u8> {
 
     {
         let mut ctx = make_ctx!("clone-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

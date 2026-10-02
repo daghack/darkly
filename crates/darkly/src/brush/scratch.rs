@@ -44,6 +44,7 @@
 
 use crate::brush::node::DabPass;
 use crate::brush::pipeline::CanvasCopyLayouts;
+use crate::coord::LayerRect;
 
 /// Per-dab read-mirror initial size.  1×1 is the smallest legal wgpu
 /// texture; the first dab's footprint will lazy-grow it.  Picking a small
@@ -393,7 +394,8 @@ impl Scratch {
     /// [`crate::brush::node::Lifecycle::ClearScratchToTransparent`]. The
     /// framework calls this during `BrushGraphRunner::begin_stroke` based
     /// on the terminal's declared lifecycle, so the four terminals no
-    /// longer carry a copy-pasted prologue each.
+    /// longer carry a copy-pasted prologue each. A partial rewind clears a
+    /// region instead: [`Scratch::clear_region`].
     pub fn clear_to_transparent(&self, encoder: &mut wgpu::CommandEncoder) {
         // Channels clear alongside the write side. A channel surviving a
         // stroke start or a rewind boundary would let dabs that no longer
@@ -419,25 +421,57 @@ impl Scratch {
         encoder: &mut wgpu::CommandEncoder,
         pre_stroke: &wgpu::Texture,
     ) {
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: pre_stroke,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.write_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: self.write_w,
-                height: self.write_h,
-                depth_or_array_layers: 1,
-            },
+        crate::gpu::blit_region(
+            encoder,
+            pre_stroke,
+            (0, 0),
+            &self.write_texture,
+            (0, 0),
+            self.write_w,
+            self.write_h,
         );
+    }
+
+    /// Rewind-boundary counterpart of [`Scratch::seed_from_pre_stroke`]:
+    /// re-seed only `rect` (write-side local) from the pre-stroke snapshot,
+    /// for a partial rewind whose every other pixel already holds the
+    /// state being restored. The snapshot is layer sized like the write
+    /// side, so the same rect addresses both.
+    pub fn seed_region_from_pre_stroke(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pre_stroke: &wgpu::Texture,
+        rect: LayerRect,
+    ) {
+        if rect.is_empty() {
+            return;
+        }
+        crate::gpu::blit_region(
+            encoder,
+            pre_stroke,
+            (rect.x0(), rect.y0()),
+            &self.write_texture,
+            (rect.x0(), rect.y0()),
+            rect.width,
+            rect.height,
+        );
+    }
+
+    /// Rewind-boundary counterpart of [`Scratch::clear_to_transparent`]:
+    /// zero only `rect` (write-side local) of the write side and every
+    /// channel, for a partial rewind whose every other pixel already holds
+    /// the state being restored. A buffer copy from `zero` rather than an
+    /// attachment clear, which has no sub-rect form; see
+    /// [`crate::gpu::zero_fill`].
+    pub fn clear_region(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        zero: &wgpu::Buffer,
+        rect: LayerRect,
+    ) {
+        for texture in std::iter::once(&self.write_texture).chain(self.channel_textures()) {
+            crate::gpu::zero_fill::zero_fill_rect(encoder, zero, texture, rect);
+        }
     }
     pub fn write_view(&self) -> &wgpu::TextureView {
         &self.write_view
@@ -562,29 +596,16 @@ impl Scratch {
         // canvas-anchored offset.  Old regions outside the source rect
         // start as transparent (texture default), which is exactly the
         // pre-stroke state of pixels that didn't exist before growth.
-        if self.write_w > 0 && self.write_h > 0 {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.write_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &new_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: dst_offset_x,
-                        y: dst_offset_y,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: self.write_w,
-                    height: self.write_h,
-                    depth_or_array_layers: 1,
-                },
+        let had_pixels = self.write_w > 0 && self.write_h > 0;
+        if had_pixels {
+            crate::gpu::blit_region(
+                encoder,
+                &self.write_texture,
+                (0, 0),
+                &new_texture,
+                (dst_offset_x, dst_offset_y),
+                self.write_w,
+                self.write_h,
             );
         }
 
@@ -609,16 +630,18 @@ impl Scratch {
                 target_h,
                 &old.declared,
             );
-            for (src, dst) in old.textures.iter().zip(&grown.textures) {
-                copy_region_offset(
-                    encoder,
-                    src,
-                    dst,
-                    self.write_w,
-                    self.write_h,
-                    dst_offset_x,
-                    dst_offset_y,
-                );
+            if had_pixels {
+                for (src, dst) in old.textures.iter().zip(&grown.textures) {
+                    crate::gpu::blit_region(
+                        encoder,
+                        src,
+                        (0, 0),
+                        dst,
+                        (dst_offset_x, dst_offset_y),
+                        self.write_w,
+                        self.write_h,
+                    );
+                }
             }
             self.channels = Some(grown);
         }
@@ -739,45 +762,6 @@ fn clear_channel_views(encoder: &mut wgpu::CommandEncoder, views: &[wgpu::Textur
         color_attachments: &attachments,
         ..Default::default()
     });
-}
-
-/// Copy all of `src` into `dst` at a canvas-anchored destination offset:
-/// the growth rebase, matching [`Scratch::grow_write`]'s own blit.
-fn copy_region_offset(
-    encoder: &mut wgpu::CommandEncoder,
-    src: &wgpu::Texture,
-    dst: &wgpu::Texture,
-    w: u32,
-    h: u32,
-    dst_offset_x: u32,
-    dst_offset_y: u32,
-) {
-    if w == 0 || h == 0 {
-        return;
-    }
-    encoder.copy_texture_to_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: src,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyTextureInfo {
-            texture: dst,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: dst_offset_x,
-                y: dst_offset_y,
-                z: 0,
-            },
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
 }
 
 /// The write side: an attachment the framework clears, a copy source and
@@ -905,6 +889,87 @@ mod tests {
         assert!(!instanced
             .write_usage()
             .contains(wgpu::TextureUsages::STORAGE_BINDING));
+    }
+
+    /// A region clear zeroes the rect on the write side and on every
+    /// channel, and nothing outside it, on a packed `r32uint` ground with
+    /// a storage channel (the dial's two grounds).
+    #[test]
+    fn clear_region_zeroes_the_rect_on_both_grounds() {
+        use crate::gpu::test_utils::readback_texture;
+        let (device, queue, mut scratch) = make_scratch(
+            crate::brush::node::PACKED_GROUND_FORMAT,
+            DabPass::DispatchPerDab,
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        scratch.ensure_channels(
+            &device,
+            &mut encoder,
+            &[StrokeChannel {
+                name: "build",
+                format: crate::brush::node::PACKED_GROUND_FORMAT,
+                kind: ChannelUse::Storage,
+            }],
+        );
+        queue.submit([encoder.finish()]);
+        let (w, h) = scratch.write_dimensions();
+        let pattern: Vec<u8> = (0..(w * h * 4)).map(|i| (i % 253) as u8 + 1).collect();
+        let textures: Vec<&wgpu::Texture> = std::iter::once(scratch.write_texture())
+            .chain(scratch.channel_textures())
+            .collect();
+        assert_eq!(textures.len(), 2);
+        for texture in &textures {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pattern,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let rect = LayerRect::from_xywh(5, 3, 20, 10);
+        let zero = crate::gpu::zero_fill::create_zero_buffer(&device);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        scratch.clear_region(&mut encoder, &zero, rect);
+        queue.submit([encoder.finish()]);
+        for (name, texture) in ["write side", "build channel"].iter().zip(&textures) {
+            let out = readback_texture(
+                &device,
+                &queue,
+                texture,
+                crate::brush::node::PACKED_GROUND_FORMAT,
+                w,
+                h,
+            );
+            for y in 0..h {
+                for x in 0..w {
+                    let inside = x >= rect.x0() && x < rect.x1() && y >= rect.y0() && y < rect.y1();
+                    let i = ((y * w + x) * 4) as usize;
+                    let expected = if inside {
+                        [0; 4]
+                    } else {
+                        pattern[i..i + 4].try_into().unwrap()
+                    };
+                    assert_eq!(
+                        &out[i..i + 4],
+                        &expected,
+                        "{name} at ({x}, {y}), inside: {inside}"
+                    );
+                }
+            }
+        }
     }
 
     /// Every declared channel is readable through the canvas-copy layout

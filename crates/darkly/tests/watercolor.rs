@@ -208,7 +208,7 @@ fn render_flush_groups(
     for (gi, g) in groups.iter().enumerate() {
         let mut ctx = make_ctx!("watercolor-compiled-test-flush");
         if gi == 0 || g.restart {
-            runner.begin_stroke(&mut ctx);
+            runner.begin_stroke(&mut ctx, None);
         }
         for (x, y) in g.dabs {
             let info = PaintInformation {

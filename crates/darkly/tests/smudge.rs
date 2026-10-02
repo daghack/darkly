@@ -151,7 +151,7 @@ fn render_smudge_dabs(size_override: f32, dabs: &[([f32; 2], [f32; 2])]) -> Vec<
 
     {
         let mut ctx = make_ctx!("smudge-test-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

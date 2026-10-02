@@ -131,7 +131,7 @@ fn render_one_dab(brush_name: &str, color: [f32; 4], canvas: &[u8]) -> Vec<u8> {
 
     {
         let mut ctx = make_ctx!("brush-untouched-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

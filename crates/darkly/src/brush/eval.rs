@@ -249,18 +249,39 @@ fn remap_scalar(value: f32, src: (f32, f32), dst: (f32, f32)) -> f32 {
 /// established lifecycles; the four-way copy-paste that used to live
 /// in `paint`/`watercolor`/`smudge`/`liquify` collapses into one
 /// declaration plus the enum dispatch below.
-fn apply_lifecycle(lifecycle: super::node::Lifecycle, gpu: &mut BrushGpuContext) {
+///
+/// `region` is `None` to reset the whole scratch (stroke start, a full
+/// re-render) and `Some(rect)` (write-side local) to reset only that rect:
+/// a partial rewind, where every pixel outside it already holds the state
+/// being restored and the checkpoint ring copies the rest back.
+fn apply_lifecycle(
+    lifecycle: super::node::Lifecycle,
+    gpu: &mut BrushGpuContext,
+    region: Option<crate::coord::LayerRect>,
+) {
     use super::node::Lifecycle;
     let Some(stroke) = &gpu.stroke else { return };
-    match lifecycle {
-        Lifecycle::None => {}
-        Lifecycle::ClearScratchToTransparent => {
+    match (lifecycle, region) {
+        (Lifecycle::None, _) => {}
+        (Lifecycle::ClearScratchToTransparent, None) => {
             stroke.scratch.clear_to_transparent(&mut gpu.encoder);
         }
-        Lifecycle::SeedScratchFromPreStroke => {
+        (Lifecycle::ClearScratchToTransparent, Some(rect)) => {
+            stroke
+                .scratch
+                .clear_region(&mut gpu.encoder, gpu.pipelines.zero_buffer(), rect);
+        }
+        (Lifecycle::SeedScratchFromPreStroke, None) => {
             stroke
                 .scratch
                 .seed_from_pre_stroke(&mut gpu.encoder, stroke.pre_stroke_texture);
+        }
+        (Lifecycle::SeedScratchFromPreStroke, Some(rect)) => {
+            stroke.scratch.seed_region_from_pre_stroke(
+                &mut gpu.encoder,
+                stroke.pre_stroke_texture,
+                rect,
+            );
         }
     }
 }
@@ -1145,7 +1166,15 @@ impl BrushGraphRunner {
     /// queue is also reset here for the same reason: every terminal
     /// needs it cleared at stroke-start; no point copy-pasting that
     /// line per terminal.
-    pub fn begin_stroke(&mut self, gpu: &mut BrushGpuContext) {
+    ///
+    /// `region` is `None` to reset the whole scratch and `Some(rect)` to
+    /// reset only that write-side rect (a partial rewind); see
+    /// [`apply_lifecycle`].
+    pub fn begin_stroke(
+        &mut self,
+        gpu: &mut BrushGpuContext,
+        region: Option<crate::coord::LayerRect>,
+    ) {
         gpu.dab_batch.clear();
 
         // Realize the terminal's declared accumulation channels before the
@@ -1175,7 +1204,7 @@ impl BrushGraphRunner {
                 .get(type_id)
                 .map(|r| r.lifecycle)
                 .unwrap_or(super::node::Lifecycle::None);
-            apply_lifecycle(lifecycle, gpu);
+            apply_lifecycle(lifecycle, gpu, region);
             ev.begin_stroke(ctx, gpu);
         });
     }

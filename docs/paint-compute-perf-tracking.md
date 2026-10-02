@@ -740,6 +740,73 @@ and `blur` terminals, watercolor's atlas, the instanced skeleton and the
 float foreground entry in `composite.wgsl` (the port plan's "deleted
 later" list).
 
+### #7: region copies in the checkpoint ring (shipped)
+
+**Shape:** not a terminal change; the per-event fixed cost every brush
+pays through the checkpoint ring (`crates/darkly/src/brush/checkpoint_ring.rs`,
+plan `docs/plans/checkpoint-ring-delta-copies.md`, diagnosis
+`notes/handoffs/handoff-stroke-fixed-costs.md`). Every save used to copy
+the stroke's whole cumulative bbox into a slot, every restore copied the
+slot's whole bbox back after a full-canvas attachment clear, and at
+`stabilize = 0.6` that was about seven saves and one restore and clear
+per ground per event, each the size of most of the canvas once the stroke
+had crossed it. Now each slot is a layer-sized frame that records which
+save point it equals and a stale rect where it does not; a save copies
+the stale rect plus the footprint of the dabs placed since the slot's
+save point (the per-dab footprints live on the save points), and a
+restore copies back only the footprint of the dabs after the checkpoint,
+resetting the part its frame does not cover (a zero fill, or a re-seed
+from the pre-stroke layer) in the same submission. The reset is a
+`copy_buffer_to_texture` from a zero buffer (`gpu/zero_fill.rs`), since
+an attachment clear has no sub-rect form.
+
+**Measurements, on this machine** (Intel Raptor Lake-P iGPU, Mesa
+26.2.3), before at `b9aa3e94` and after with this change, the recorded
+curvy stroke (204 events) at 1920x1080, Pencil, `stabilize = 0.6`,
+medians of three. Browser `event_sync_ms.p50` is the harness's
+`pace=sync` (one event posted, drained, rendered and waited on; serialized
+CPU plus GPU per event under Dawn); native `cpu p50` is the matrix under
+`--gpu-sync` (`bench-results/stroke-replay-matrix-pencil-*-b9aa3e9458*`).
+
+| cell | browser before | browser after | native before | native after |
+|---|---:|---:|---:|---:|
+| 250 px, build-only (`buildup=100`) | 10.0 ms | 9.9 ms | 8.9 ms | 8.5 ms |
+| 500 px, build-only | 13.4 ms | 12.2 ms | 11.6 ms | 10.7 ms |
+| 250 px, mid-dial | 11.4 ms | 10.6 ms | 9.7 ms | 9.3 ms |
+| 500 px, mid-dial | 15.2 ms | 13.1 ms | 13.1 ms | 11.3 ms |
+
+The realtime 500 px mid-dial cell's `long_frames_over_33ms` went from 3,
+5 and 4 to 0, 1 and 0. Full re-render fallbacks are 0 in every cell,
+before and after (the matrix now prints them). Per stroke in the browser,
+counted with a one-off patch of the harness: `copyTextureToTexture`
+texels fell from 1.66 G to 0.42 G at 250 px build-only and from 4.58 G to
+1.44 G at 500 px mid-dial, with the copy *count* unchanged (1408 and
+2806); render passes fell by one per event (1025 to 823, the full-canvas
+clears); submits fell by one per event (3419 to 3215, the restore
+recorded into the rewind's encoder); zero fills are 4 to 10 per stroke.
+The remaining copies are the divergence window's dabs, a bounding rect of
+the last 65 or so points rather than of the whole stroke.
+
+The first implementation sized a slot's frame to the cumulative bbox
+rounded out to 256 px. Its medians matched these, but the worst single
+event in the build-only cells rose from 21 to 27 ms (before) to 40 to
+47 ms: every slot crosses a band in the same event and reallocates, a
+fresh texture plus a frame-sized copy, times eight slots and two grounds.
+Layer-sized frames brought the worst event to 17 to 22 ms with the same
+medians, at one layer-sized copy per slot the first time a stroke uses
+it, and are what shipped.
+
+**Decision: shipped.** The gate (`event_sync_ms.p50` down 1.5 ms at
+250 px and 2 ms at 500 px mid-dial) is met at 500 px (2.1 ms, and 1.2 ms
+build-only) and missed at 250 px (0.8 ms, and 0.1 ms build-only). The
+texel sums say why: the copies did fall by the expected factor there too,
+so what remains at 250 px is not the ring. That cell runs 116 dabs per
+event as 116 dispatches (`dispatches/ev` in the matrix) and its time
+tracks the dispatch count, not the bbox; the handoff's remaining items
+(replay length, item 3; dab footprints, item 4) and the per-event commit
+(a full-layer pass that could be scissored to the rewound plus dirtied
+region, which the ring now computes) are where the 250 px residual lives.
+
 ## Background changes that are NOT competing attempts
 
 These landed for different reasons over the same time window. Listed

@@ -158,7 +158,7 @@ fn render_blur_dabs(size: f32, strength: f32, opacity: f32, dabs: &[[f32; 2]]) -
 
     {
         let mut ctx = make_ctx!("blur-test-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

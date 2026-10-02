@@ -177,7 +177,7 @@ fn render_liquify_dabs_on(
 
     {
         let mut ctx = make_ctx!("liquify-test-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

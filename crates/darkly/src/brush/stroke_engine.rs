@@ -665,9 +665,15 @@ impl StrokeEngine {
     /// GPU terminal in the graph. Called by the engine at the start of a
     /// stroke and at every rewind boundary (full or partial): the paint
     /// terminal clears its scratch here; other terminals (warp, smudge, …)
-    /// may copy the pre-stroke layer, etc.
-    pub fn begin_stroke(&mut self, gpu: &mut BrushGpuContext) {
-        self.runner.begin_stroke(gpu);
+    /// may copy the pre-stroke layer, etc. `region` is `None` for the whole
+    /// scratch and `Some(rect)` (write-side local) for the part a partial
+    /// rewind undoes.
+    pub fn begin_stroke(
+        &mut self,
+        gpu: &mut BrushGpuContext,
+        region: Option<crate::coord::LayerRect>,
+    ) {
+        self.runner.begin_stroke(gpu, region);
     }
 
     /// Delegate the per-pen-event commit hook to every GPU terminal. Called

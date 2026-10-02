@@ -177,7 +177,7 @@ fn run_begin_stroke(graph: &Graph<BrushWireType>, setup: Setup) -> Vec<u8> {
         preview: None,
         dab_batch: DabBatch::default(),
     };
-    runner.begin_stroke(&mut ctx);
+    runner.begin_stroke(&mut ctx, None);
     queue.submit([ctx.encoder.finish()]);
 
     readback_texture(

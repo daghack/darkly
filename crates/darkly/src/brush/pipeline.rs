@@ -366,6 +366,10 @@ pub struct BrushPipelines {
     // ── Per-node pipelines (modular, looked up by id) ────────────────
     entries: HashMap<&'static str, Box<dyn BrushPipelineEntry>>,
 
+    /// Zero source for region clears of the stroke scratch and its
+    /// channels on a partial rewind; see [`crate::gpu::zero_fill`].
+    zero_buffer: wgpu::Buffer,
+
     // ── Engine-owned named-texture registry ──────────────────────────
     /// Named GPU textures sampled by `image` brush nodes (paper grain,
     /// canvas, …). Built-ins are registered at construction; graph
@@ -772,10 +776,17 @@ impl BrushPipelines {
             mask_blit_pipeline,
             scratch_blit_r8_pipeline,
             entries,
+            zero_buffer: crate::gpu::zero_fill::create_zero_buffer(device),
             texture_registry,
             baked_sources,
             cursor_preview_pipeline_cache,
         }
+    }
+
+    /// The zero source [`crate::gpu::zero_fill::zero_fill_rect`] copies
+    /// from when a partial rewind clears a region of the scratch.
+    pub fn zero_buffer(&self) -> &wgpu::Buffer {
+        &self.zero_buffer
     }
 
     /// Named-texture registry for graph `image` nodes. Built-ins are

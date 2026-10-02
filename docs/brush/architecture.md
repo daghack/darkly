@@ -108,7 +108,9 @@ Three independent reasons every stroke needs this pair:
    previously-seen samples. The stroke engine rewinds to a save point and
    re-renders forward. On full rewind the engine calls `runner.begin_stroke`
    again, so each terminal re-initialises its scratch however it wants:
-   clear, re-copy the layer, whatever.
+   clear, re-copy the layer, whatever. On a partial rewind it calls the
+   same hook over just the rewound region, when the checkpoint's frame
+   does not cover it.
 3. **Atomic commit per event.** The artist only sees changes land when the
    active terminal's `commit` hook writes to the layer. That boundary lets
    commit apply blend modes (paint/erase), replace wholesale (warp), or
@@ -551,9 +553,11 @@ as paint, without any warp-specific code in the engine.
 
 Stabilizer rewind works out of the box: on a full rewind the engine calls
 `runner.begin_stroke` again, re-copying the layer and wiping prior warps.
-Partial rewind from a checkpoint restores the scratch's bytes directly
-(the checkpoint doesn't care whether those bytes represent accumulated
-pigment or a warped layer).
+Partial rewind from a checkpoint re-seeds only the rewound region from the
+pre-stroke layer where the checkpoint's frame does not cover it, then
+restores the scratch's bytes over that region directly (the checkpoint
+doesn't care whether those bytes represent accumulated pigment or a
+warped layer).
 
 **Designing a new non-paint terminal:**
 

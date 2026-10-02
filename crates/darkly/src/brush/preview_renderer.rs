@@ -299,7 +299,7 @@ impl BrushStrokePreviewRenderer {
         // Terminal setup: color_output clears the scratch to transparent.
         {
             let mut ctx = make_gpu_ctx!("brush-preview-begin-stroke");
-            engine.begin_stroke(&mut ctx);
+            engine.begin_stroke(&mut ctx, None);
             ctx.submit_final();
         }
 

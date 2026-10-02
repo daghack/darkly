@@ -140,7 +140,7 @@ fn render_single_dab_with_pressure(
 
     {
         let mut ctx = make_ctx!("paint-compiled-basic-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

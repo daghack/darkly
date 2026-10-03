@@ -75,6 +75,8 @@ impl CompositePipeline {
                         "\n",
                         include_str!("../../shaders/lib/deposit_ceiling.wgsl"),
                         "\n",
+                        include_str!("../../shaders/lib/commit_law.wgsl"),
+                        "\n",
                         include_str!("../../shaders/brush/composite.wgsl"),
                     )
                     .into(),

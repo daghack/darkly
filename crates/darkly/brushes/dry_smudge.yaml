@@ -1,0 +1,89 @@
+name: Dry Smudge
+description: "A fingertip rubbed through graphite and charcoal. Pulls the pigment already on the paper along the stroke, through the same tooth the pencil laid it down with, and leaves nothing of its own."
+nodes:
+  pen_input:
+    type: pen_input
+  brush_settings:
+    type: brush_settings
+    comment: The Pencil's cadence. Each dab moves the pigment by exactly its own step, so the smear is continuous at any spacing; 0.03 keeps the dab count of the medium it smudges
+    inputs:
+      size: 0.1
+      spacing: 0.03
+      stabilize: 0.4
+  circle:
+    type: circle
+    name: Fingertip
+    inputs:
+      softness: 0.6
+  noise:
+    type: noise
+    name: Paper grain texture
+    comment: Canvas space, so the smear is broken by the sheet's tooth and not by a per-dab pattern
+    inputs:
+      roughness: 0.548843264579773
+      scale: 2.5
+  levels:
+    type: levels
+    name: Grain intensity
+    inputs:
+      in_high: 0.40818285942077637
+  multiply:
+    type: multiply
+    name: Combine grain with tip
+  curve:
+    type: curve
+    name: Squash pen pressure
+    comment: A light touch still smears; pressure mostly widens the fingertip
+    inputs:
+      curve:
+      - - 0.0
+        - 0.35
+      - - 1.0
+        - 1.0
+  strength:
+    type: user_input
+    name: Strength
+    comment: One dial for both halves of the dial, the way the Pencil wires pressure into both flows
+    inputs:
+      value: 0.6
+  sampler:
+    type: clone_source
+    name: Live canvas
+    comment: Samples the stroke one dab behind along the pen's motion
+    inputs:
+      source: 1
+  stamp:
+    type: stamp
+  paint:
+    type: paint
+    inputs:
+      buildup: 0.1
+connections:
+- pen_input.position -> paint.position
+- pen_input.motion -> sampler.motion
+- pen_input.pressure -> curve.input
+- curve.output -> paint.size
+- noise.value -> levels.input
+- levels.output -> multiply.a
+- circle.mask -> multiply.b
+- multiply.result -> stamp.tip
+- sampler.color -> stamp.color
+- stamp.dab -> paint.rgba
+- strength.value -> paint.wash_flow
+- strength.value -> paint.build_flow
+exposed_ports:
+  brush_settings.size: {}
+  brush_settings.stabilize: {}
+  strength.value:
+    label: Strength
+    description: How much of what is under the finger moves with each touch
+    icon: mdi:gesture-swipe
+  levels.in_high:
+    label: Grain
+    description: How much the paper's tooth breaks up the smear
+    icon: tabler:grain
+  paint.buildup:
+    label: Build-up
+    description: How much rubbing the same spot keeps moving pigment, 0% = one pass moves it once, 100% = every touch moves more
+    icon: fa6-solid:layer-group
+  paint.opacity: {}

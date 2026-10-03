@@ -70,6 +70,15 @@ impl DabPass {
             Self::DispatchPerDab => wgpu::TextureUsages::STORAGE_BINDING,
         }
     }
+
+    /// Whether a texture written for one dab can be refreshed before the
+    /// next dab of the same flush reads it. A dispatch per dab orders its
+    /// dispatches and a dispatch's stores are visible to the next; the
+    /// instances of one draw cannot see each other's writes, and nothing
+    /// can run between them.
+    pub fn can_refresh_between_dabs(self) -> bool {
+        matches!(self, Self::DispatchPerDab)
+    }
 }
 
 /// Scratch format for a terminal that accumulates through a compute dab

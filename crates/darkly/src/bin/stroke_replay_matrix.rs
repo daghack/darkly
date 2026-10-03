@@ -15,7 +15,8 @@
 //!   - Builds a fresh `DarklyEngine` at the cell's canvas size.
 //!   - Loads the topology's brush (`Ink Pen` for paint-family
 //!     topologies, `Smooth Watercolor` for the watercolor topology,
-//!     `Pencil` for the mid-dial one), sets `brush_settings.stabilize` to
+//!     `Pencil` for the mid-dial one, `Dry Smudge` for the live sampler),
+//!     sets `brush_settings.stabilize` to
 //!     `--stabilize` (default 1.0), the `brush_settings.size` base-size
 //!     knob to the cell's dab radius, and `paint.buildup` to `--buildup`
 //!     when given.
@@ -67,6 +68,7 @@ const BRUSH_NAME_ROUGH_INK: &str = "Rough Ink";
 const BRUSH_NAME_SMUDGE: &str = "Smudge";
 const BRUSH_NAME_LIQUIFY: &str = "Liquify";
 const BRUSH_NAME_PENCIL: &str = "Pencil";
+const BRUSH_NAME_DRY_SMUDGE: &str = "Dry Smudge";
 
 /// Default stabilizer strength (`--stabilize` overrides it). The recorded
 /// stroke is what stresses the stabilizer; 1.0 maximises the rewind
@@ -108,6 +110,11 @@ enum Topology {
     /// the curve/levels chain between them. Same terminal as Paint; the
     /// regime an artist actually shades in.
     Pencil,
+    /// Dry Smudge: the live canvas sampler on `paint` at the Pencil's
+    /// dial and spacing. Every dab is two dispatches, the appearance
+    /// snapshot over the dab's read region and the dab, with two
+    /// pipeline switches between them.
+    DrySmudge,
 }
 
 impl Topology {
@@ -119,6 +126,7 @@ impl Topology {
             "smudge" => Some(Topology::Smudge),
             "liquify" => Some(Topology::Liquify),
             "pencil" => Some(Topology::Pencil),
+            "dry-smudge" | "dry_smudge" => Some(Topology::DrySmudge),
             _ => None,
         }
     }
@@ -131,6 +139,7 @@ impl Topology {
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
             Topology::Pencil => "pencil",
+            Topology::DrySmudge => "dry-smudge",
         }
     }
 
@@ -144,6 +153,7 @@ impl Topology {
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
             Topology::Pencil => "paint",
+            Topology::DrySmudge => "paint",
         }
     }
 
@@ -155,6 +165,7 @@ impl Topology {
             Topology::Smudge => BRUSH_NAME_SMUDGE,
             Topology::Liquify => BRUSH_NAME_LIQUIFY,
             Topology::Pencil => BRUSH_NAME_PENCIL,
+            Topology::DrySmudge => BRUSH_NAME_DRY_SMUDGE,
         }
     }
 
@@ -207,7 +218,7 @@ fn parse_args() -> Args {
                 topology = Topology::parse(&v).unwrap_or_else(|| {
                     panic!(
                         "unknown topology `{v}`, expected `paint`, `watercolor`, `rough-ink`, \
-                         `smudge`, `liquify`, or `pencil`"
+                         `smudge`, `liquify`, `pencil`, or `dry-smudge`"
                     )
                 });
             }
@@ -232,7 +243,7 @@ fn parse_args() -> Args {
                 eprintln!(
                     "stroke_replay_matrix --input <path> [--output <tsv>] [--stabilize <0..1>] \
                      [--buildup <0..1>] [--gpu-sync] [--only WxH:R]... \
-                     [--topology paint|watercolor|rough-ink|smudge|liquify|pencil]\n\n\
+                     [--topology paint|watercolor|rough-ink|smudge|liquify|pencil|dry-smudge]\n\n\
                      Replays a recording across the configured (dab_radius × resolution) matrix.\n\
                      Axes are constants at the top of stroke_replay_matrix.rs; `--only` picks cells.\n\
                      `--buildup` overrides `paint.buildup`; `--gpu-sync` blocks on the device after\n\
@@ -240,7 +251,8 @@ fn parse_args() -> Args {
                      `paint` = Ink Pen (compiled). `watercolor` = Smooth Watercolor (compiled).\n\
                      `rough-ink` = the demo brush with the upstream random graph.\n\
                      `smudge` / `liquify` = the read-mirror terminals, one pass per dab.\n\
-                     `pencil` = the mid-dial Pencil on `paint` (two grounds per thread, spacing 0.03)."
+                     `pencil` = the mid-dial Pencil on `paint` (two grounds per thread, spacing 0.03).\n\
+                     `dry-smudge` = the live canvas sampler on `paint` (a snapshot dispatch per dab)."
                 );
                 std::process::exit(0);
             }
@@ -328,8 +340,9 @@ struct CellResult {
     /// bbox shape that mattered for the compute round-trip (and stays
     /// interesting for the fragment path's overdraw cost).
     flushes_per_event_avg: f64,
-    /// Draws or compute dispatches into the scratch per event: one per
-    /// flush for an instanced terminal, one per dab for a serialized one.
+    /// Draws or compute dispatches per event: one per flush for an
+    /// instanced terminal, one per dab for a serialized one, two per dab
+    /// for a brush that samples the live stroke.
     dispatches_per_event_avg: f64,
     dabs_per_event_avg: f64,
     union_bbox_area_per_event_avg: f64,
@@ -574,9 +587,9 @@ fn write_markdown(
          `submit` is host wall-clock around `queue.submit()`: high values indicate \
          back-pressure. `flushes/ev`, `dispatches/ev`, `dabs/ev`, `bbox/ev` are \
          per-event averages of the workload the engine fed the GPU: flushes are \
-         `flush_dabs` calls, dispatches are draws or compute dispatches into the \
-         scratch (one per flush for an instanced terminal, one per dab for a \
-         serialized one). The 6-slot GPU-timestamp columns \
+         `flush_dabs` calls, dispatches are draws or compute dispatches (one per \
+         flush for an instanced terminal, one per dab for a serialized one, two \
+         per dab for a brush that samples the live stroke). The 6-slot GPU-timestamp columns \
          (`gpu_shader` / `gpu_sync_in` / `gpu_sync_out`) that the older matrices \
          carried are gone; they instrumented the compute-path buffer round-trip, \
          which the `paint` terminal no longer pays."

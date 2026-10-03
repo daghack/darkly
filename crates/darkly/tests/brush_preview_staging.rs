@@ -20,11 +20,12 @@ use darkly::gpu::test_utils::test_device;
 const ANALYTIC_DISC_MID_DIAL: &str = include_str!("fixtures/analytic_disc_buildup_half.yaml");
 
 /// Brushes whose graphs sample the canvas, and the glyph each declares.
-const STAGED: [(&str, &str); 4] = [
+const STAGED: [(&str, &str); 5] = [
     ("Liquify", "tabler:ripple"),
     ("Smudge", "mdi:gesture-swipe"),
     ("Blur", "mdi:blur"),
     ("Clone", "fa6-solid:clone"),
+    ("Dry Smudge", "mdi:fingerprint"),
 ];
 
 const WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -126,10 +127,12 @@ fn measure_stroke(engine: &mut DarklyEngine, backdrop: PreviewBackdrop) -> Strok
 
 /// Floor on how much of the render canvas the stroke must change.
 ///
-/// Measured over the shipped backdrop: Blur (the weakest of the four, and the
-/// one this floor exists for) changes 0.121 %, clearing it by 2.4×, and
-/// Liquify, Smudge and Clone clear it by 8.8× / 15.9× / 29.6×. Blur *without*
-/// its preview pin changes 0.022 %, less than half the floor.
+/// Measured over the shipped backdrop: Blur (the one this floor exists for)
+/// changes 0.121 %, clearing it by 2.4×, and Liquify, Smudge and Clone clear
+/// it by 7.8× / 15.9× / 29.6×. Blur *without* its preview pin changes
+/// 0.022 %, less than half the floor. The Dry Smudge changes 0.052 %, clearing
+/// it by only 1.04×, at its shipped `buildup` of 0.1, where most of each dab
+/// goes through the wash ceiling.
 ///
 /// A stripe field only responds where an operator's action crosses a band edge,
 /// so these numbers are much closer together than they would be over a field
@@ -268,7 +271,7 @@ fn flat_is_the_background_everywhere() {
 }
 
 /// The dab slot is the glyph. A single stationary sample has no motion for a
-/// displacement to reveal, so these four brushes show their declared icon there
+/// displacement to reveal, so these brushes show their declared icon there
 /// rather than a bake, and the icon is what `BrushInfo` projects to the picker.
 #[test]
 fn the_dab_slot_belongs_to_the_icon() {

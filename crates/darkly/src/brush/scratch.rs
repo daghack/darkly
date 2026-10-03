@@ -39,6 +39,13 @@
 //! The mirror is the more expensive of the two (a `copy_texture_to_texture`
 //! per dab), so prefer the direct read whenever the target allows it.
 //!
+//! A third read path serves a graph that samples the stroke at *other*
+//! pixels from inside a dispatch-per-dab pass: the **appearance mirror**
+//! ([`Scratch::appearance_view`]), a layer-sized `rgba8unorm` texture the
+//! terminal renders the stroke's appearance into under each dab's read
+//! region before that dab's dispatch. It is derived per dab and never
+//! cleared, checkpointed or restored.
+//!
 //! Ownership: owned by `StrokeBuffer`, allocated at stroke start, freed at
 //! stroke end.
 
@@ -110,7 +117,23 @@ pub struct Scratch {
     /// [`Scratch::ensure_channels`]; terminals that declare none pay
     /// nothing.
     channels: Option<StrokeChannels>,
+
+    /// The stroke's appearance under the dabs placed so far, rendered by
+    /// the terminal under each dab's read region before that dab runs, for
+    /// graphs that sample the live stroke at other pixels. Layer-sized in
+    /// the write side's frame so a sampler addresses it through the paint
+    /// target's extent alone; written as storage by the terminal's
+    /// snapshot dispatch, sampled as an ordinary graph texture by the
+    /// dab's dispatch. Derived: never cleared, checkpointed or restored,
+    /// because every texel a dab reads was rewritten for that dab. `None`
+    /// until a brush asks.
+    appearance: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
+
+/// Texel format of the appearance mirror: straight RGBA8, write-only
+/// storage in core WebGPU and filterable, so the snapshot stores it and a
+/// graph texture slot samples it bilinearly.
+pub const APPEARANCE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// One extra per-pixel quantity a terminal accumulates over a stroke.
 ///
@@ -253,7 +276,30 @@ impl Scratch {
             format,
             pass,
             channels: None,
+            appearance: None,
         }
+    }
+
+    /// Allocate the appearance mirror at the write side's size when
+    /// `wanted` and absent; free it when not wanted (a `Scratch` outlives
+    /// one brush, the reason [`Scratch::ensure_channels`] frees too).
+    /// Idempotent. Its contents need no clear: every texel a dab samples
+    /// is rewritten for that dab first.
+    pub fn ensure_appearance_mirror(&mut self, device: &wgpu::Device, wanted: bool) {
+        if !wanted {
+            self.appearance = None;
+        } else if self.appearance.is_none() {
+            self.appearance = Some(create_appearance_texture(
+                device,
+                self.write_w,
+                self.write_h,
+            ));
+        }
+    }
+
+    /// The appearance mirror's view, when the brush asked for one.
+    pub fn appearance_view(&self) -> Option<&wgpu::TextureView> {
+        self.appearance.as_ref().map(|(_, view)| view)
     }
 
     /// Allocate the terminal's declared channels if they aren't already,
@@ -646,6 +692,12 @@ impl Scratch {
             self.channels = Some(grown);
         }
 
+        // The appearance mirror follows the write side's frame with no
+        // copy: every texel a dab reads is rewritten for that dab.
+        if self.appearance.is_some() {
+            self.appearance = Some(create_appearance_texture(device, target_w, target_h));
+        }
+
         self.write_texture = new_texture;
         self.write_view = new_view;
         self.write_bind_group = new_bind_group;
@@ -790,6 +842,29 @@ fn create_write_texture(
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::TEXTURE_BINDING
             | pass.write_side_usage(),
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_appearance_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scratch-appearance"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: APPEARANCE_FORMAT,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -970,6 +1045,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The appearance mirror is allocated layer-sized for storage writes
+    /// and filtered sampling only when asked, follows the write side
+    /// through a grow, and is freed when the next brush does not ask.
+    #[test]
+    fn appearance_mirror_is_layer_sized_and_follows_the_write_side() {
+        let (device, queue, mut scratch) = make_scratch(
+            crate::brush::node::PACKED_GROUND_FORMAT,
+            DabPass::DispatchPerDab,
+        );
+        assert!(scratch.appearance_view().is_none());
+        scratch.ensure_appearance_mirror(&device, true);
+        let size = |s: &Scratch| {
+            let (t, _) = s.appearance.as_ref().expect("allocated");
+            assert_eq!(t.format(), APPEARANCE_FORMAT);
+            assert_eq!(
+                t.usage(),
+                wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING
+            );
+            (t.width(), t.height())
+        };
+        assert_eq!(size(&scratch), scratch.write_dimensions());
+
+        let mut encoder = device.create_command_encoder(&Default::default());
+        scratch.grow_write(&device, &mut encoder, 48, 40, 16, 24);
+        queue.submit([encoder.finish()]);
+        assert_eq!(size(&scratch), (48, 40));
+
+        scratch.ensure_appearance_mirror(&device, false);
+        assert!(scratch.appearance_view().is_none());
     }
 
     /// Every declared channel is readable through the canvas-copy layout

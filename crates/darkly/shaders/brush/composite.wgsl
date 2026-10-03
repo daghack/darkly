@@ -1,9 +1,8 @@
 // The stroke commit: lays a stroke's finished accumulations onto the layer.
 //
 // Two foreground slots, each with a fixed law and its own opacity, where an
-// opacity of zero means the slot is absent:
-//   wash:  committed through the per-pigment deposit ceiling
-//   build: composited on top with plain Porter-Duff source-over
+// opacity of zero means the slot is absent; the law itself is
+// `lib/commit_law.wgsl`'s, shared with the appearance snapshot.
 //
 // A terminal maps its accumulations onto the slots; the shader knows nothing
 // about brushes. One accumulation under one law is the common case (a brush
@@ -22,7 +21,8 @@
 // Outputs straight alpha with REPLACE blend (no hardware alpha blending).
 // See docs/lessons-learned/compositing-lessons-learned.md #4 (why REPLACE).
 //
-// Includes `source_over.wgsl` and `lib/deposit_ceiling.wgsl`.
+// Includes `source_over.wgsl`, `lib/deposit_ceiling.wgsl` and
+// `lib/commit_law.wgsl`.
 
 struct CompositeUniforms {
     origin: vec2f,       // quad top-left in canvas pixels
@@ -78,18 +78,6 @@ struct VertexOutput {
     return out;
 }
 
-// The deposit ceiling: lay `fg` (premultiplied) onto `bg` (straight alpha),
-// depositing only what the pixel can still take; the room is `ceiling_t`'s.
-// A saturated pixel (`t == 0`) is left exactly as it is, where a
-// `source_over` at zero alpha would re-derive it through a division.
-fn deposit_through_ceiling(fg: vec4f, bg: vec4f) -> vec4f {
-    let t = ceiling_t(fg, vec4f(bg.rgb * bg.a, bg.a));
-    if t <= 0.0 {
-        return bg;
-    }
-    return source_over(fg.rgb / fg.a * t, t, bg);
-}
-
 // Float foregrounds, sampled: the instanced terminals' scratch and channels.
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     // Each slot scaled by its own stroke opacity. Premultiplied, so one
@@ -108,33 +96,11 @@ fn deposit_through_ceiling(fg: vec4f, bg: vec4f) -> vec4f {
     return commit_fragment(in, wash, build);
 }
 
-// The commit law over two premultiplied, opacity-scaled foregrounds.
+// The background under a fragment: the pre-stroke snapshot, straight
+// alpha. The copy_texture_to_texture origin is floor(u.origin), integer
+// pixel coords, so the floored origin maps each fragment to its own texel.
 fn commit_fragment(in: VertexOutput, wash: vec4f, build: vec4f) -> vec4f {
-    // Background: the pre-stroke snapshot, straight alpha. The
-    // copy_texture_to_texture origin is floor(u.origin), integer pixel
-    // coords, so the floored origin maps each fragment to its own texel.
     let copy_uv = (in.canvas_pos - floor(u.origin)) / vec2f(textureDimensions(t_bg));
     let bg = textureSample(t_bg, s_bg, copy_uv);
-
-    if u.blend_mode == 1u {
-        // Erase: each slot removes its own coverage, composing to a removal
-        // of `1 - (1 - wash.a) * (1 - build.a)`. Removal never goes through
-        // the ceiling, so an eraser can always reach zero. No gate needed:
-        // `destination_out(0, x)` is exactly `x`.
-        return destination_out(build.a, destination_out(wash.a, bg));
-    }
-
-    // The wash slot first: the ceiling reads the ground to find room, and a
-    // build slot laid under it would let a stroke's own build-up shrink its
-    // own wash. An absent slot is skipped rather than composited at zero
-    // alpha, because `source_over` at zero alpha is not an exact identity
-    // (it divides `bg.a * bg.rgb` by `bg.a`, and zeroes rgb under 0.001).
-    var out = bg;
-    if u.wash_opacity > 0.0 {
-        out = deposit_through_ceiling(wash, out);
-    }
-    if u.build_opacity > 0.0 {
-        out = source_over(build.rgb, build.a, out);
-    }
-    return out;
+    return commit_law(wash, build, bg, u.blend_mode, u.wash_opacity, u.build_opacity);
 }

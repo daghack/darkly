@@ -866,6 +866,65 @@ outright) and item 4 (several dabs per dispatch, since the 250 px cell's
 time tracks its 116 dispatches per event), plus the commit scissor
 (item 3) as its own small plan.
 
+### #9: the live canvas sampler on `paint` (shipped)
+
+**Shape:** not a change to `paint`'s own regime but a second dispatch per
+dab for a graph that samples the stroke at other pixels (plan
+`docs/plans/live-canvas-sampler.md`). Before each dab's dispatch, in the
+same compute pass, an appearance snapshot dispatch lays the grounds on the
+pre-stroke snapshot through the commit law into a layer-sized
+`rgba8unorm` mirror over the dab's read region (footprint plus `|motion|`
+plus a texel); the dab samples the mirror. Per dab: two `set_pipeline`,
+two `set_bind_group(1)` and two dispatches, against one bind and one
+dispatch for a brush that samples nothing (group 0 is shared by the two
+pipelines' layouts and stays bound; groups 2 and 3 are outside the
+snapshot's layout and stay bound). `dispatches/ev` counts both, so it reads
+`2 * dabs/ev` for the Dry Smudge.
+
+**Measurements, on this machine** (Intel Raptor Lake-P iGPU, Mesa
+26.2.3), the recorded curvy stroke at `stabilize = 1`, native, realtime
+pacing, one session at `ce9622df` plus the change
+(`bench-results/stroke-replay-matrix-{paint,pencil,dry-smudge}-recorded_curvy_stroke-ce9622df0e.md`).
+The Pencil is the fair baseline: the Dry Smudge runs its dial (`buildup
+0.1`, two grounds) and its spacing (0.03). The two brushes' pressure-to-size
+curves differ, so at 100 px and above their dab counts differ and the rows
+compare per event only.
+
+| cell | brush | dabs/ev | dispatches/ev | cpu p50 | submit p50 | behind |
+|---|---|---:|---:|---:|---:|---:|
+| 1920x1080, 1 px | Ink Pen | 490.9 | 490.9 | 7.0 ms | 3.0 ms | +2 ms |
+| | Pencil | 490.9 | 490.9 | 7.5 ms | 2.3 ms | +7 ms |
+| | Dry Smudge | 490.9 | 981.9 | 7.5 ms | 3.8 ms | +8 ms |
+| 1920x1080, 10 px | Pencil | 491.0 | 491.0 | 7.7 ms | 2.3 ms | +3 ms |
+| | Dry Smudge | 491.0 | 982.1 | 7.3 ms | 3.8 ms | +6 ms |
+| 1920x1080, 100 px | Pencil | 301.9 | 301.9 | 7.3 ms | 2.6 ms | +8 ms |
+| | Dry Smudge | 121.4 | 242.8 | 6.0 ms | 3.4 ms | +6 ms |
+| 2560x1440, 2000 px | Pencil | 20.5 | 20.5 | 10.5 ms | 5.4 ms | +5672 ms |
+| | Dry Smudge | 8.3 | 16.5 | 6.9 ms | 4.5 ms | +2323 ms |
+
+At the small-dab rows, where the stroke is CPU-bound, the doubled
+dispatch count is inside the noise of `cpu p50` (7.3 to 7.5 ms against the
+Pencil's 7.5 to 7.7 ms); `submit p50` rises by about 1.5 ms, the GPU work
+the snapshots add showing up as back-pressure, and nothing falls behind.
+At 2000 px on 1440p the compute terminal's large-dab regime is already
+over budget for the Pencil; the Dry Smudge falls behind by less only
+because its curve places fewer dabs.
+
+**Not measured:** the browser. Every production pixel goes through the
+`webgpu` backend, where a `setPipeline`, `setBindGroup` or
+`dispatchWorkgroups` costs whatever the browser's GPU process charges, and
+this shape doubles the dispatches and adds two pipeline switches per dab.
+The browser replay harness the paint port listed as a follow-up is where
+that is answered.
+
+**Correctness note** worth carrying to the next live reader: the sampler
+filters the mirror by hand from four texel loads, splitting the sample
+point into the pixel's integer texel and a fraction taken from `motion`
+alone. Through `graph_smp` the hardware filter's fixed-point weights depend
+on the layer's size, so a dab re-rendered after the layer grew (the full
+re-render path) read a different LSB than the same dab rendered before
+the grow, and `tests/stroke_rewind.rs`'s oracle caught it.
+
 ## Background changes that are NOT competing attempts
 
 These landed for different reasons over the same time window. Listed
@@ -997,55 +1056,31 @@ Cheap, partial; ships behind the heuristic. **Rejected in favour of
 that complexity the buffer round-trip is still the dominant cost. (C)
 removes the round-trip entirely.
 
-### E. Chained-read terminals: what the matrix already says
+### E. Chained-read terminals: answered on `paint` by the appearance mirror
 
 Smudge, blur, liquify and watercolor all have a *semantic* dependency
 between consecutive dabs: dab `n+1` reads what dab `n` wrote (the
 scratch read mirror for the first three, the deposit channel for
-watercolor). Any future graph that samples the live stroke, such as a
-canvas-sampling node feeding `paint`, has the same dependency.
+watercolor). Neither #3 nor #4 can express it: a thread cannot read a
+neighbour's post-dab value inside one dispatch, and instances of one draw
+cannot see each other's writes.
 
-That dependency rules out the two shapes that won above:
+The dispatch-per-dab terminal (#6) can, because dispatches in a pass are
+ordered and a dispatch's stores are visible to the next. Attempt #9 is the
+shape: a graph that samples the live stroke requests
+`LiveSource::StrokeAppearance`, and `paint` runs a snapshot dispatch
+before each dab that renders the stroke's appearance under the dab's read
+region into a mirror the dab samples. That is one extra dispatch per dab,
+about 1.5 us of marginal cost on this machine, against the old framing's
+one render pass and one copy per dab (about 40 us, the read-mirror
+terminals' shape). The Dry Smudge is built this way, with every `paint`
+law and the full dial.
 
-- **#4 cannot express it.** Instances in one draw cannot see each
-  other's writes; the ROP blends them but a fragment never reads the
-  target. `paint`'s one-pass-per-phase trick is unavailable.
-- **#3 cannot express it.** A thread owns one pixel and cannot read a
-  neighbour's post-dab value; workgroups cannot barrier against each
-  other.
-
-Only #1 (one render pass per dab, what the read-mirror terminals run
-today) and #2 (one workgroup walking the dab list with a
-`storageBarrier()` between dabs) can. The matrix already contains
-their crossover, read from the synthesis table:
-
-| radius_px | #1 pass-per-dab | #2 single workgroup |
-|---:|---:|---:|
-| 1 to 10 | +1006 to +17614 | +4 to +5 |
-| 100 | +15 to +27 | +3 to +1415 (4K) |
-| 250 and up | +16 to +55 | +34 to +54099 |
-
-So a chained terminal would want #2 below roughly radius 100 and #1
-above it, with the crossover depending on canvas size. Caveats before
-building that hybrid:
-
-- Nobody has measured the existing smudge, blur or liquify at any
-  cell. `stroke_replay_matrix --topology smudge` exists. Run it first;
-  if the per-dab fragment path keeps up at radius 1 on the recorded
-  stroke, there is nothing to fix.
-- #2's numbers were measured with the buffer round-trip that #3 showed
-  dominates at large bboxes. A chained #2 pays the same round-trip (or
-  needs storage textures), so its large-radius column is not
-  pessimistic by accident.
-- The hybrid was dropped for `paint` because #4 made it unnecessary,
-  not because it was wrong. For chained terminals #4 is not on the
-  table, so the hybrid question is live again, and it belongs in the
-  shared serialized flush path, not in `paint`'s instanced path.
-- Watercolor is the cautionary tale in the other direction: it was
-  batched onto #4, then re-serialized because the batched answer was
-  wrong (banding at the pointer-event period). Correctness decides
-  whether a terminal is chained; performance only decides #1 versus
-  #2 within that.
+What remains is the follow-up: delete the `smudge` and `blur` terminals in
+favour of samplers on `paint`, and move watercolor's pickup onto the same
+mechanism. Liquify warps rather than deposits, so it is a different
+question. The browser's per-call cost for the doubled dispatches is
+unmeasured (#9).
 
 ### F. Dispatch-per-dab on a resident storage scratch: B.1 revisited, *stages 1 and 2 passed*
 

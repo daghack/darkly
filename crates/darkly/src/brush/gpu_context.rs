@@ -72,9 +72,10 @@ pub struct BrushPerfCounters {
     pub dab_flushes: u32,
     /// Total dabs that flowed through a dab-batching terminal.
     pub flushed_dabs: u32,
-    /// Draw calls or compute dispatches a terminal issued into the stroke
-    /// scratch, summed over flushes: one per flush for an instanced draw,
-    /// one per dab for a serialized terminal.
+    /// Draw calls or compute dispatches a terminal issued per flush,
+    /// summed over flushes: one per flush for an instanced draw, one per
+    /// dab for a serialized terminal, two per dab for a dispatch-per-dab
+    /// terminal that refreshes the stroke appearance before each dab.
     pub dispatches: u32,
     /// Sum of `union_w * union_h` across every dab flush.
     pub dab_union_bbox_area: u64,
@@ -99,8 +100,7 @@ impl BrushPerfCounters {
         self.dab_flushes = self.dab_flushes.saturating_add(1);
     }
 
-    /// Record how many draws or dispatches a flush issued into the
-    /// scratch.
+    /// Record how many draws or dispatches a flush issued.
     pub fn record_dispatches(&mut self, n: u32) {
         self.dispatches = self.dispatches.saturating_add(n);
     }
@@ -268,15 +268,12 @@ pub struct DabBatch {
     /// `flush_dabs` to know the dab record / uniform layouts and the
     /// pipeline topology hash.
     pub compiled_brush: Option<Arc<CompiledBrush>>,
-    /// `@group(3)` textures published for this flush by the nodes that
-    /// requested them, keyed by which live source they satisfy. A node
-    /// with a [`crate::brush::texture_source::ResolvedSource::Live`] slot
-    /// publishes its view from its own `flush_dabs`; the terminal reads
-    /// them all when it builds the graph-texture bind group. The runner
-    /// dispatches `flush_dabs` in topological order, so every producer
-    /// upstream of the terminal has published before the terminal binds.
-    /// Cleared at the start of each flush: a slot nobody published falls
-    /// back to `_fallback` (the cursor-preview path).
+    /// `@group(3)` textures published for this flush, keyed by which live
+    /// source they satisfy. Both live sources are stroke resources, so the
+    /// terminal that owns the stroke publishes them from its own
+    /// `flush_dabs` and reads them back when it builds the graph-texture
+    /// bind group. Cleared at the start of each flush: a slot nobody
+    /// published falls back to `_fallback` (the cursor-preview path).
     pub live_textures: Vec<(LiveSource, wgpu::TextureView)>,
     /// Name → value map of every output slot in the brush graph, built
     /// by the runner's `dispatch_gpu` immediately after `execute_cpu`
@@ -285,6 +282,13 @@ pub struct DabBatch {
     /// [`crate::brush::wgsl::CompileWgslCtx::dab_field_name`]. The
     /// terminal reads from this to pack per-dab records and uniforms.
     pub slot_outputs: Option<HashMap<String, ScalarValue>>,
+    /// Canvas pixels the graph reads beyond the current dab's write
+    /// footprint, per axis: the per-axis maximum of every node's
+    /// [`crate::brush::eval::BrushNodeEvaluator::read_reach`], set by the
+    /// runner before the terminal's `evaluate_gpu`. Per dab, overwritten
+    /// for every dab; a terminal that refreshes the stroke appearance
+    /// sizes the region it refreshes under from it.
+    pub read_reach: [f32; 2],
 }
 
 impl DabBatch {
@@ -358,12 +362,10 @@ impl DabBatch {
         self.live_textures.clear();
     }
 
-    /// Publish a `@group(3)` texture for this flush. Called by the node
-    /// that requested the matching
-    /// [`crate::brush::texture_source::ResolvedSource::Live`] slot, from
-    /// its own `flush_dabs`, before the terminal binds. Last write wins,
-    /// so a node re-publishing within one flush replaces its own entry
-    /// rather than accumulating.
+    /// Publish a `@group(3)` texture for this flush, for the matching
+    /// [`crate::brush::texture_source::ResolvedSource::Live`] slot, before
+    /// the terminal binds. Last write wins, so a re-publish within one
+    /// flush replaces the entry rather than accumulating.
     pub fn publish_live_texture(&mut self, kind: LiveSource, view: wgpu::TextureView) {
         if let Some(slot) = self.live_textures.iter_mut().find(|(k, _)| *k == kind) {
             slot.1 = view;

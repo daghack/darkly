@@ -6,6 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Per-axis [`PaintInformation::motion`] magnitude, in canvas pixels, below
+/// which a dab has not moved from the previous one: there is no "one dab
+/// ago" to read, so a reader of the stroke at `-motion` (the `smudge`
+/// terminal, the live canvas sampler) contributes nothing for it.
+pub const STATIONARY_MOTION_PX: f32 = 0.5;
+
 /// All sensor data for a single pen sample.
 ///
 /// Modelled after Krita's `KisPaintInformation`: every field the tablet

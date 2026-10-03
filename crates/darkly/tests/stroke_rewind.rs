@@ -279,6 +279,48 @@ fn recorded_stroke_rewinds_match_full_rerender() {
     });
 }
 
+/// Black vertical bars across the layer in the Ink Pen, then `brush`
+/// back at `stabilize = 0`: something for a brush that moves existing
+/// pigment to move. The bars stay a dab's reach inside the layer: pigment
+/// at the border would let the smear cross the edge at a dab clipped
+/// before the layer grows, the history `grow_reverse_jump`'s note says a
+/// from-scratch render cannot reproduce.
+fn lay_stripes(engine: &mut DarklyEngine, layer: LayerId, canvas: (u32, u32), brush: &str) {
+    install_builtin(engine, "Ink Pen");
+    set_input(engine, "brush_settings", "stabilize", 0.0);
+    const INSET: u32 = 64;
+    for x in (INSET..canvas.0 - INSET).step_by(48) {
+        engine.begin_stroke(layer).unwrap();
+        for i in 0..=8 {
+            let y = INSET as f32 + (canvas.1 - 2 * INSET) as f32 * i as f32 / 8.0;
+            engine.stroke_to(event(x as f32, y, i as f64 * 16.0));
+        }
+        engine.end_stroke();
+    }
+    install_builtin(engine, brush);
+    set_input(engine, "brush_settings", "stabilize", 0.0);
+}
+
+/// The recorded stroke through the Dry Smudge over a striped layer: every
+/// rewind restores the grounds and the next dab's appearance snapshot
+/// reads them back, and the appearance mirror itself is never
+/// checkpointed, so a mirror texel a dab read without refreshing it shows
+/// here as a difference from the full re-render.
+#[test]
+fn live_sampler_rewinds_match_full_rerender() {
+    let canvas = (1024, 512);
+    let cell = Cell {
+        brush: "Dry Smudge",
+        buildup: None,
+        canvas,
+        crop: None,
+    };
+    cell.assert_matches_oracle(|engine, layer| {
+        lay_stripes(engine, layer, canvas, "Dry Smudge");
+        replay_recording(engine, layer, canvas);
+    });
+}
+
 /// The same stroke with the `build` channel declared: the ring snapshots
 /// and restores two `r32uint` grounds with one set of rects, and the
 /// commit reads both, so a channel the restore missed shows in the layer.

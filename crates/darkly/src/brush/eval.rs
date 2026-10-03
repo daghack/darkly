@@ -447,6 +447,34 @@ pub trait BrushNodeEvaluator: Send + Sync {
     ) -> crate::brush::wgsl::ExtentContribution {
         crate::brush::wgsl::ExtentContribution::Identity
     }
+
+    /// Canvas pixels this node reads beyond the dab's write footprint, per
+    /// axis, for the dab being evaluated. The per-dab counterpart of
+    /// [`Self::extent`]: `extent` bounds what a dab writes and is composed
+    /// once at compile time; this bounds what it reads and is composed per
+    /// dab, because a read offset such as the stroke's motion is per-dab
+    /// data with no compile-time bound. The runner takes the per-axis
+    /// maximum over the graph and hands it to the terminal, which sizes the
+    /// region it refreshes the stroke appearance under. One virtual call
+    /// per node per dab with an identity default; it cannot move to
+    /// compile time.
+    fn read_reach(&self, _ctx: &EvalContext) -> [f32; 2] {
+        [0.0, 0.0]
+    }
+
+    /// How a preview of a brush containing this node instance must be
+    /// staged, given the instance's ports. Defaults to `declared`, the
+    /// registration's static
+    /// [`preview_staging`](crate::nodegraph::NodeRegistration::preview_staging);
+    /// a node whose compile-time settings change what it samples answers
+    /// per instance.
+    fn preview_staging(
+        &self,
+        _ports: &[crate::nodegraph::PortDef<BrushWireType>],
+        declared: Option<crate::gpu::preview::PreviewStaging>,
+    ) -> Option<crate::gpu::preview::PreviewStaging> {
+        declared
+    }
 }
 
 /// Stroke-constant clone uniforms, seeded into a `clone_source` node's
@@ -581,6 +609,17 @@ pub struct BrushGraphRunner {
     /// `BrushGpuContext` at `dispatch_gpu` time so the terminal can
     /// read its dab/uniform layouts.
     compiled: Option<Arc<CompiledBrush>>,
+    /// Per-axis maximum of every node's [`BrushNodeEvaluator::read_reach`]
+    /// for the dab being evaluated: reset at the top of `execute_cpu`,
+    /// folded after each node's `evaluate_cpu`, and handed to the terminal
+    /// on [`crate::brush::gpu_context::DabBatch::read_reach`].
+    dab_read_reach: [f32; 2],
+}
+
+/// Fold one node's read reach into the dab's per-axis maximum.
+fn fold_read_reach(acc: &mut [f32; 2], reach: [f32; 2]) {
+    acc[0] = acc[0].max(reach[0]);
+    acc[1] = acc[1].max(reach[1]);
 }
 
 struct NodeData {
@@ -746,6 +785,7 @@ impl BrushGraphRunner {
             dabs_per_pass: 1.0,
             dpi: crate::document::REFERENCE_DPI,
             compiled: None,
+            dab_read_reach: [0.0, 0.0],
         })
     }
 
@@ -965,6 +1005,7 @@ impl BrushGraphRunner {
     /// Call `seed_sensors()` first.  After this returns, output slots
     /// contain the final values for this dab.
     pub fn execute_cpu(&mut self) {
+        self.dab_read_reach = [0.0, 0.0];
         let n = self.plan.steps.len();
         for idx in 0..n {
             // Field accesses below all go through `self.<field>` directly so
@@ -1014,6 +1055,7 @@ impl BrushGraphRunner {
             );
 
             let outputs = evaluator.evaluate_cpu(&ctx);
+            fold_read_reach(&mut self.dab_read_reach, evaluator.read_reach(&ctx));
 
             // Write outputs to their assigned slots. `ctx`'s borrows on
             // `self.inputs_scratch` (immut) and `step.input_slots` (immut)
@@ -1135,6 +1177,11 @@ impl BrushGraphRunner {
             // Declared-GPU nodes take the opposite path: `evaluate_cpu`
             // returns empty, `evaluate_gpu` does the work.
             let mut outputs = evaluator.evaluate_cpu(&ctx);
+            fold_read_reach(&mut self.dab_read_reach, evaluator.read_reach(&ctx));
+            // Every reader upstream of the terminal precedes it in
+            // topological order, so the reach is complete by the time the
+            // terminal queues its dab.
+            gpu.dab_batch.read_reach = self.dab_read_reach;
             let gpu_outputs = f(evaluator.as_ref(), &ctx, gpu);
 
             outputs.extend(gpu_outputs);
@@ -1191,11 +1238,18 @@ impl BrushGraphRunner {
             .as_ref()
             .map(|c| c.channels.clone())
             .unwrap_or_default();
+        let reads_appearance = self
+            .compiled
+            .as_ref()
+            .is_some_and(|c| c.reads_stroke_appearance());
         let device = gpu.device;
         if let Some(stroke) = gpu.stroke.as_mut() {
             stroke
                 .scratch
                 .ensure_channels(device, &mut gpu.encoder, &channels);
+            stroke
+                .scratch
+                .ensure_appearance_mirror(device, reads_appearance);
         }
 
         let registry = crate::brush::registry();

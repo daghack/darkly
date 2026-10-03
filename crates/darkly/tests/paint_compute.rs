@@ -167,6 +167,63 @@ fn dispatches_count_one_per_dab() {
     );
 }
 
+/// A brush that samples the live stroke refreshes the stroke's appearance
+/// before every dab: two dispatches per dab, both counted.
+#[test]
+fn dispatches_count_two_per_dab_for_a_live_sampler() {
+    let mut engine = test_engine((256, 128));
+    install_builtin(&mut engine, "Ink Pen");
+    let layer = engine.add_raster_layer(None);
+    stroke_row(&mut engine, layer, 64.0, 12.0, 244.0, 48);
+    install_builtin(&mut engine, "Dry Smudge");
+    let _ = engine.drain_brush_perf_delta();
+    stroke_row(&mut engine, layer, 60.0, 12.0, 244.0, 48);
+    let perf = engine.drain_brush_perf_delta();
+    assert!(perf.flushed_dabs > 0, "paint flushed no dabs");
+    assert_eq!(
+        perf.dispatches as u64,
+        2 * perf.flushed_dabs,
+        "a snapshot and a dab per dab"
+    );
+}
+
+/// The Dry Smudge over painted rows, through the recorded curvy stroke at
+/// full stabilisation: every event rewinds through the checkpoint ring and
+/// every dab's snapshot reads the restored grounds. Two fresh engines
+/// agree byte for byte, and the smudge moved pigment.
+#[test]
+fn live_sampler_replay_is_deterministic_and_moves_pigment() {
+    let recording =
+        StrokeRecording::load(&fixture("recorded_curvy_stroke.json")).expect("fixture parses");
+    let canvas = (1024, 512);
+    let run = || {
+        let mut engine = test_engine(canvas);
+        install_builtin(&mut engine, "Ink Pen");
+        let layer = engine.add_raster_layer(None);
+        for y in (16..canvas.1).step_by(32) {
+            stroke_row(&mut engine, layer, y as f32, 8.0, canvas.0 as f32 - 8.0, 64);
+        }
+        let painted = layer_pixels(&engine, layer);
+        install_builtin(&mut engine, "Dry Smudge");
+        set_input(&mut engine, "brush_settings", "stabilize", 1.0);
+        let timings = replay(
+            &mut engine,
+            &recording,
+            layer,
+            canvas,
+            ReplayPacing::AsFastAsPossible,
+            None,
+        );
+        assert_eq!(timings.len(), recording.events.len());
+        engine.test_flush_readbacks();
+        (painted, layer_pixels(&engine, layer))
+    };
+    let (painted, first) = run();
+    let (_, second) = run();
+    assert!(first != painted, "the smudge moved no pigment");
+    assert!(first == second, "two replays of the same recording differ");
+}
+
 /// The compute skeleton samples the selection per dab exactly as the
 /// fragment skeleton did, through the window-anchored mask: pixels outside
 /// a rectangular selection stay untouched and pixels inside are painted,

@@ -32,6 +32,14 @@
 //!   (slot `i` holds `i`, written once at build) bound with a dynamic
 //!   offset: immediates are unavailable on the `webgpu` backend, and this
 //!   is the cheapest legal mechanism there.
+//! - **A graph that samples the live stroke** (the stroke's appearance at
+//!   other pixels, [`CompiledBrush::reads_stroke_appearance`]) gets one
+//!   more dispatch before each dab's: the
+//!   [`AppearanceSnapshotPipeline`] renders the grounds through the commit
+//!   law into the scratch's appearance mirror under the dab's read region
+//!   (its footprint grown by the graph's per-dab read reach), and the dab
+//!   samples the mirror. Inside one dispatch the read would race the
+//!   threads writing the texels it reads; across dispatches it is ordered.
 //!
 //! Upstream nodes (`circle`, `stamp`, etc.) compile inline into the
 //! compute shader and evaluate per-pixel-per-dab, with no intermediate
@@ -56,6 +64,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
+use crate::brush::appearance_snapshot::{
+    AppearanceSnapshotPipeline, SnapshotRecord, SnapshotSources, APPEARANCE_SNAPSHOT_ID,
+};
 use crate::brush::eval::{BrushNodeEvaluator, EvalContext};
 use crate::brush::gpu_context::{BrushGpuContext, MAX_DABS_PER_PHASE};
 use crate::brush::node::{BrushNodeRegistration, DabPass, PACKED_GROUND_FORMAT};
@@ -64,9 +75,10 @@ use crate::brush::pipeline::{
     BrushPipelineEntry, BrushPipelineRegistration, BuildContext, DynamicUniformRing,
 };
 use crate::brush::scratch::{ChannelUse, StrokeChannel};
+use crate::brush::texture_source::{LiveSource, ResolvedSource};
 use crate::brush::wgsl::{
     pack_intrinsic_uniforms, pack_uniforms, CompileWgslCtx, CompiledBrush, InputBinding, NodeWgsl,
-    DAB_WORKGROUP, GROUND_NAME, INTRINSIC_UNIFORMS_SIZE,
+    DAB_SLOT_STRIDE, DAB_WORKGROUP, GROUND_NAME, INTRINSIC_UNIFORMS_SIZE,
 };
 use crate::brush::wire::{BrushWireType, ScalarValue};
 use crate::nodegraph::{NodeRegistration, PortDef, UnitType};
@@ -75,11 +87,6 @@ use crate::nodegraph::{NodeRegistration, PortDef, UnitType};
 
 /// Maximum uniform buffer size we'll allocate per brush pipeline.
 const MAX_UNIFORM_BYTES: usize = 1024;
-
-/// Stride of the static dab index buffer: WebGPU's default
-/// `min_uniform_buffer_offset_alignment`, so a dynamic offset can select
-/// any slot on the web.
-const INDEX_STRIDE: u64 = 256;
 
 /// The accumulation the stacking half of a dab goes into when the brush sits
 /// strictly inside the dial. Its law is the one the original terminal always
@@ -103,13 +110,17 @@ const ACCUMULATE_WGSL: &str = concat!(
     include_str!("../../../shaders/brush/paint_accumulate.wgsl"),
 );
 
-/// Per-dab grid size, in lockstep with the dab records: the dab's
-/// layer-clamped footprint, which the dispatch covers.
+/// Per-dab meta, in lockstep with the dab records: the footprint's size
+/// (the dab's dispatch grid) and the read region (the appearance
+/// snapshot's dispatch grid and origin, write-side texels), both clamped
+/// to the layer. The read region is the footprint grown by the graph's
+/// per-dab read reach; for a graph that reads nothing beyond its
+/// footprint it equals the footprint and is never used.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct DabGrid {
-    width: u32,
-    height: u32,
+struct PaintDabMeta {
+    grid: [u32; 2],
+    read: SnapshotRecord,
 }
 
 /// How much of each dab goes to each half, from the `buildup` dial.
@@ -132,6 +143,28 @@ fn rgba_expr(cctx: &CompileWgslCtx) -> String {
 fn shares(buildup: f32) -> (f32, f32) {
     let b = buildup.clamp(0.0, 1.0);
     (1.0 - b, b)
+}
+
+/// Which accumulation fills each of the commit law's two slots, `(wash,
+/// build)`. At either end the ground is the only accumulation and fills
+/// its own law's slot; between, the ground is the wash half and the build
+/// channel the build half. The commit and the appearance snapshot both map
+/// through here, so the stroke a sampler reads is the one the commit lays.
+fn law_slots<T: Copy>(
+    buildup: f32,
+    ground: T,
+    build_channel: impl FnOnce() -> T,
+) -> (Option<T>, Option<T>) {
+    let (wash_share, build_share) = shares(buildup);
+    let wash = (wash_share > 0.0).then_some(ground);
+    let build = if build_share <= 0.0 {
+        None
+    } else if wash_share <= 0.0 {
+        Some(ground)
+    } else {
+        Some(build_channel())
+    };
+    (wash, build)
 }
 
 // ── Per-brush pipeline ──────────────────────────────────────────────────
@@ -230,9 +263,9 @@ impl PerBrushPipeline {
         // node with a terminal that also claims @group(3) (e.g.
         // watercolor's pickup atlas).
         // `@group(3)` texture count: every slot the graph requested,
-        // whatever kind. Live slots (`clone_source`'s snapshot, `pickup`'s
-        // atlas) occupy a binding exactly like a named texture; only the
-        // moment their view resolves differs.
+        // whatever kind. Live slots (the stroke snapshot, the live stroke
+        // appearance) occupy a binding exactly like a named texture; only
+        // the moment their view resolves differs.
         let graph_tex_count = compiled.graph_sources.len();
         let graph_layout = if graph_tex_count == 0 {
             None
@@ -400,15 +433,15 @@ pub struct PaintPipeline {
     cache: RefCell<HashMap<u64, PerBrushPipeline>>,
     /// The static dab index: slot `i` holds `i`, one slot per
     /// [`MAX_DABS_PER_PHASE`], written once. A dispatch selects its dab
-    /// by binding the slot at a dynamic offset of `i * INDEX_STRIDE`.
+    /// by binding the slot at a dynamic offset of `i * DAB_SLOT_STRIDE`.
     index_buffer: wgpu::Buffer,
 }
 
 impl PaintPipeline {
     fn build(ctx: &BuildContext) -> Self {
-        let mut index_bytes = vec![0u8; (INDEX_STRIDE * MAX_DABS_PER_PHASE as u64) as usize];
+        let mut index_bytes = vec![0u8; (DAB_SLOT_STRIDE * MAX_DABS_PER_PHASE as u64) as usize];
         for i in 0..MAX_DABS_PER_PHASE {
-            let at = (i as u64 * INDEX_STRIDE) as usize;
+            let at = (i as u64 * DAB_SLOT_STRIDE) as usize;
             index_bytes[at..at + 4].copy_from_slice(&i.to_le_bytes());
         }
         let index_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -618,11 +651,29 @@ impl BrushNodeEvaluator for PaintEvaluator {
         else {
             return vec![("dab_size".into(), ScalarValue::Vec2([diameter, diameter]))];
         };
+        // The read region: the footprint grown by what the graph reads
+        // beyond it this dab, under the same clamp, in write-side texels.
+        let extent = paint_target.canvas_extent();
+        let reach = gpu.dab_batch.read_reach;
+        let read = extent
+            .clamp_f32(
+                position[0] - bbox_radius - reach[0],
+                position[1] - bbox_radius - reach[1],
+                position[0] + bbox_radius + reach[0],
+                position[1] + bbox_radius + reach[1],
+            )
+            .expect("the read region encloses a footprint that overlaps the layer");
         gpu.dab_batch
             .meta_bytes
-            .extend_from_slice(bytemuck::bytes_of(&DabGrid {
-                width: footprint.width,
-                height: footprint.height,
+            .extend_from_slice(bytemuck::bytes_of(&PaintDabMeta {
+                grid: [footprint.width, footprint.height],
+                read: SnapshotRecord {
+                    origin: [
+                        (read.x0() - extent.x0()) as u32,
+                        (read.y0() - extent.y0()) as u32,
+                    ],
+                    size: [read.width, read.height],
+                },
             }));
 
         gpu.dab_batch
@@ -631,7 +682,7 @@ impl BrushNodeEvaluator for PaintEvaluator {
         vec![("dab_size".into(), ScalarValue::Vec2([diameter, diameter]))]
     }
 
-    fn flush_dabs(&self, _ctx: &EvalContext, gpu: &mut BrushGpuContext) {
+    fn flush_dabs(&self, ctx: &EvalContext, gpu: &mut BrushGpuContext) {
         if gpu.dab_batch.count == 0 {
             return;
         }
@@ -648,11 +699,11 @@ impl BrushNodeEvaluator for PaintEvaluator {
         }
         gpu.perf
             .record_dab_flush_workload(total_dabs, union_w, union_h);
-        let grids: &[DabGrid] = bytemuck::cast_slice(&meta_bytes);
+        let metas: &[PaintDabMeta] = bytemuck::cast_slice(&meta_bytes);
         debug_assert_eq!(
-            grids.len(),
+            metas.len(),
             total_dabs as usize,
-            "paint queues one grid per dab record"
+            "paint queues one meta per dab record"
         );
 
         let pipeline_ref = gpu.pipelines.get::<PaintPipeline>("paint");
@@ -689,32 +740,59 @@ impl BrushNodeEvaluator for PaintEvaluator {
             .expect("paint::flush_dabs requires dab_batch.slot_outputs");
         pack_uniforms(&compiled, outputs, &mut uniform_bytes);
 
+        // The appearance snapshot, for a graph that samples the live
+        // stroke: its records, its flags from the same slot mapping the
+        // commit uses, and the mirror it writes. Group 1 per flush, since a
+        // grow reallocates every view in it.
+        let pre_stroke_view = stroke
+            .pre_stroke_texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let snapshot = gpu
+            .pipelines
+            .get::<AppearanceSnapshotPipeline>(APPEARANCE_SNAPSHOT_ID);
+        let snapshots = compiled.reads_stroke_appearance().then(|| {
+            let (wash, build) = law_slots(ctx.input_f32("buildup"), scratch.write_view(), || {
+                scratch
+                    .channel_view(BUILD_CHANNEL.name)
+                    .expect("a brush inside the dial declares its build channel")
+            });
+            let records: Vec<SnapshotRecord> = metas.iter().map(|m| m.read).collect();
+            snapshot.begin_flush(
+                gpu.device,
+                gpu.queue,
+                &pipeline_ref.index_buffer,
+                &records,
+                SnapshotSources {
+                    wash,
+                    build,
+                    pre_stroke: &pre_stroke_view,
+                    appearance: scratch
+                        .appearance_view()
+                        .expect("begin_stroke allocates the mirror for a brush that reads it"),
+                },
+            )
+        });
+
         // `@group(3)` for graphs with a live slot: rebuilt here each flush
-        // from the views the producing nodes published during their own
-        // `flush_dabs` (the runner dispatches those first, in topological
-        // order). `clone_source` publishes the stroke snapshot; `pickup`
-        // publishes its atlas. An unpublished slot resolves to `_fallback`
-        // inside `make_bind_group`.
+        // from the stroke textures this terminal publishes. Both are stroke
+        // resources, so the terminal that owns the stroke publishes them;
+        // an unpublished slot resolves to `_fallback` inside
+        // `make_bind_group`.
         let live_bind_group = if compiled.graph_sources.iter().any(|s| s.is_live()) {
-            // The stroke snapshot is a *stroke* resource, so the terminal
-            // that owns the stroke publishes it; node-owned live textures
-            // (the `pickup` atlas) are already in the table, published by
-            // their nodes earlier in this same topological dispatch. Both
-            // then resolve through one uniform lookup below.
-            let snapshot = stroke
+            let source = stroke
                 .source_texture()
                 .create_view(&wgpu::TextureViewDescriptor::default());
-            gpu.dab_batch.publish_live_texture(
-                crate::brush::texture_source::LiveSource::StrokeSnapshot,
-                snapshot,
-            );
+            gpu.dab_batch
+                .publish_live_texture(LiveSource::StrokeSnapshot, source);
+            if let Some(view) = scratch.appearance_view() {
+                gpu.dab_batch
+                    .publish_live_texture(LiveSource::StrokeAppearance, view.clone());
+            }
             let published: Vec<Option<&wgpu::TextureView>> = compiled
                 .graph_sources
                 .iter()
                 .map(|s| match s {
-                    crate::brush::texture_source::ResolvedSource::Live(kind) => {
-                        gpu.dab_batch.live_texture(*kind)
-                    }
+                    ResolvedSource::Live(kind) => gpu.dab_batch.live_texture(*kind),
                     _ => None,
                 })
                 .collect();
@@ -769,9 +847,9 @@ impl BrushNodeEvaluator for PaintEvaluator {
             pass.set_bind_group(0, &per_brush.uniform_bind_group, &[uniform_offset]);
             pass.set_bind_group(2, gpu.selection_bind_group, &[]);
             // `@group(3)` holds the brush's graph textures: paper grain,
-            // baked noise, the `clone_source` snapshot, the `pickup`
-            // atlas. Graphs with a live slot bind the group assembled
-            // above; wholly static ones bind the pipeline's cached group.
+            // baked noise, the stroke snapshot, the stroke appearance.
+            // Graphs with a live slot bind the group assembled above;
+            // wholly static ones bind the pipeline's cached group.
             // Paint never uses group 3 for anything else.
             if let Some(live_bg) = live_bind_group.as_ref() {
                 pass.set_bind_group(3, live_bg, &[]);
@@ -780,16 +858,28 @@ impl BrushNodeEvaluator for PaintEvaluator {
             }
             // One dispatch per dab over its clamped footprint; the shader
             // rejects the threads past the footprint's rounding and
-            // outside the dab's bbox. Dispatches in a pass are ordered.
-            for (i, grid) in grids.iter().enumerate() {
+            // outside the dab's bbox. Dispatches in a pass are ordered, so
+            // a dab's snapshot sees every earlier dab and the dab sees its
+            // snapshot.
+            for (i, meta) in metas.iter().enumerate() {
+                if let Some(flush) = &snapshots {
+                    // Its own pipeline and group 1. Group 0 is an equal
+                    // layout entry in both pipelines, so it stays bound
+                    // across the switch; groups 2 and 3 lie outside the
+                    // snapshot's layout and are still bound when the brush
+                    // pipeline returns.
+                    snapshot.dispatch(&mut pass, flush, i as u32);
+                    pass.set_pipeline(&per_brush.pipeline);
+                }
                 let groups = |px: u32| px.div_ceil(DAB_WORKGROUP).max(1);
-                pass.set_bind_group(1, &dabs_bind_group, &[(i as u64 * INDEX_STRIDE) as u32]);
-                pass.dispatch_workgroups(groups(grid.width), groups(grid.height), 1);
+                pass.set_bind_group(1, &dabs_bind_group, &[(i as u64 * DAB_SLOT_STRIDE) as u32]);
+                pass.dispatch_workgroups(groups(meta.grid[0]), groups(meta.grid[1]), 1);
             }
         });
 
         gpu.perf.record_dab_flush(total_dabs);
-        gpu.perf.record_dispatches(total_dabs);
+        let per_dab = if snapshots.is_some() { 2 } else { 1 };
+        gpu.perf.record_dispatches(per_dab * total_dabs);
     }
 
     fn commit(&self, ctx: &EvalContext, gpu: &mut BrushGpuContext) {
@@ -798,24 +888,17 @@ impl BrushNodeEvaluator for PaintEvaluator {
         };
         let opacity = ctx.input_f32("opacity").clamp(0.0, 1.0);
         // Each half this brush accumulated goes in the slot that commits
-        // under its law. At either end the ground is the only
-        // accumulation and fills its own slot; between, the ground is the
-        // wash half and the declared channel is the build half.
-        let (wash_share, build_share) = shares(ctx.input_f32("buildup"));
-        let scratch = stroke.scratch.write_bind_group();
-        let wash = (wash_share > 0.0).then_some(scratch);
-        let build = if build_share <= 0.0 {
-            None
-        } else if wash_share <= 0.0 {
-            Some(scratch)
-        } else {
-            Some(
+        // under its law.
+        let (wash, build) = law_slots(
+            ctx.input_f32("buildup"),
+            stroke.scratch.write_bind_group(),
+            || {
                 stroke
                     .scratch
                     .channel_bind_group(BUILD_CHANNEL.name)
-                    .expect("a brush inside the dial declares its build channel"),
-            )
-        };
+                    .expect("a brush inside the dial declares its build channel")
+            },
+        );
         stroke.paint_target.commit_brush_dab(
             &mut gpu.encoder,
             gpu.pipelines,

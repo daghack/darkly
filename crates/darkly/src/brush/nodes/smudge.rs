@@ -23,6 +23,7 @@
 use crate::brush::eval::{BrushNodeEvaluator, EvalContext};
 use crate::brush::gpu_context::BrushGpuContext;
 use crate::brush::node::BrushNodeRegistration;
+use crate::brush::paint_info::STATIONARY_MOTION_PX;
 use crate::brush::read_mirror_terminal::{
     self as rmt, read_mirror_pipeline_reg, ReadMirrorTerminal,
 };
@@ -30,11 +31,6 @@ use crate::brush::wgsl::{CompileWgslCtx, NodeWgsl};
 use crate::brush::wire::{BrushWireType, ScalarValue};
 use crate::gpu::preview::{PreviewBackdrop, PreviewStaging};
 use crate::nodegraph::{NodeRegistration, PortDef, UnitType};
-
-/// Motion magnitude (canvas pixels) below which the dab is treated as
-/// stationary and dropped before queueing: `mix(bg, src, _)` is an
-/// identity write when `src == bg`.
-const STATIONARY_THRESHOLD_PX: f32 = 0.5;
 
 pub const TYPE_ID: &str = "smudge";
 
@@ -112,7 +108,7 @@ impl ReadMirrorTerminal for SmudgeEvaluator {
         let motion = ctx.input("motion").as_vec2();
         // Stationary-dab early-out: `mix(bg, src, _)` is identity in this
         // regime. Skipping the queue saves a render pass and a mirror copy.
-        if motion[0].abs() < STATIONARY_THRESHOLD_PX && motion[1].abs() < STATIONARY_THRESHOLD_PX {
+        if motion[0].abs() < STATIONARY_MOTION_PX && motion[1].abs() < STATIONARY_MOTION_PX {
             return None;
         }
         // Expand the read region by `|motion|` per axis so the smear

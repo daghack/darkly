@@ -373,6 +373,24 @@ the compute skeleton.
   inside the dial) as packed foregrounds, through `composite.wgsl`'s
   `fs_packed` entry. Applies `gpu.blend_mode` (paint / erase toggle).
 
+**The appearance mirror.** A graph that samples the stroke at other
+pixels (the canvas sampler's Live source, which the Dry Smudge feeds into
+`stamp.color`) cannot read the ground from inside the dab's dispatch: the
+thread owning the texel it reads runs in the same dispatch, and WebGPU
+orders nothing within one. Such a graph requests
+`LiveSource::StrokeAppearance`, and `paint` runs a second dispatch before
+each dab's (`brush/appearance_snapshot.rs`): the ground (and the build
+channel) laid on the pre-stroke snapshot through `lib/commit_law.wgsl`, the
+law the commit uses, at full strength in paint mode, written into a
+layer-sized `rgba8unorm` mirror on `Scratch` under the dab's read region.
+The read region is the footprint grown by the graph's per-dab
+`read_reach` (the sampler's `|motion|` plus a texel). The dab then samples
+the mirror as an ordinary graph texture. Opacity and erase stay at the
+commit. The mirror is derived per dab, so it is never cleared,
+checkpointed or restored. An instanced terminal cannot order work
+between its dabs, so the compiler rejects a graph that asks for the
+appearance under one (`DabPass::can_refresh_between_dabs`).
+
 The hover preview is a fragment module for every terminal; `paint`'s
 preview body shows the one dab as the stroke would deposit it on blank
 ground.
@@ -575,6 +593,14 @@ warped layer).
    `preview_output` subtree so hover feedback works.
 
 No engine changes needed.
+
+**Prefer a sampler on `paint` to a new read-mirror terminal.** An effect
+that reads the canvas the stroke is changing (a smear, a blur, a pickup)
+can be a node feeding `paint` that requests
+`LiveSource::StrokeAppearance` and reports its per-dab `read_reach`;
+`paint` then supplies the ordering, the dial, flow, pressure size,
+selection, the hover preview, the commit and undo. The Dry Smudge is
+built that way. The `smudge` and `blur` terminals predate it.
 
 ## Performance anchors
 

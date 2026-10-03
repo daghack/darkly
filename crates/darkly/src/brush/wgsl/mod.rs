@@ -101,6 +101,12 @@ const EPS_BBOX_CANVAS_PX: f32 = 1e-3;
 /// and neither alternative beats it at 1000 px by enough to pay for that.
 pub const DAB_WORKGROUP: u32 = 8;
 
+/// Stride of a dispatch-per-dab terminal's static dab index buffer (slot
+/// `i` holds `i`): WebGPU's default `min_uniform_buffer_offset_alignment`,
+/// so a dynamic offset of `i * DAB_SLOT_STRIDE` selects dab `i` on the web.
+/// Shared by the dab's dispatch and the appearance snapshot before it.
+pub const DAB_SLOT_STRIDE: u64 = 256;
+
 /// `@group(1)` of the dispatch-per-dab skeleton: the dab records at 0, the
 /// dab slot at 1, the ground at 2, storage channels from 3.
 const GROUND_BINDING: u32 = 2;
@@ -211,11 +217,11 @@ pub struct CompiledBrush {
     /// The `@group(3)` texture slots this graph requests, in
     /// `@binding(1+N)` order. Each is a [`crate::brush::texture_source::ResolvedSource`]:
     /// a named registry texture (`image`), a baked procedural tile
-    /// (`noise`), or a live per-flush texture (`clone_source`'s stroke
-    /// snapshot, `pickup`'s atlas). Empty for graphs without
-    /// graph-texture nodes. Named and baked slots resolve at
-    /// pipeline-build time; live slots resolve at bind time from whatever
-    /// their producing node published this flush. Deduplicated by the
+    /// (`noise`), or a live per-flush stroke texture (the frozen stroke
+    /// snapshot or the live stroke appearance, both `clone_source`'s).
+    /// Empty for graphs without graph-texture nodes. Named and baked slots
+    /// resolve at pipeline-build time; live slots resolve at bind time
+    /// from whatever the terminal published this flush. Deduplicated by the
     /// compiler so two nodes requesting the same source share one binding.
     pub graph_sources: Vec<crate::brush::texture_source::ResolvedSource>,
     /// How the terminal's per-dab pass writes the scratch, from its
@@ -270,6 +276,14 @@ impl CompiledBrush {
     /// layout built from this list matches the shader by construction.
     pub fn storage_bindings(&self) -> Vec<StorageBinding> {
         storage_bindings(self.dab_pass, self.scratch_format, &self.channels)
+    }
+
+    /// Whether the graph samples a texture the terminal must refresh
+    /// between dabs: the live stroke appearance. A terminal asks this,
+    /// never the graph, to decide whether to allocate the appearance
+    /// mirror and render it under each dab's read region.
+    pub fn reads_stroke_appearance(&self) -> bool {
+        self.graph_sources.iter().any(|s| s.refreshed_per_dab())
     }
 }
 
@@ -632,6 +646,23 @@ pub fn compile_brush_to_wgsl(
     let stroke_body = format!("{shared_body}{stroke_terminal_body}");
     let preview_body = format!("{preview_shared_body}{preview_terminal_body}");
     let graph_sources = graph_sources_cell.into_inner();
+    // A source the terminal refreshes between dabs needs a pass that can
+    // order work between them. Checked before the `@group(3)` collision
+    // below, which such a terminal would also trip, so the error names the
+    // real reason.
+    if !terminal.dab_pass.can_refresh_between_dabs() {
+        if let Some(source) = graph_sources.iter().find(|s| s.refreshed_per_dab()) {
+            return Err(CompileError::NodeNotCompilable {
+                type_id: terminal.type_id.to_string(),
+                reason: format!(
+                    "`{}` is refreshed between dabs, which a terminal that draws its \
+                     dabs in one instanced pass (`{}`) cannot do; end the graph in `paint`",
+                    source.binding_label(),
+                    terminal.type_id
+                ),
+            });
+        }
+    }
     // `@group(3)` collision check. Terminal `terminal_bindings`
     // (e.g. watercolor's pickup atlas) and the `image` node's
     // graph textures both target group 3, the highest slot WebGPU's
@@ -1105,7 +1136,7 @@ fn assemble_shader(
     // rejects graphs that try to claim both: see the early-return
     // check in [`compile_brush_to_wgsl`].
     //
-    // Live slots (`clone_source`'s snapshot, `pickup`'s atlas) are
+    // Live slots (the stroke snapshot, the live stroke appearance) are
     // ordinary entries in this list; they differ only in *when* the view
     // is resolved, not in how the binding is emitted. They are declared in
     // *both* modes, because a non-terminal node's body is shared by the

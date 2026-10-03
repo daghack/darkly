@@ -319,6 +319,7 @@ pub struct BrushPipelineRegistration {
 pub fn plumbing_registrations() -> Vec<BrushPipelineRegistration> {
     vec![
         crate::brush::composite_pipeline::composite_pipeline_registration(),
+        crate::brush::appearance_snapshot::appearance_snapshot_registration(),
         crate::brush::warp_field::warp_field_resolve_registration(),
     ]
 }

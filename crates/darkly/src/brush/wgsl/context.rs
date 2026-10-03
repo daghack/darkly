@@ -273,16 +273,19 @@ impl CompileWgslCtx<'_> {
         self.request_source(ResolvedSource::Named(name.to_string()))
     }
 
-    /// Reserve (or look up) a slot for a texture the requesting node
+    /// Reserve (or look up) a slot for a stroke texture the terminal
     /// republishes every flush, the [`ResolvedSource::Live`] shim over
     /// [`Self::request_source`].
     ///
     /// Unlike [`Self::request_texture`], the view is not resolved against
     /// the [`crate::gpu::texture_registry::TextureRegistry`] at
-    /// pipeline-build time; the producing node publishes it during its own
-    /// `flush_dabs` and the terminal binds whatever is there. A slot with
-    /// nothing published falls back to `_fallback`, which is how the
-    /// cursor preview renders without a stroke.
+    /// pipeline-build time; the terminal publishes it during its
+    /// `flush_dabs` and binds whatever is there. The slot is an ordinary
+    /// filterable graph texture: for [`LiveSource::StrokeAppearance`] it
+    /// holds the layer-sized appearance mirror, in the paint target's
+    /// frame. A slot with nothing published
+    /// falls back to `_fallback`, which is how the cursor preview renders
+    /// without a stroke.
     pub fn request_live_texture(&self, live: LiveSource) -> u32 {
         self.request_source(ResolvedSource::Live(live))
     }

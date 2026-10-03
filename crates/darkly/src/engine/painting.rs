@@ -340,39 +340,30 @@ impl DarklyEngine {
         self.clone_source_layer = layer;
     }
 
-    /// `true` when the active brush graph contains a `clone_source` node,
-    /// i.e. it needs a set-source anchor before it can paint. The
-    /// frontend polls this to arm the set-source gesture and show the
-    /// "set a source" hint. A structural graph check (no compile): the
-    /// `clone_source` node is exactly what sets `CompiledBrush::samples_source`.
+    /// `true` when the active brush graph samples the canvas snapshot at a
+    /// set source point, i.e. it needs a set-source anchor before it can
+    /// paint. The frontend polls this to arm the set-source gesture and
+    /// show the "set a source" hint. A structural graph check (no
+    /// compile), answered by the sampler node's own module.
     #[handler]
     pub fn active_brush_needs_source(&self) -> bool {
         use crate::brush::state::BrushState;
         let tool = self.tool_session.read();
-        let Some(brush) = tool.get::<BrushState>() else {
-            return false;
-        };
-        brush
-            .graph
-            .nodes()
-            .values()
-            .any(|n| n.type_id == crate::brush::nodes::clone_source::TYPE_ID)
+        tool.get::<BrushState>().is_some_and(|brush| {
+            crate::brush::nodes::clone_source::graph_needs_source(&brush.graph)
+        })
     }
 
-    /// Structural read of one of the active brush's `clone_source` port
+    /// Structural read of one of the active brush's snapshot sampler's port
     /// defaults: no compile, just the graph under the session read lock.
-    /// `None` when there is no `clone_source` node (or no such port).
+    /// `None` when there is no such sampler (or no such port).
     /// Shared by the mode / merged queries below so they resolve the node
     /// identically.
     fn clone_source_port_default(&self, port: &str) -> Option<f32> {
         use crate::brush::state::BrushState;
         let tool = self.tool_session.read();
         let brush = tool.get::<BrushState>()?;
-        brush
-            .graph
-            .nodes()
-            .values()
-            .find(|n| n.type_id == crate::brush::nodes::clone_source::TYPE_ID)
+        crate::brush::nodes::clone_source::snapshot_sampler(&brush.graph)
             .and_then(|n| n.ports.iter().find(|p| p.name == port))
             .map(|p| p.value.as_f32())
     }

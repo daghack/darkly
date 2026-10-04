@@ -417,8 +417,7 @@ array is uploaded once per pass.
 **Files:** [`crates/darkly/src/bin/dispatch_cost_bench.rs`](../crates/darkly/src/bin/dispatch_cost_bench.rs)
 (harness, inline WGSL). No engine, no stroke, no terminal: this stage
 measures the one quantity B.1 was dismissed over without measuring, the
-all-in cost of a dispatch inside a pass, barrier included. Plan:
-[`plans/compute-dispatch-per-dab-spike.md`](plans/compute-dispatch-per-dab-spike.md).
+all-in cost of a dispatch inside a pass, barrier included.
 
 **Bench data.** 3840x2160 target, N dabs scattered, three shapes over the
 same dabs: (a) the option F shape; (b) the same dispatches with the texture
@@ -630,8 +629,7 @@ are permanent.
 ### #6: the compute paint terminal (shipped)
 
 **Shape:** `paint` ported to the stage 2 shape with the spike's artefacts
-removed (`crates/darkly/src/brush/nodes/paint.rs`, plan
-`docs/plans/compute-paint-terminal.md`). The terminal's registration
+removed (`crates/darkly/src/brush/nodes/paint.rs`). The terminal's registration
 declares `dab_pass: DispatchPerDab` and `scratch_format: R32Uint`; the
 ground *is* the stroke scratch, so the checkpoint ring, the clear, the
 grow and the commit act on one texture and the unpack pass and the doubled
@@ -743,9 +741,8 @@ later" list).
 ### #7: region copies in the checkpoint ring (shipped)
 
 **Shape:** not a terminal change; the per-event fixed cost every brush
-pays through the checkpoint ring (`crates/darkly/src/brush/checkpoint_ring.rs`,
-plan `docs/plans/checkpoint-ring-delta-copies.md`, diagnosis
-`notes/handoffs/handoff-stroke-fixed-costs.md`). Every save used to copy
+pays through the checkpoint ring (`crates/darkly/src/brush/checkpoint_ring.rs`).
+Every save used to copy
 the stroke's whole cumulative bbox into a slot, every restore copied the
 slot's whole bbox back after a full-canvas attachment clear, and at
 `stabilize = 0.6` that was about seven saves and one restore and clear
@@ -810,9 +807,7 @@ region, which the ring now computes) are where the 250 px residual lives.
 ### #8: checkpoint saves in the segment's submission (shipped as stage one; the full fold is not worth it)
 
 **Shape:** not a terminal change; the submit count of the stabilized
-rewind-and-replay path in `crates/darkly/src/engine/painting.rs` (plan
-`docs/plans/stroke-replay-one-submit.md`, diagnosis
-`notes/handoffs/handoff-stabilized-stroke-perf.md`, item 1). At
+rewind-and-replay path in `crates/darkly/src/engine/painting.rs`. At
 `stabilize = 0.6` an event replays 5.85 segments on average and used to
 submit each segment's dabs and then its checkpoint save separately, with
 the rewind and the commit in submissions of their own: about fourteen
@@ -869,8 +864,8 @@ time tracks its 116 dispatches per event), plus the commit scissor
 ### #9: the live canvas sampler on `paint` (shipped)
 
 **Shape:** not a change to `paint`'s own regime but a second dispatch per
-dab for a graph that samples the stroke at other pixels (plan
-`docs/plans/live-canvas-sampler.md`). Before each dab's dispatch, in the
+dab for a graph that samples the stroke at other pixels. Before each
+dab's dispatch, in the
 same compute pass, an appearance snapshot dispatch lays the grounds on the
 pre-stroke snapshot through the commit law into a layer-sized
 `rgba8unorm` mirror over the dab's read region (footprint plus `|motion|`

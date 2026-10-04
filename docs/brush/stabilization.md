@@ -220,7 +220,7 @@ Each tablet event follows one of three paths:
 | GPU overhead per save | N/A | one copy of the region dirtied since the slot was last written (one layer-sized copy the first time a stroke uses the slot) |
 | GPU overhead per restore | N/A | one copy of the region the rewind undoes, plus a zero fill of it when the slot's frame does not cover it |
 
-The frame is the layer (8 x 1920 x 1080 texels per ground at 1080p, allocated once per layer size), and the per-event GPU work follows the dabs between two save points rather than the frame: for a stroke that crosses the canvas the cumulative bbox reaches most of it within a second, and copying it on every save and restore was most of a stroke's per-event GPU time (`notes/handoffs/handoff-stroke-fixed-costs.md`).
+The frame is the layer (8 x 1920 x 1080 texels per ground at 1080p, allocated once per layer size), and the per-event GPU work follows the dabs between two save points rather than the frame: for a stroke that crosses the canvas the cumulative bbox reaches most of it within a second, and copying it on every save and restore was most of a stroke's per-event GPU time.
 
 ## File Map
 

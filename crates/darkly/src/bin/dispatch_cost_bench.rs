@@ -1,7 +1,7 @@
 //! Dispatch-cost harness: what does one dab cost as a compute dispatch?
 //!
-//! Stage 1 of `docs/plans/compute-dispatch-per-dab-spike.md`, testing the
-//! hypothesis in section F of `docs/paint-compute-perf-tracking.md`: that a
+//! Tests the hypothesis in section F of
+//! `docs/paint-compute-perf-tracking.md`: that a
 //! paint terminal issuing **one compute dispatch per dab inside a single
 //! compute pass**, against a stroke-resident read-write `r32uint` storage
 //! texture, keeps up where a render pass per dab (attempt #1, and the

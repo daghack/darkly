@@ -186,8 +186,7 @@ const HEADING_WINDOW: usize = 3;
 /// grows-by-one + reshapes: the cases `find_divergence` already handles.
 ///
 /// Only constructed when a real stabilizer is active (strength > 0) and a
-/// look-ahead horizon is configured (> 0); see the engine's stroke-start path
-/// and `docs/plans/stroke-prediction-stabilizer.md`.
+/// look-ahead horizon is configured (> 0); see the engine's stroke-start path.
 pub struct PredictingStabilizer {
     inner: Box<dyn StabilizerAlgorithm>,
     /// Real + predicted polyline: what `stabilized()` returns.

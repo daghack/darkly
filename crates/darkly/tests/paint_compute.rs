@@ -1,7 +1,6 @@
 //! The `paint` terminal as a compute pass: one dispatch per dab against a
 //! packed `r32uint` ground that is the stroke scratch itself
-//! (`crates/darkly/src/brush/nodes/paint.rs`, plan
-//! `docs/plans/compute-paint-terminal.md`).
+//! (`crates/darkly/src/brush/nodes/paint.rs`).
 //!
 //! The accumulation laws are pinned exactly by `tests/brush_accumulation.rs`
 //! and the pixels against the recorded dispatch spike by

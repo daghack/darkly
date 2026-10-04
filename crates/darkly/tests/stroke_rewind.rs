@@ -3,8 +3,8 @@
 //!
 //! Every mid-stroke event rewinds to a checkpoint, restores it, and
 //! replays the dabs after it. The ring copies only the region those dabs
-//! dirtied (plan `docs/plans/checkpoint-ring-delta-copies.md`), so a
-//! region that is one texel too small leaves a stale dab or a hole. The
+//! dirtied, so a region that is one texel too small leaves a stale dab or
+//! a hole. The
 //! oracle is the engine's own full re-render path: `test_set_full_rerender`
 //! clears the ring before every rewind, so each event renders the final
 //! polyline from index 0 with the terminal's whole-scratch prologue.
@@ -13,9 +13,8 @@
 //! All cells run at `stabilize = 0`, where only the synthetic tip
 //! correction rewinds and the two paths are exactly equal; a reported
 //! divergence at `stabilize > 0` leaves the segment before it drawn with
-//! a lookahead point that has since moved (`docs/plans/stabilized-rewind-
-//! lookahead.md`), so a from-scratch render differs there regardless of
-//! the ring.
+//! a lookahead point that has since moved, so a from-scratch render
+//! differs there regardless of the ring.
 //!
 //! Run with: `cargo test -p darkly --test stroke_rewind --features testing -- --test-threads=1`
 

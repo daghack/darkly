@@ -116,8 +116,14 @@ fn render_liquify_dabs_on(
     // Compile before allocating: the terminal decides the scratch format,
     // and liquify's is a warp field rather than colour.
     let mut runner: BrushGraphRunner = compile_graph(&graph).expect("brush compiles");
-    let mut stroke_buffer =
-        StrokeBuffer::new(&device, CANVAS, CANVAS, &pipelines, runner.scratch_format());
+    let mut stroke_buffer = StrokeBuffer::new(
+        &device,
+        CANVAS,
+        CANVAS,
+        &pipelines,
+        runner.scratch_format(),
+        runner.dab_pass(),
+    );
 
     let pre_stroke = darkly::gpu::paint_target::GpuPaintTarget::from_canvas_texture(
         &layer_texture,
@@ -171,7 +177,7 @@ fn render_liquify_dabs_on(
 
     {
         let mut ctx = make_ctx!("liquify-test-begin");
-        runner.begin_stroke(&mut ctx);
+        runner.begin_stroke(&mut ctx, None);
         queue.submit([ctx.encoder.finish()]);
     }
     {

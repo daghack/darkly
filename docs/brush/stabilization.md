@@ -78,7 +78,7 @@ The remaining mid-stroke fallbacks traced to two compounding defects, both since
 
 2. **`pick_slot` evicted the lowest-`vi` slot unconditionally.** Once the ring filled, this destroyed the anchor below the divergence boundary; over time only slots near the tip survived, and a divergence reaching back to `tip − max_div` found no slot below it. The fix is anchor-protected min-gap eviction: the lowest-`vi` slot is protected while it is the sole slot satisfying `vi < tip − max_div`; among non-protected candidates, eviction picks the slot whose removal leaves the smallest worst consecutive gap. A `debug_assert!` after every save validates the coverage invariant.
 
-A populated-ring `restore_before(div_idx)` returning `None` is now impossible whenever the stabilizer's `max_divergence_window` bound holds. `full_rerender_events` counts only this case; the empty-ring "initialization fallback" on the first divergence event of a stroke is structurally unavoidable and cheap, so it is not counted.
+A populated-ring `find_before(div_idx)` returning `None` is now impossible whenever the stabilizer's `max_divergence_window` bound holds. `full_rerender_events` counts only this case; the "initialization fallback" on the first divergence event of a stroke (an empty ring, or a divergence index of 0, which no slot can precede) is structurally unavoidable and cheap, so it is not counted.
 
 Stabilization retroactively reshapes a stroke as the artist draws. The tip is always pinned at the cursor (zero lag), but the path behind the pen continuously smooths (the "taffy" feel, like pulling a thread through honey).
 
@@ -142,17 +142,21 @@ The render state is finalized at the end of each vector index segment (not per-d
 
 **Why save points exist alongside checkpoints:** Save points are the *index*, checkpoints are the *data*. The index is cheap (a few fields per dab), so we keep one per dab. The data is expensive (GPU texture copies), so we only keep 8 spread across the divergence window. The checkpoint ring depends on save points for three things:
 
-1. **What region to snapshot**: `save_points.full_bbox()` tells the ring what bbox to GPU-copy when saving a checkpoint
+1. **What region to copy**: each save point carries its dab's own footprint as well as the cumulative bbox, so `dirty_between(a, b)` and `dirty_after(a)` give the region in which the scratch differs between two save points. That is what a checkpoint save or restore copies; the cumulative bbox (`full_bbox`) is the undo damage rect
 2. **Where to truncate on restore**: when restoring from a checkpoint, we `save_points.truncate(cp.save_point_index + 1)` to discard invalidated save points, then re-rendering builds them fresh
 3. **What engine state to resume with**: the engine's interpolation state (spacing, accumulated distance, last position) is mutated by every dab and can't be reconstructed from position alone; the save point's `render_state` is the only way to resume mid-stroke without starting from scratch
 
 ### Checkpoint Ring (`checkpoint_ring.rs`)
 
-A ring buffer of 8 GPU texture slots, each storing the stroke buffer's **bbox region** (not the full canvas) at a specific save point.
+A ring buffer of 8 GPU texture slots, each holding the stroke buffer (and the terminal's channels) as of a specific save point over a **frame**: the layer's canvas extent when the slot was allocated. Canvas coordinates are stable across mid-stroke layer growth, so a frame never moves; a save under a grown extent reallocates. Frames are layer-sized rather than bbox-sized so a stroke never reallocates its slots mid-way (every slot would do so in the same event, each a fresh texture plus a frame-sized copy, which measured as a dropped frame), at the price of one layer-sized copy per slot the first time a stroke uses it.
 
-**Saving**: GPU copies just the cumulative bbox region from the stroke texture into the slot's texture. Textures are lazily allocated with power-of-two sizing to minimize reallocation. The cumulative bbox grows monotonically as the stroke extends, so each checkpoint's bbox is larger than the previous one. Since `create_texture` is just a VRAM allocation (microseconds, no data transfer), and the power-of-two sizing means each slot reallocates at most ~log2(canvas_dimension) times over a stroke, the slots quickly stabilize at the current bbox size and stop reallocating entirely.
+**Slot content**: a slot records which save point its textures equal and a *stale* rect where they do not. The invariant: with `content = Some(c)`, the textures equal the scratch as of save point `c.save_point_index` (relative to the current dab list) everywhere in the frame outside `c.stale`; a valid slot's content index is its own and its stale rect is empty. A reallocation, or `clear()` at stroke end, sets the content to unknown, and the next save into the slot copies its whole frame.
 
-**Restoring**: Clear the stroke buffer to transparent, then GPU-copy the checkpoint's bbox region back. Since the stroke buffer only contains dab pixels (no background), clear + patch is an exact reconstruction.
+**Saving**: the slot keeps its textures across saves, and the copy is only what they lack: the stale rect plus the region dirtied between the save point the slot holds and the one being saved (`dirty_between`). A slot whose frame is not the current layer extent, or whose formats differ from the terminal's, is reallocated and takes one frame-sized copy, as does a slot a stroke uses for the first time. Between two save points the scratch differs only inside the footprints of the dabs between them (every write a dab makes lies inside the footprint it publishes through `push_write_bbox`), so this copy makes the slot exact over its whole frame.
+
+**Restoring**: the region a rewind to checkpoint `k` undoes is the footprint of every dab after `k` (`dirty_after`, read before the save points are truncated). Outside it the scratch already equals the checkpoint. Inside it, the part the slot's frame covers is copied back from the slot; the rest, if any, is reset to the terminal's baseline first (`begin_stroke` over just that rect: a zero fill for paint, a re-seed from the pre-stroke layer for a warp or smudge terminal), since no dab at or before `k` could have written there. The reset and the copy go in one submission.
+
+**Invalidation keeps the content truthful**: when a rewind to `k` invalidates the slots at or after the divergence index, each of them equals the restore point everywhere outside the rewound region (its dabs after `k` were discarded, and all of them lie inside that region), so its content is rewritten to `k` with the region added to its stale rect. Valid slots sit at or below the restore point and keep both their texels and their index.
 
 **Spacing**: Checkpoints are nominally spaced `max_divergence_window / 7` vector indices apart. The intent: 8 slots at spacing-distance positions cover the divergence window with one slot just past the lower boundary and the rest packed in the volatile zone. The eviction policy doesn't strictly hold to this layout (see "Slot selection") but uses spacing to break ties when choosing what to evict.
 
@@ -175,7 +179,7 @@ A `debug_assert!` after every save checks the coverage invariant. Naive "evict t
 
 Two invariants (one for correctness, one for performance) together make full-stroke re-render fallback impossible by construction whenever the stabilizer's `max_divergence_window` bound holds.
 
-1. **Coverage (correctness).** After every save, there exists a valid slot with `vi < tip_vi − max_divergence_window`. That slot is what `restore_before(div_idx)` returns for the worst-case `div_idx = tip_vi − max_divergence_window`; the slot's existence guarantees no fallback. The anchor-protected min-gap eviction policy in `pick_slot` is the load-bearing mechanism; it never evicts the sole anchor and never picks a victim that breaks the invariant. A `debug_assert!` after every save enforces it in debug builds.
+1. **Coverage (correctness).** After every save, there exists a valid slot with `vi < tip_vi − max_divergence_window`. That slot is what `find_before(div_idx)` returns for the worst-case `div_idx = tip_vi − max_divergence_window`; the slot's existence guarantees no fallback. The anchor-protected min-gap eviction policy in `pick_slot` is the load-bearing mechanism; it never evicts the sole anchor and never picks a victim that breaks the invariant. A `debug_assert!` after every save enforces it in debug builds.
 
 2. **Density (performance).** Consecutive valid slot gaps (sorted by `vi`) stay close to `spacing = max_divergence_window / 7`. The min-gap eviction picks the most-clustered slot, which keeps the layout even. Density bounds per-event re-render cost at roughly `spacing` dabs.
 
@@ -186,12 +190,13 @@ Two invariants (one for correctness, one for performance) together make full-str
 Each tablet event follows one of three paths:
 
 **Divergence with checkpoint available:**
-1. `checkpoint_ring.restore_before(div_idx)`: clear stroke buffer + copy best checkpoint back
-2. Truncate save points and restore engine render state
-3. Invalidate stale checkpoints
-4. Compute segment boundaries based on divergence window
-5. Render each segment, saving a checkpoint at each boundary
-6. Composite stroke buffer onto layer
+1. `checkpoint_ring.find_before(div_idx)`: pick the best checkpoint and the region its rewind undoes (every dab after it)
+2. Reset that region to the terminal's baseline where the checkpoint's frame does not cover it (`begin_stroke` over the rect), then `checkpoint_ring.restore`: copy the region back from the checkpoint; one submission for both
+3. Truncate save points and restore engine render state
+4. Invalidate stale checkpoints and mark what their textures still equal
+5. Compute segment boundaries based on divergence window
+6. Render each segment and save a checkpoint at its boundary in the same submission (a copy recorded after the segment's pass reads the pass's result, so a save never submits on its own)
+7. Composite stroke buffer onto layer
 
 **Divergence without checkpoint (beginning of stroke):**
 1. Clear stroke buffer entirely
@@ -201,7 +206,7 @@ Each tablet event follows one of three paths:
 
 **No divergence (straight-line drawing, or strength=0):**
 1. Render only the new tail point
-2. Save a checkpoint if enough distance has passed since the last one
+2. Save a checkpoint in the same submission if enough distance has passed since the last one
 3. Composite
 
 ## Performance Characteristics
@@ -209,12 +214,13 @@ Each tablet event follows one of three paths:
 | Metric | Naive approach | With checkpoint ring |
 |--------|---------------|---------------------|
 | Re-render cost per frame | O(total_stroke_dabs) | O(divergence_window / 8) |
-| VRAM per checkpoint | N/A | bbox_area * 4 bytes |
-| Total checkpoint VRAM | N/A | 8 * bbox_area * 4 bytes |
-| CPU overhead | Minimal | Minimal (ring bookkeeping) |
-| GPU overhead per checkpoint | N/A | 1 bbox-sized texture copy |
+| VRAM per checkpoint | N/A | frame_area * bytes per texel, per ground |
+| Total checkpoint VRAM | N/A | 8 * frame_area * bytes per texel, per ground |
+| CPU overhead | Minimal | Minimal (ring bookkeeping, a rect union per dab in the replay window) |
+| GPU overhead per save | N/A | one copy of the region dirtied since the slot was last written (one layer-sized copy the first time a stroke uses the slot) |
+| GPU overhead per restore | N/A | one copy of the region the rewind undoes, plus a zero fill of it when the slot's frame does not cover it |
 
-The bbox grows monotonically as the stroke extends, but for typical brushes it's much smaller than the full canvas (especially early in the stroke).
+The frame is the layer (8 x 1920 x 1080 texels per ground at 1080p, allocated once per layer size), and the per-event GPU work follows the dabs between two save points rather than the frame: for a stroke that crosses the canvas the cumulative bbox reaches most of it within a second, and copying it on every save and restore was most of a stroke's per-event GPU time.
 
 ## File Map
 

@@ -11,7 +11,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --release --bin stroke_replay_bench -- \
+//! cargo run --release -p darkly --features testing --bin stroke_replay_bench -- \
 //!     --input crates/darkly/tests/fixtures/stroke_recording_sample.json
 //! ```
 //!
@@ -275,6 +275,7 @@ fn main() {
         layer_id,
         target_canvas,
         ReplayPacing::Realtime,
+        None,
     );
     let wall_elapsed_ms = wall_start.elapsed().as_secs_f64() * 1000.0;
 

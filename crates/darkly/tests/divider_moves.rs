@@ -1,7 +1,7 @@
 //! Moving nodes across the viewport divider.
 //!
 //! Regression coverage for the two drag bugs born of the boundary having no
-//! index in the tree (`docs/plans/divider-as-a-node.md`): a group dragged from
+//! index in the tree: a group dragged from
 //! screen space to just below the viewport threshold either landed at the
 //! bottom of screen space (reference-side inheritance) or refused with
 //! "Cannot move a layer into itself" (the boundary gap resolving into the

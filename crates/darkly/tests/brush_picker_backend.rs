@@ -442,15 +442,13 @@ fn brush_active_capabilities_reflect_loaded_brush() {
         "Clone's stroke preview is staged over a field it can transport"
     );
 
-    engine
-        .brush_load("Smudge")
-        .expect("Smudge is a built-in brush");
+    engine.brush_load("Blur").expect("Blur is a built-in brush");
     let caps = engine.brush_active_capabilities();
     assert!(
         !caps.supports_erase,
-        "Smudge's smear terminal opts out of erase"
+        "Blur's read-mirror terminal opts out of erase"
     );
-    assert_eq!(caps.preview_fallback_icon, Some("mdi:gesture-swipe"));
+    assert_eq!(caps.preview_fallback_icon, Some("mdi:blur"));
 
     engine
         .brush_load("Ink Pen")

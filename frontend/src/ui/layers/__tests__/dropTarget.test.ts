@@ -209,7 +209,7 @@ describe('the reported gesture', () => {
 });
 
 /**
- * Regression for the cross-divider drag bugs (`docs/plans/divider-as-a-node.md`).
+ * Regression for the cross-divider drag bugs.
  * The divider is a row, so the gap above it and the gap below it are distinct:
  * the user's reported panel: a veil in Viewport Effects → Group 2, then the
  * divider, then a canvas raster.

@@ -172,6 +172,7 @@ pub mod view;
 pub mod void;
 pub mod void_content;
 pub mod voids;
+pub mod zero_fill;
 
 /// Convert straight-alpha RGBA8 to premultiplied, in place.
 ///

@@ -72,6 +72,11 @@ pub struct BrushPerfCounters {
     pub dab_flushes: u32,
     /// Total dabs that flowed through a dab-batching terminal.
     pub flushed_dabs: u32,
+    /// Draw calls or compute dispatches a terminal issued per flush,
+    /// summed over flushes: one per flush for an instanced draw, one per
+    /// dab for a serialized terminal, two per dab for a dispatch-per-dab
+    /// terminal that refreshes the stroke appearance before each dab.
+    pub dispatches: u32,
     /// Sum of `union_w * union_h` across every dab flush.
     pub dab_union_bbox_area: u64,
     /// Per-flush dab counts. One entry per `flush_dabs` call. Drained
@@ -93,6 +98,11 @@ impl BrushPerfCounters {
     pub fn record_dab_flush(&mut self, dab_count: u32) {
         self.flushed_dabs = self.flushed_dabs.saturating_add(dab_count);
         self.dab_flushes = self.dab_flushes.saturating_add(1);
+    }
+
+    /// Record how many draws or dispatches a flush issued.
+    pub fn record_dispatches(&mut self, n: u32) {
+        self.dispatches = self.dispatches.saturating_add(n);
     }
 
     /// Record the workload shape of one dab flush: `dab_count` queued
@@ -119,6 +129,7 @@ impl std::ops::AddAssign for BrushPerfCounters {
         self.submits = self.submits.saturating_add(rhs.submits);
         self.dab_flushes = self.dab_flushes.saturating_add(rhs.dab_flushes);
         self.flushed_dabs = self.flushed_dabs.saturating_add(rhs.flushed_dabs);
+        self.dispatches = self.dispatches.saturating_add(rhs.dispatches);
         self.dab_union_bbox_area = self
             .dab_union_bbox_area
             .saturating_add(rhs.dab_union_bbox_area);
@@ -234,12 +245,14 @@ pub struct DabBatch {
     pub batch_canvas_bbox: Option<crate::coord::CanvasRect>,
     /// Terminal-private per-dab CPU meta, packed by `evaluate_gpu` in
     /// lockstep with [`Self::bytes`] and drained by the terminal's
-    /// `flush_dabs` hook. Only used by per-dab-feedback terminals
-    /// (`smudge`, `liquify`) that need CPU-side state at flush time to
-    /// drive mirror-snapshot copies without re-deriving footprints from
-    /// GPU memory. The framework doesn't interpret these bytes: the
-    /// owning terminal reinterprets them via `bytemuck::cast_slice`
-    /// against its own meta record struct.
+    /// `flush_dabs` hook. Used by terminals that need CPU-side state per
+    /// dab at flush time: the per-dab-feedback terminals (`blur`,
+    /// `liquify`) drive mirror-snapshot copies from it, and a
+    /// dispatch-per-dab terminal (`paint`) sizes each dab's dispatch
+    /// grid from it, neither re-deriving footprints from GPU memory.
+    /// The framework doesn't interpret these bytes: the owning terminal
+    /// reinterprets them via `bytemuck::cast_slice` against its own meta
+    /// record struct.
     pub meta_bytes: Vec<u8>,
     /// Union of canvas-pixel rects the current dab's passes write to.
     /// The node that issues the write is the only thing that knows the
@@ -255,15 +268,12 @@ pub struct DabBatch {
     /// `flush_dabs` to know the dab record / uniform layouts and the
     /// pipeline topology hash.
     pub compiled_brush: Option<Arc<CompiledBrush>>,
-    /// `@group(3)` textures published for this flush by the nodes that
-    /// requested them, keyed by which live source they satisfy. A node
-    /// with a [`crate::brush::texture_source::ResolvedSource::Live`] slot
-    /// publishes its view from its own `flush_dabs`; the terminal reads
-    /// them all when it builds the graph-texture bind group. The runner
-    /// dispatches `flush_dabs` in topological order, so every producer
-    /// upstream of the terminal has published before the terminal binds.
-    /// Cleared at the start of each flush: a slot nobody published falls
-    /// back to `_fallback` (the cursor-preview path).
+    /// `@group(3)` textures published for this flush, keyed by which live
+    /// source they satisfy. Both live sources are stroke resources, so the
+    /// terminal that owns the stroke publishes them from its own
+    /// `flush_dabs` and reads them back when it builds the graph-texture
+    /// bind group. Cleared at the start of each flush: a slot nobody
+    /// published falls back to `_fallback` (the cursor-preview path).
     pub live_textures: Vec<(LiveSource, wgpu::TextureView)>,
     /// Name → value map of every output slot in the brush graph, built
     /// by the runner's `dispatch_gpu` immediately after `execute_cpu`
@@ -272,11 +282,18 @@ pub struct DabBatch {
     /// [`crate::brush::wgsl::CompileWgslCtx::dab_field_name`]. The
     /// terminal reads from this to pack per-dab records and uniforms.
     pub slot_outputs: Option<HashMap<String, ScalarValue>>,
+    /// Canvas pixels the graph reads beyond the current dab's write
+    /// footprint, per axis: the per-axis maximum of every node's
+    /// [`crate::brush::eval::BrushNodeEvaluator::read_reach`], set by the
+    /// runner before the terminal's `evaluate_gpu`. Per dab, overwritten
+    /// for every dab; a terminal that refreshes the stroke appearance
+    /// sizes the region it refreshes under from it.
+    pub read_reach: [f32; 2],
 }
 
 impl DabBatch {
     /// Pack one dab record for the active compiled brush into [`Self::bytes`]
-    /// and bump [`Self::count`]. Every terminal (paint, watercolor, smudge,
+    /// and bump [`Self::count`]. Every terminal (paint, watercolor, blur,
     /// liquify) calls this from its `evaluate_gpu` after computing the
     /// per-dab geometry; the WGSL terminal reinterprets the bytes via its
     /// dab layout at flush time.
@@ -345,12 +362,10 @@ impl DabBatch {
         self.live_textures.clear();
     }
 
-    /// Publish a `@group(3)` texture for this flush. Called by the node
-    /// that requested the matching
-    /// [`crate::brush::texture_source::ResolvedSource::Live`] slot, from
-    /// its own `flush_dabs`, before the terminal binds. Last write wins,
-    /// so a node re-publishing within one flush replaces its own entry
-    /// rather than accumulating.
+    /// Publish a `@group(3)` texture for this flush, for the matching
+    /// [`crate::brush::texture_source::ResolvedSource::Live`] slot, before
+    /// the terminal binds. Last write wins, so a re-publish within one
+    /// flush replaces the entry rather than accumulating.
     pub fn publish_live_texture(&mut self, kind: LiveSource, view: wgpu::TextureView) {
         if let Some(slot) = self.live_textures.iter_mut().find(|(k, _)| *k == kind) {
             slot.1 = view;
@@ -445,6 +460,21 @@ impl<'a> StrokeResources<'a> {
     pub fn source_view(&self) -> wgpu::TextureView {
         self.source_texture()
             .create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    /// The scratch's write side as a canvas frame: what the checkpoint
+    /// ring saves and restores, anchored at the paint target's extent.
+    pub fn scratch_frame(&self) -> crate::gpu::atlas::CanvasFrame<'_> {
+        crate::gpu::atlas::CanvasFrame {
+            texture: self.scratch.write_texture(),
+            canvas_extent: self.paint_target.canvas_extent(),
+        }
+    }
+
+    /// The scratch's channel textures in declaration order, as the
+    /// checkpoint ring takes them alongside [`Self::scratch_frame`].
+    pub fn channel_textures(&self) -> Vec<&wgpu::Texture> {
+        self.scratch.channel_textures().iter().collect()
     }
 }
 
@@ -651,8 +681,8 @@ impl<'a> BrushGpuContext<'a> {
     /// The write region is the dab footprint (`position ± write_half`);
     /// the read region is the scratch-mirror snapshot footprint
     /// (`position ± read_half`). Read must be at least as large as write,
-    /// but a brush that samples the scratch at an offset (smudge: per-dab
-    /// `−motion`; clone: a stroke-scoped anchor) sizes the read region
+    /// but a brush that samples the scratch at an offset (blur: its kernel
+    /// reach; clone: a stroke-scoped anchor) sizes the read region
     /// wider so the offset sample always lies inside the snapshot. For a
     /// symmetric dab pass equal write/read halves (e.g. `radius`,
     /// `radius`, `radius`, `radius`).

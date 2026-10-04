@@ -5401,8 +5401,8 @@ fn long_stabilized_stroke_no_fallback() {
     // the checkpoint ring's coverage invariant; this test is about the
     // stabilizer's full-rerender fallback, not anything scatter-specific.
     let settings_id = find_node_id(&engine, brush_settings::TYPE_ID);
-    // Full-strength stabilization → max_divergence_window = 11 (iterations=10
-    // + 1 from the influence-radius model). Spacing = 11 / 7 = 1.
+    // Full-strength stabilization: the Laplacian's window is its sweep count
+    // plus one, widened by the resampler's per-event commit cap.
     engine
         .brush_graph_set_input(
             &settings_id,

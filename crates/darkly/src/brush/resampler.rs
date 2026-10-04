@@ -8,13 +8,18 @@
 //! raw path instead, which makes an index mean the same distance on every
 //! platform, at every pen speed and zoom.
 //!
+//! The inner algorithm's polyline is the committed vertices followed by the
+//! latest raw sample as a provisional tip, so the algorithm pins the pen
+//! position itself and smooths right up to it. Until the pen has travelled
+//! one spacing past the last committed vertex, each push retracts that
+//! provisional tip from the inner and pushes the new one in its place.
+//!
 //! Guarantees of the output polyline:
 //! - Committed vertices lie on the raw polyline, `spacing` apart in raw arc
 //!   length, every [`PaintInformation`] field interpolated between the two
 //!   raw samples a vertex falls between.
-//! - The last vertex is the latest raw sample, unmodified: the tip is pinned
-//!   at the pen with zero lag. Until the pen has travelled one spacing past
-//!   the last committed vertex, each push replaces that tip in place.
+//! - The last vertex is the latest raw sample: the tip is pinned at the pen
+//!   with zero lag.
 //! - The polyline never shrinks and never ends in a zero-length segment.
 //! - At most [`MAX_COMMITS_PER_PUSH`] vertices commit per push. A raw segment
 //!   longer than that many spacings gets exactly that many vertices spread
@@ -24,9 +29,10 @@
 //!   `MAX_COMMITS_PER_PUSH x spacing` in a single event.
 //!
 //! Divergence window: the inner algorithm's window `W` bounds each of its
-//! pushes relative to its own tip at that push. Over `k` commits the earliest
-//! vertex that can move is `W` behind the tip before the first commit, and
-//! the output tip is `k` further on, so the output never diverges more than
+//! pushes relative to its own tip at that push. After the provisional tip is
+//! retracted, the first push of an event lands where that tip was, so the
+//! earliest vertex that can move is `W` behind it; `k` commits and the new
+//! tip land at most `k` further on, so the output never diverges more than
 //! `W + k <= W + MAX_COMMITS_PER_PUSH` vertices behind its tip.
 
 use super::interpolation::lerp_paint_info;
@@ -53,12 +59,9 @@ pub struct ResamplingStabilizer {
     last_raw: Option<PaintInformation>,
     /// Raw arc length from the last committed vertex to `last_raw`.
     residual: f32,
-    /// The last committed vertex is the raw tip itself, so the tip is not
-    /// appended again.
+    /// The last committed vertex is the raw tip itself, so no provisional tip
+    /// follows it in the inner polyline.
     tip_is_committed: bool,
-    /// `inner.stabilized()` followed by the raw tip: what `stabilized()`
-    /// returns.
-    combined: Vec<PaintInformation>,
 }
 
 impl ResamplingStabilizer {
@@ -76,7 +79,6 @@ impl ResamplingStabilizer {
             last_raw: None,
             residual: 0.0,
             tip_is_committed: false,
-            combined: Vec::with_capacity(256),
         }
     }
 
@@ -123,24 +125,30 @@ impl StabilizerAlgorithm for ResamplingStabilizer {
                 self.residual = 0.0;
                 self.tip_is_committed = true;
             }
-            Some(from) => self.commit_segment(from, raw),
+            Some(from) => {
+                if !self.tip_is_committed {
+                    self.inner.retract_tip();
+                }
+                self.commit_segment(from, raw);
+                if !self.tip_is_committed {
+                    self.inner.push(raw);
+                }
+            }
         }
         self.last_raw = Some(raw);
 
-        self.combined.clear();
-        self.combined.extend_from_slice(self.inner.stabilized());
-        if !self.tip_is_committed {
-            self.combined.push(raw);
-        }
-
         let window = self.max_divergence_window();
         StabilizeResult {
-            divergence_index: self.diff.update(&self.combined, window),
+            divergence_index: self.diff.update(self.inner.stabilized(), window),
         }
     }
 
+    fn retract_tip(&mut self) {
+        unreachable!("the resampler is the outermost stage that replaces a tip");
+    }
+
     fn stabilized(&self) -> &[PaintInformation] {
-        &self.combined
+        self.inner.stabilized()
     }
 
     fn max_divergence_window(&self) -> usize {
@@ -153,7 +161,6 @@ impl StabilizerAlgorithm for ResamplingStabilizer {
         self.last_raw = None;
         self.residual = 0.0;
         self.tip_is_committed = false;
-        self.combined.clear();
     }
 }
 
@@ -181,6 +188,9 @@ mod tests {
             StabilizeResult {
                 divergence_index: None,
             }
+        }
+        fn retract_tip(&mut self) {
+            self.points.pop();
         }
         fn stabilized(&self) -> &[PaintInformation] {
             &self.points
@@ -222,11 +232,11 @@ mod tests {
         (a[0] - b[0]).hypot(a[1] - b[1])
     }
 
-    /// The tip is always the raw sample itself, and the inner algorithm runs
-    /// once per committed vertex, never on a push that commits none.
+    /// The tip is always the raw sample itself, the inner polyline holds the
+    /// committed vertices plus that one provisional tip, and nothing shrinks.
     #[test]
-    fn tip_is_pinned_and_inner_runs_only_on_commits() {
-        let (mut stab, pushes) = counting();
+    fn tip_is_pinned_and_inner_holds_committed_plus_tip() {
+        let (mut stab, _pushes) = counting();
         let steps = [0.3, 25.0, 1.7, 4.4, 0.9, 13.1, 2.2, 7.7, 0.5, 19.3, 3.3];
         let (mut x, mut y, mut arc) = (0.0f32, 0.0f32, 0.0f32);
         let mut prev_len = 0;
@@ -253,9 +263,14 @@ mod tests {
             assert!((tip.time - raw.time).abs() < 1e-5, "push {i}: tip time");
 
             // One committed vertex at the origin, then one per spacing of
-            // raw arc length (no step here reaches the per-push cap).
+            // raw arc length (no step here reaches the per-push cap), plus
+            // the provisional tip unless the pen sits exactly on a commit.
             let committed = 1 + (arc / SPACING).floor() as usize;
-            assert_eq!(pushes.load(Ordering::Relaxed), committed, "push {i}");
+            assert!(
+                out.len() == committed + 1 || out.len() == committed,
+                "push {i}: {} vertices for {committed} committed",
+                out.len()
+            );
             assert!(out.len() >= prev_len, "push {i}: output must never shrink");
             prev_len = out.len();
         }
@@ -294,7 +309,7 @@ mod tests {
     #[test]
     fn divergence_stays_within_the_widened_window() {
         let mut stab = laplacian(1.0);
-        assert_eq!(stab.max_divergence_window(), 11 + MAX_COMMITS_PER_PUSH);
+        assert_eq!(stab.max_divergence_window(), 161 + MAX_COMMITS_PER_PUSH);
         let (mut x, mut y) = (0.0f32, 0.0f32);
         for i in 0..300 {
             let step = if i % 5 == 0 { 40.0 } else { 1.0 };
@@ -323,7 +338,7 @@ mod tests {
             first.divergence_index, None,
             "nothing was rendered before the origin"
         );
-        assert_eq!(stab.max_divergence_window(), 6 + MAX_COMMITS_PER_PUSH);
+        assert_eq!(stab.max_divergence_window(), 41 + MAX_COMMITS_PER_PUSH);
 
         let second = stab.push(mk(12.0, 10.0, 0.5, 0.004));
         assert_eq!(stab.stabilized().len(), 2);
@@ -335,15 +350,45 @@ mod tests {
         assert_eq!(third.divergence_index, Some(1));
     }
 
+    /// Regression: committing a vertex must not jolt the stroke. On a tight
+    /// curve at full strength, the vertex behind the tip moves about as much
+    /// on a push that commits as on one that only replaces the tip. With
+    /// the tip outside the smoothed polyline, or with a smoother that slides
+    /// points along the stroke, commits moved it several times further.
+    #[test]
+    fn commits_reshape_no_more_than_tip_moves() {
+        let mut stab = laplacian(1.0);
+        let mut prev: Vec<[f32; 2]> = vec![];
+        let (mut on_commit, mut on_replace) = (0.0f32, 0.0f32);
+        for i in 0..600 {
+            let th = i as f32 * 0.012;
+            stab.push(mk(30.0 * th.cos(), 30.0 * th.sin(), 0.5, i as f32 * 0.004));
+            let cur: Vec<[f32; 2]> = stab.stabilized().iter().map(|p| p.pos).collect();
+            if i > 100 {
+                let j = prev.len() - 2;
+                let moved = dist(prev[j], cur[j]);
+                if cur.len() > prev.len() {
+                    on_commit = on_commit.max(moved);
+                } else {
+                    on_replace = on_replace.max(moved);
+                }
+            }
+            prev = cur;
+        }
+        assert!(
+            on_commit < on_replace * 1.5,
+            "a commit moved the vertex behind the tip {on_commit:.2} px, a replace at most {on_replace:.2} px"
+        );
+    }
+
     /// A jump longer than the cap allows commits exactly the cap, spread
     /// evenly and ending on the raw sample, with no duplicate tip; the next
     /// commit is a nominal spacing past that last vertex.
     #[test]
     fn long_jump_commits_the_cap_evenly_and_ends_on_the_sample() {
-        let (mut stab, pushes) = counting();
+        let (mut stab, _pushes) = counting();
         stab.push(mk(0.0, 0.0, 0.5, 0.0));
         stab.push(mk(200.0, 0.0, 0.5, 0.01));
-        assert_eq!(pushes.load(Ordering::Relaxed), 1 + MAX_COMMITS_PER_PUSH);
         let out = stab.stabilized();
         assert_eq!(out.len(), 1 + MAX_COMMITS_PER_PUSH, "no extra tip vertex");
         for (j, v) in out.iter().enumerate() {
@@ -356,14 +401,25 @@ mod tests {
         }
 
         stab.push(mk(203.0, 0.0, 0.5, 0.02));
-        assert_eq!(pushes.load(Ordering::Relaxed), 1 + MAX_COMMITS_PER_PUSH);
-        stab.push(mk(207.0, 0.0, 0.5, 0.03));
-        assert_eq!(pushes.load(Ordering::Relaxed), 2 + MAX_COMMITS_PER_PUSH);
         let out = stab.stabilized();
+        assert_eq!(
+            out.len(),
+            2 + MAX_COMMITS_PER_PUSH,
+            "provisional tip appended"
+        );
+        assert!((out.last().unwrap().pos[0] - 203.0).abs() < 1e-3);
+        stab.push(mk(207.0, 0.0, 0.5, 0.03));
+        let out = stab.stabilized();
+        assert_eq!(
+            out.len(),
+            3 + MAX_COMMITS_PER_PUSH,
+            "one commit, tip replaced"
+        );
         let next = out[out.len() - 2].pos[0];
         assert!(
             (next - 206.0).abs() < 1e-3,
             "next commit at {next}, expected 206"
         );
+        assert!((out.last().unwrap().pos[0] - 207.0).abs() < 1e-3);
     }
 }

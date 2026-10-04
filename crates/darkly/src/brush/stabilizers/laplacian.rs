@@ -1,14 +1,25 @@
 //! Laplacian relaxation stabilizer: iterative smoothing with zero lag.
 //!
-//! Maintains a polyline of all raw input positions.  On each new input:
+//! Maintains a polyline of all input positions.  On each new input:
 //! 1. Append to polyline
-//! 2. Run N iterations of Laplacian smoothing on interior points (first + last pinned)
-//! 3. Each iteration: `point[i] = lerp(point[i], avg(point[i-1], point[i+1]), strength)`
-//! 4. Sensor values (pressure, tilt, etc.) smoothed the same way
-//! 5. Diff against the positions last rendered → find divergence point
+//! 2. Run N sweeps of Laplacian smoothing on interior points (first + last
+//!    pinned), each moving a point onto the chord between its neighbours
+//! 3. Sensor values (pressure, tilt, etc.) smoothed the same way
+//! 4. Diff against the positions last rendered → find divergence point
+//!
+//! A point lands on the chord at its own arc-length proportion between its
+//! neighbours (the midpoint when they are equally spaced), measured on the
+//! raw polyline. Smoothing therefore changes shape only and never slides
+//! points along the stroke, so an unevenly spaced segment, such as the
+//! short one to a provisional tip, does not pull its neighbours after it.
 //!
 //! The tip is always pinned at the cursor (zero lag).  The stroke behind
 //! the pen continuously reshapes as direction changes: the "taffy" feel.
+//!
+//! Repeated neighbour averaging is a diffusion, so the smoothing radius
+//! grows with the square root of the sweep count. The sweep count is
+//! therefore quadratic in strength, which makes the visible smoothing grow
+//! about linearly with the slider.
 
 use crate::brush::paint_info::PaintInformation;
 use crate::brush::stabilizer::{
@@ -38,20 +49,46 @@ pub fn register() -> StabilizerRegistration {
     }
 }
 
+/// Sweeps at strength 1. With vertices one resample spacing apart this
+/// smooths over about ten spacings.
+const MAX_SWEEPS: f32 = 160.0;
+
 pub struct LaplacianStabilizer {
     raw_points: Vec<PaintInformation>,
     stabilized: Vec<PaintInformation>,
+    /// Per interior point, its arc-length proportion between its raw
+    /// neighbours: where on their chord relaxation places it.
+    chord_t: Vec<f32>,
     diff: DivergenceDiff,
-    strength: f32,
+    sweeps: u32,
 }
 
 impl LaplacianStabilizer {
     pub fn new(strength: f32) -> Self {
+        let strength = strength.clamp(0.0, 1.0);
         Self {
             raw_points: Vec::with_capacity(256),
             stabilized: Vec::with_capacity(256),
+            chord_t: Vec::with_capacity(256),
             diff: DivergenceDiff::new(DIVERGENCE_EPSILON),
-            strength: strength.clamp(0.0, 1.0),
+            sweeps: (strength * strength * MAX_SWEEPS).ceil() as u32,
+        }
+    }
+
+    /// Each interior point's arc-length proportion between its raw
+    /// neighbours; 0.5 where a neighbour coincides with it.
+    fn compute_chord_t(&mut self) {
+        self.chord_t.clear();
+        let raw = &self.raw_points;
+        self.chord_t.push(0.5);
+        for i in 1..raw.len().saturating_sub(1) {
+            let before =
+                (raw[i].pos[0] - raw[i - 1].pos[0]).hypot(raw[i].pos[1] - raw[i - 1].pos[1]);
+            let after =
+                (raw[i + 1].pos[0] - raw[i].pos[0]).hypot(raw[i + 1].pos[1] - raw[i].pos[1]);
+            let total = before + after;
+            self.chord_t
+                .push(if total > 0.0 { before / total } else { 0.5 });
         }
     }
 
@@ -63,34 +100,25 @@ impl LaplacianStabilizer {
             return;
         }
 
-        let iterations = (self.strength * 10.0).ceil() as u32;
-        let s = self.strength;
-
-        for _ in 0..iterations {
+        for _ in 0..self.sweeps {
             for i in 1..len - 1 {
-                // Position smoothing.
-                let prev_pos = self.stabilized[i - 1].pos;
-                let next_pos = self.stabilized[i + 1].pos;
-                let avg = [
-                    (prev_pos[0] + next_pos[0]) * 0.5,
-                    (prev_pos[1] + next_pos[1]) * 0.5,
-                ];
-                let cur = &mut self.stabilized[i];
-                cur.pos[0] += (avg[0] - cur.pos[0]) * s;
-                cur.pos[1] += (avg[1] - cur.pos[1]) * s;
-
-                // Sensor smoothing: same treatment for all continuous values.
                 let prev = self.stabilized[i - 1];
                 let next = self.stabilized[i + 1];
+                let t = self.chord_t[i];
                 let cur = &mut self.stabilized[i];
 
+                // Position and every continuous sensor move onto the chord
+                // between their neighbours, at this point's own proportion.
                 macro_rules! smooth_field {
                     ($field:ident) => {
-                        let avg = (prev.$field + next.$field) * 0.5;
-                        cur.$field += (avg - cur.$field) * s;
+                        cur.$field = prev.$field + (next.$field - prev.$field) * t;
                     };
                 }
 
+                cur.pos = [
+                    prev.pos[0] + (next.pos[0] - prev.pos[0]) * t,
+                    prev.pos[1] + (next.pos[1] - prev.pos[1]) * t,
+                ];
                 smooth_field!(pressure);
                 smooth_field!(x_tilt);
                 smooth_field!(y_tilt);
@@ -114,12 +142,13 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
         self.stabilized.extend_from_slice(&self.raw_points);
 
         // Run relaxation.
+        self.compute_chord_t();
         self.relax();
 
         // Find divergence. The walk is bounded by `max_divergence_window`,
         // which shares the relaxation's influence model, so the bound is
         // enforced by construction rather than by clamping a wider scan.
-        let divergence_index = if self.strength == 0.0 {
+        let divergence_index = if self.sweeps == 0 {
             None
         } else {
             let window = self.max_divergence_window();
@@ -129,14 +158,19 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
         StabilizeResult { divergence_index }
     }
 
+    fn retract_tip(&mut self) {
+        self.raw_points.pop();
+        self.stabilized.pop();
+    }
+
     fn stabilized(&self) -> &[PaintInformation] {
         &self.stabilized
     }
 
     /// Conservative upper bound on `tip_vi - find_divergence().unwrap()`.
     ///
-    /// Each `push()` re-runs `N = ceil(strength * 10)` Gauss-Seidel Laplacian
-    /// sweeps from scratch on the raw polyline. Between frames, the only
+    /// Each `push()` re-runs `N` Gauss-Seidel Laplacian sweeps from scratch
+    /// on the raw polyline. Between frames, the only
     /// inputs that differ are the new tip and the now-interior previous tip
     /// (formerly pinned). Both perturbations sit at indices `>= len - 2`.
     ///
@@ -147,16 +181,16 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
     /// index that can possibly differ between frames is `len - 2 - N`, so the
     /// distance from the tip (`len - 1`) is at most `N + 1`.
     fn max_divergence_window(&self) -> usize {
-        if self.strength == 0.0 {
+        if self.sweeps == 0 {
             return 0;
         }
-        let iterations = (self.strength * 10.0).ceil() as usize;
-        iterations + 1
+        self.sweeps as usize + 1
     }
 
     fn clear(&mut self) {
         self.raw_points.clear();
         self.stabilized.clear();
+        self.chord_t.clear();
         self.diff.clear();
     }
 }
@@ -271,16 +305,16 @@ mod tests {
     fn divergence_detected_near_turn() {
         let mut stab = LaplacianStabilizer::new(0.5);
 
-        // Build a straight stroke.
-        for i in 0..10 {
+        // Build a straight stroke much longer than the smoothing reach.
+        for i in 0..200 {
             stab.push(make_point(i as f32 * 10.0, 0.0));
         }
 
         // Add a sharp turn, which should cause divergence near the end, not at the beginning.
-        let result = stab.push(make_point(90.0, 30.0));
+        let result = stab.push(make_point(1990.0, 30.0));
         if let Some(div) = result.divergence_index {
             assert!(
-                div > 2,
+                div > 100,
                 "divergence at {div} should be near the turn, not at the start"
             );
         }
@@ -288,7 +322,9 @@ mod tests {
 
     #[test]
     fn sensor_values_smoothed() {
-        let mut stab = LaplacianStabilizer::new(0.8);
+        // Gentle enough that a five-point stroke does not fully converge to
+        // a straight ramp between its pinned ends.
+        let mut stab = LaplacianStabilizer::new(0.1);
 
         // Pressure spike in the middle.
         stab.push(make_point_with_pressure(0.0, 0.0, 0.3));
@@ -341,6 +377,27 @@ mod tests {
         );
     }
 
+    /// Regression: relaxation changes shape only. A straight line with one
+    /// short segment at the end (a provisional tip just past the last
+    /// committed vertex) must not slide its points along the line, which a
+    /// midpoint rule does, and which made the stroke lurch at every commit.
+    #[test]
+    fn uneven_spacing_on_a_line_does_not_slide_points() {
+        let mut stab = LaplacianStabilizer::new(1.0);
+        for i in 0..20 {
+            stab.push(make_point(i as f32 * 6.0, 0.0));
+        }
+        stab.push(make_point(19.0 * 6.0 + 0.4, 0.0));
+        for (i, p) in stab.stabilized().iter().enumerate().take(20) {
+            let expected = i as f32 * 6.0;
+            assert!(
+                (p.pos[0] - expected).abs() < 1e-3,
+                "vertex {i} slid to {} (expected {expected})",
+                p.pos[0]
+            );
+        }
+    }
+
     /// `max_divergence_window` is the contract the checkpoint ring relies on
     /// for coverage. Lock the value to the influence-radius derivation so any
     /// future change is forced through this test (and the documentation).
@@ -349,9 +406,14 @@ mod tests {
         // strength = 0 → pass-through, no relaxation, no divergence window.
         assert_eq!(LaplacianStabilizer::new(0.0).max_divergence_window(), 0);
 
-        // iterations = ceil(strength * 10); window = iterations + 1.
-        for (strength, expected_iters) in [(0.1f32, 1u32), (0.25, 3), (0.5, 5), (0.8, 8), (1.0, 10)]
-        {
+        // sweeps = ceil(strength^2 * 160); window = sweeps + 1.
+        for (strength, expected_iters) in [
+            (0.1f32, 2u32),
+            (0.25, 10),
+            (0.5, 40),
+            (0.8, 103),
+            (1.0, 160),
+        ] {
             let stab = LaplacianStabilizer::new(strength);
             assert_eq!(
                 stab.max_divergence_window(),

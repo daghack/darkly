@@ -153,6 +153,10 @@ pub trait StabilizerAlgorithm: Send {
     /// Append a raw input point, run the algorithm, and return the result.
     fn push(&mut self, point: PaintInformation) -> StabilizeResult;
 
+    /// Forget the most recent point, so the next `push` replaces it. The
+    /// polyline is only meaningful again after that push.
+    fn retract_tip(&mut self);
+
     /// The current stabilized polyline (full stroke).
     fn stabilized(&self) -> &[PaintInformation];
 
@@ -203,6 +207,10 @@ impl StabilizerAlgorithm for PassThrough {
         StabilizeResult {
             divergence_index: None,
         }
+    }
+
+    fn retract_tip(&mut self) {
+        self.points.pop();
     }
 
     fn stabilized(&self) -> &[PaintInformation] {
@@ -357,6 +365,10 @@ impl StabilizerAlgorithm for PredictingStabilizer {
         let window = self.max_divergence_window();
         let divergence_index = self.diff.update(&self.combined, window);
         StabilizeResult { divergence_index }
+    }
+
+    fn retract_tip(&mut self) {
+        self.inner.retract_tip();
     }
 
     fn stabilized(&self) -> &[PaintInformation] {

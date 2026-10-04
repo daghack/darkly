@@ -291,7 +291,7 @@ impl BrushStrokePreviewRenderer {
         }
 
         // Walk the full polyline placing dabs. `render_from_stabilized_range_to`
-        // handles Catmull-Rom interpolation + sensor derivation internally.
+        // handles segment interpolation + sensor derivation internally.
         {
             let end = path.len() - 1;
             let mut ctx = make_gpu_ctx!("brush-preview-stroke");

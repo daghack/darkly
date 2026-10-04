@@ -56,10 +56,11 @@ Four pieces to keep in mind:
 
  for each pen event (brush_stroke_to):
    │
-   ├─► stabilizer.feed(event) → smoothed polyline, maybe a divergence index
-   ├─► StrokeEngine.render_from_stabilized_tail(gpu_ctx)
-   │      │
-   │      ├─► for each dab position on the spline:
+   ├─► stabilizer.push(event) → resampled, smoothed polyline; a divergence
+   │      index when a rendered vertex moved, else append-only
+   ├─► StrokeEngine.render_from_stabilized_range(gpu_ctx, first_new)
+   │      │   (after restoring a checkpoint on divergence)
+   │      ├─► for each dab position on the segment:
    │      │     ├─► runner.seed_sensors(PaintInformation)
    │      │     ├─► runner.execute_cpu()     // scalars (size, opacity, …)
    │      │     └─► runner.execute_gpu(ctx)  // render passes recorded in ctx.encoder
@@ -455,20 +456,13 @@ render pass.
 
 ## Dab spacing
 
-The stroke engine places dabs at a fixed distance along the Catmull-Rom
-interpolated polyline. The distance is derived from the brush's **own
-reported `dab_size`**:
-
-```rust
-for node_type in &["procedural", "stamp", "liquify"] {
-    if let Some(slot) = runner.find_output_slot(node_type, "dab_size") { ... }
-}
-```
-
-Any terminal-ish node that wants its footprint to drive spacing must expose
-a `dab_size: Vec2` output **and** have its `type_id` listed here. Forgetting
-to list it means dabs get placed one per input event instead of at uniform
-intervals; strokes will look choppy.
+The stroke engine places dabs at a fixed distance along the straight
+segments between consecutive stabilized vertices, every field interpolated
+linearly along the segment. The distance is derived from the brush's **own
+reported `dab_size`**: the runner caches, at build time, the slot of
+whichever terminal publishes a `dab_size: Vec2` output, and the stroke engine
+reads it after every dab (`BrushGraphRunner::last_dab_size`). A terminal that
+wants its footprint to drive spacing only has to publish that port.
 
 ## Undo and save points
 

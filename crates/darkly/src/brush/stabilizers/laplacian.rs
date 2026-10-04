@@ -5,14 +5,15 @@
 //! 2. Run N iterations of Laplacian smoothing on interior points (first + last pinned)
 //! 3. Each iteration: `point[i] = lerp(point[i], avg(point[i-1], point[i+1]), strength)`
 //! 4. Sensor values (pressure, tilt, etc.) smoothed the same way
-//! 5. Diff against previous frame's polyline → find divergence point
+//! 5. Diff against the positions last rendered → find divergence point
 //!
 //! The tip is always pinned at the cursor (zero lag).  The stroke behind
 //! the pen continuously reshapes as direction changes: the "taffy" feel.
 
 use crate::brush::paint_info::PaintInformation;
 use crate::brush::stabilizer::{
-    find_divergence, StabilizeResult, StabilizerAlgorithm, StabilizerRegistration,
+    DivergenceDiff, StabilizeResult, StabilizerAlgorithm, StabilizerRegistration,
+    DIVERGENCE_EPSILON,
 };
 use crate::gpu::params::{ParamDef, ParamValue};
 
@@ -40,7 +41,7 @@ pub fn register() -> StabilizerRegistration {
 pub struct LaplacianStabilizer {
     raw_points: Vec<PaintInformation>,
     stabilized: Vec<PaintInformation>,
-    prev_positions: Vec<[f32; 2]>,
+    diff: DivergenceDiff,
     strength: f32,
 }
 
@@ -49,7 +50,7 @@ impl LaplacianStabilizer {
         Self {
             raw_points: Vec::with_capacity(256),
             stabilized: Vec::with_capacity(256),
-            prev_positions: Vec::with_capacity(256),
+            diff: DivergenceDiff::new(DIVERGENCE_EPSILON),
             strength: strength.clamp(0.0, 1.0),
         }
     }
@@ -101,36 +102,10 @@ impl LaplacianStabilizer {
             }
         }
     }
-
-    /// Find the divergence point: walk backward from tip until either the
-    /// position delta between current and previous frame falls below
-    /// `DIVERGENCE_EPSILON`, or we hit the earliest index the influence model
-    /// admits a perturbation could reach.
-    ///
-    /// The walk is bounded by [`Self::max_divergence_window`]: both methods
-    /// share the same Laplacian-relaxation influence model, so the bound is
-    /// enforced by construction rather than by clamping a wider scan. See
-    /// `max_divergence_window` for the derivation.
-    ///
-    /// The diff itself is the shared [`find_divergence`] free function: the
-    /// same detector the [`PredictingStabilizer`](crate::brush::stabilizer::PredictingStabilizer)
-    /// runs over its combined real+predicted polyline.
-    fn find_divergence(&self) -> Option<usize> {
-        find_divergence(
-            &self.stabilized,
-            &self.prev_positions,
-            self.max_divergence_window(),
-        )
-    }
 }
 
 impl StabilizerAlgorithm for LaplacianStabilizer {
     fn push(&mut self, point: PaintInformation) -> StabilizeResult {
-        // Save previous positions for divergence detection.
-        self.prev_positions.clear();
-        self.prev_positions
-            .extend(self.stabilized.iter().map(|p| p.pos));
-
         // Append raw point.
         self.raw_points.push(point);
 
@@ -141,11 +116,14 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
         // Run relaxation.
         self.relax();
 
-        // Find divergence.
+        // Find divergence. The walk is bounded by `max_divergence_window`,
+        // which shares the relaxation's influence model, so the bound is
+        // enforced by construction rather than by clamping a wider scan.
         let divergence_index = if self.strength == 0.0 {
             None
         } else {
-            self.find_divergence()
+            let window = self.max_divergence_window();
+            self.diff.update(&self.stabilized, window)
         };
 
         StabilizeResult { divergence_index }
@@ -179,7 +157,7 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
     fn clear(&mut self) {
         self.raw_points.clear();
         self.stabilized.clear();
-        self.prev_positions.clear();
+        self.diff.clear();
     }
 }
 
@@ -399,11 +377,11 @@ mod tests {
             let t = i as f32;
             let x = t * 4.0;
             let y = (t * 0.15).sin() * 30.0;
-            stab.push(make_point(x, y));
+            let result = stab.push(make_point(x, y));
 
             let len = stab.stabilized().len();
             let earliest = len.saturating_sub(max_back + 1);
-            if let Some(div) = stab.find_divergence() {
+            if let Some(div) = result.divergence_index {
                 assert!(
                     div >= earliest,
                     "find_divergence returned {div} at len={len}, earliest allowed = {earliest} \

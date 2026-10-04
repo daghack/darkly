@@ -358,9 +358,8 @@ pub trait BrushNodeEvaluator: Send + Sync {
 
     /// Flush any per-rendering-phase work the terminal has queued during
     /// the preceding `evaluate_gpu` calls. Called at the end of every
-    /// dab-rendering phase (`render_from_stabilized_range_to`,
-    /// `render_from_stabilized_tail`) just before that phase's
-    /// `submit_final`.
+    /// dab-rendering phase (`render_from_stabilized_range_to`) just before
+    /// that phase's `submit_final`.
     ///
     /// Dab-batching terminals (paint, watercolor_batched) use this to dispatch their
     /// batched work; fragment-path terminals that already record per-dab

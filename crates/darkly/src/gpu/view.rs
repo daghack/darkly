@@ -21,6 +21,10 @@ pub struct ViewParams {
     pub mirror_h: bool,
     pub screen_w: f32,
     pub screen_h: f32,
+    /// Device pixels per CSS pixel. `screen_w/h`, pan and zoom are in device
+    /// pixels; input that should feel the same on every display (stroke
+    /// resampling) is measured in CSS pixels through this ratio.
+    pub dpr: f32,
 }
 
 impl Default for ViewParams {
@@ -33,6 +37,7 @@ impl Default for ViewParams {
             mirror_h: false,
             screen_w: 1.0,
             screen_h: 1.0,
+            dpr: 1.0,
         }
     }
 }

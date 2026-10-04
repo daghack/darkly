@@ -432,6 +432,7 @@ impl DarklyEngine {
         // the previous stroke's totals.
         self.brush_perf = BrushPerfCounters::default();
         self.brush_full_rerender_events = 0;
+        self.brush_rewind_events = 0;
         self.last_brush_perf = BrushPerfCounters::default();
         // GPU setup is deferred to first stroke_to (lazy init).
         Ok(())
@@ -959,23 +960,17 @@ impl DarklyEngine {
             } else {
                 crate::brush::stabilizer::StabilizerConfig::default()
             };
-            let inner = self
-                .stabilizer_registry
-                .create_from_config(&stabilizer_config);
-
-            // Prediction is coupled to stabilization: it extrapolates from the
-            // smoothed polyline, so it only engages when a real stabilizer is
-            // active AND a look-ahead horizon is configured. Otherwise the
-            // inner stabilizer is used bare.
-            let horizon_ms = self.prediction_horizon_ms();
-            let stabilizer: Box<dyn crate::brush::stabilizer::StabilizerAlgorithm> =
-                if strength > 0.0 && horizon_ms > 0.0 {
-                    Box::new(crate::brush::stabilizer::PredictingStabilizer::new(
-                        inner, horizon_ms,
-                    ))
-                } else {
-                    inner
-                };
+            // Canvas pixels per CSS pixel of pen travel at this view: the
+            // stack measures resample spacing on screen, so smoothing feels
+            // the same at every zoom and on every display.
+            let view = &self.view_params;
+            let canvas_per_css_px = view.dpr / view.zoom.max(f32::MIN_POSITIVE);
+            let stabilizer = crate::brush::stabilizer::stroke_stabilizer_stack(
+                &self.stabilizer_registry,
+                &stabilizer_config,
+                self.prediction_horizon_ms(),
+                canvas_per_css_px,
+            );
 
             self.brush_stroke_engine = Some(StrokeEngine::new(
                 runner,
@@ -1095,18 +1090,6 @@ impl DarklyEngine {
             }
         }
 
-        // Build PaintInformation from the raw tablet data.
-        let info = PaintInformation {
-            pos: [x, y],
-            pressure,
-            x_tilt,
-            y_tilt,
-            rotation,
-            tangential_pressure,
-            time: (time_ms / 1000.0) as f32,
-            ..Default::default()
-        };
-
         // Get the paint target (layer or mask): encapsulates format and
         // brush-side commit dispatch so the brush stack stays format-agnostic.
         // Inline dispatch (vs `self.paint_target(...)`) for borrow-checker
@@ -1121,6 +1104,18 @@ impl DarklyEngine {
         // Take the stroke engine and buffer out to avoid borrow conflicts.
         let mut engine = self.brush_stroke_engine.take().unwrap();
         let mut stroke_buffer = self.stroke_buffer.take();
+
+        // Build PaintInformation from the raw tablet data.
+        let info = PaintInformation {
+            pos: [x, y],
+            pressure,
+            x_tilt,
+            y_tilt,
+            rotation,
+            tangential_pressure,
+            time: engine.stroke_seconds(time_ms),
+            ..Default::default()
+        };
 
         let sel_bg = if self.has_selection() {
             self.compositor
@@ -1146,32 +1141,20 @@ impl DarklyEngine {
             // Stabilized path: dabs render into the scratch, then the
             // terminal's `commit` hook lands them on the layer.
             self.brush_pipelines.reset_uniform_rings();
+            // Vertices from `first_new` on have never been rendered.
+            let first_new = engine.stabilizer_len();
             let result = engine.stabilize(info);
             let max_div = engine.max_divergence_window();
             let tip_vi = engine.stabilizer_len().saturating_sub(1);
-
-            // Synthesize divergence on the previously-rendered tip segment.
-            // It was drawn with a degenerate `p3 = p2` because the next
-            // sample hadn't arrived yet; now it has, so re-render that
-            // segment with proper Catmull-Rom lookahead.  `tip_div` is
-            // the deeper of the two when the stabilizer also reports
-            // divergence (take the earliest vi that needs rebuild).
-            let tip_div = tip_vi.saturating_sub(1);
-            let div_idx = match result.divergence_index {
-                Some(k) => Some(k.min(tip_div)),
-                None if tip_vi >= 1 => Some(tip_div),
-                None => None,
-            };
+            let div_idx = result.divergence_index;
 
             // The checkpoint ring's coverage invariant depends on
             // `max_divergence_window` being a true upper bound on
             // `tip_vi - find_divergence().unwrap()`. Make any future drift
             // between the stabilizer's bound and its detector loud in debug
-            // builds. (The synthetic tip-divergence path is always within
-            // bound by construction, but `result.divergence_index` is what
-            // the stabilizer reported.)
+            // builds.
             #[cfg(debug_assertions)]
-            if let Some(k) = result.divergence_index {
+            if let Some(k) = div_idx {
                 let earliest = tip_vi.saturating_sub(max_div);
                 debug_assert!(
                     k >= earliest,
@@ -1236,6 +1219,7 @@ impl DarklyEngine {
 
             if let Some(div_idx) = div_idx {
                 // Divergence: try checkpoint-based partial re-render.
+                self.brush_rewind_events += 1;
                 // The terminal's `begin_stroke` establishes outside-bbox
                 // state for whichever path we take below; the checkpoint
                 // ring no longer clears on its own.
@@ -1349,17 +1333,23 @@ impl DarklyEngine {
                     self.brush_perf += gpu_ctx.submit_final();
                 }
             } else {
-                // No divergence: render tail only.
-                let mut gpu_ctx = make_gpu_ctx!("brush-dab");
-                engine.render_from_stabilized_tail(&mut gpu_ctx);
-                self.brush_perf += gpu_ctx.submit_final();
+                // Nothing already rendered moved: render the appended
+                // vertices, continuing from the engine's render state.
+                if first_new <= tip_vi {
+                    let mut gpu_ctx = make_gpu_ctx!("brush-dab");
+                    engine.render_from_stabilized_range(&mut gpu_ctx, first_new);
+                    self.brush_perf += gpu_ctx.submit_final();
+                }
 
-                // Periodically save a checkpoint to keep the ring fresh.
+                // Periodically save a checkpoint to keep the ring fresh. A
+                // stabilizer with a zero divergence window can never report
+                // a rendered index, so it never restores and needs none.
                 let spacing = CheckpointRing::spacing(max_div);
-                let should_save = match self.checkpoint_ring.newest_vector_index() {
-                    Some(newest_vi) => tip_vi.saturating_sub(newest_vi) >= spacing,
-                    None => true,
-                };
+                let should_save = max_div > 0
+                    && match self.checkpoint_ring.newest_vector_index() {
+                        Some(newest_vi) => tip_vi.saturating_sub(newest_vi) >= spacing,
+                        None => true,
+                    };
                 if should_save && !engine.save_points.is_empty() {
                     if let Some(bbox) = engine.save_points.full_bbox() {
                         let sp_idx = engine.save_points.len() - 1;

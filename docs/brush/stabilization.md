@@ -5,13 +5,11 @@ TODO:
 - Debug lag on long+fast strokes when stabilization is turned up high
      - When we doubled the max stabilization value, did we inadvertently reintroduce the possibility of fallback to full stroke-redraws? This existed in a careful balance.
      - When we get behind in rendering, does there become a backlog of queued inputs? Are we trying to render all of them? Is there a way to detect when rendering falls behind and discard all but the most recent input event?
-- Is the stabilization engine in screen-space (dependent on inputs), or in canvas space (dependent on DPI)? Ideally it should look identical to the artist no matter what zoom level they're at or whether the canvas size is 720p or 4K.
-- A better solution to "higher" stabilization may be tweaking the time element instead of the length one. Right now, faster strokes = more stabilization. Is that dial hard-coded? Can it be customized? Or is it naturally this way, just as a function of the number of input points?
 ```
 
 ## Lag investigation findings
 
-Live in-browser perf instrumentation (the `[stab-perf]` summary at `end_stroke` and the `[frame-perf]` slow-frame log in the WASM bridge) measured a small-brush, high-stabilization stroke. The numbers below are wall-clock host time only: GPU shader cost is not measured (`web_time::Instant` resolves to `performance.now()` on WASM, which only sees the CPU side).
+Live in-browser perf instrumentation (a since-removed `[stab-perf]` summary at `end_stroke`, and the `[frame-perf]` slow-frame log in the WASM bridge) measured a small-brush, high-stabilization stroke. The numbers below are wall-clock host time only: GPU shader cost is not measured (`web_time::Instant` resolves to `performance.now()` on WASM, which only sees the CPU side).
 
 ### Where the frame budget goes
 
@@ -94,9 +92,10 @@ The key insight: instead of re-rendering the entire stroke every frame when earl
   StrokeEngine                      │  │   (dabs render here)│  │
        │                            │  └─────────────────────┘  │
        ├─> Stabilizer.push()        │  ┌─────────────────────┐  │
-       │      │                     │  │  pre_stroke_texture │  │
+       │      ├─> resample          │  │  pre_stroke_texture │  │
        │      ├─> relax polyline    │  │  (layer snapshot)   │  │
-       │      └─> find divergence   │  └─────────────────────┘  │
+       │      ├─> predict tail      │  └─────────────────────┘  │
+       │      └─> find divergence   │                           │
        │             │              └───────────────────────────┘
        │             v
        │      divergence_index ──────────> CheckpointRing
@@ -108,18 +107,24 @@ The key insight: instead of re-rendering the entire stroke every frame when earl
        └──> render_from_stabilized_range_to(start, end)
 ```
 
-### Stabilizer (`stabilizer.rs`, `stabilizers/`)
+### Stabilizer (`stabilizer.rs`, `resampler.rs`, `stabilizers/`)
 
-Pluggable algorithm behind a `StabilizerAlgorithm` trait. Each frame:
+`stroke_stabilizer_stack` builds what a stroke runs through: the configured algorithm, fed by the resampler and wrapped in prediction when a look-ahead horizon is set. Each tablet event:
 
-1. Append the raw tablet point
-2. Copy raw points to a working buffer
-3. Run the smoothing algorithm
-4. Diff against the previous frame's positions to find the **divergence index**: the earliest point that moved more than 0.5 pixels
+1. The resampler turns the raw point into zero or more vertices at a fixed arc-length spacing, and replaces the pinned tip
+2. The algorithm smooths the committed vertices (only when a vertex commits)
+3. Prediction appends a short extrapolated tail
+4. The output is diffed against the positions each vertex was last rendered at to find the **divergence index**: the earliest rendered vertex that has since moved more than 0.5 CSS pixels
 
-The divergence index tells the rendering system "everything from here to the tip changed, re-render it."
+The divergence index tells the rendering system "everything from here to the tip changed, re-render it." `None` means no rendered vertex moved: the new vertices are appended and rendered with no rewind. Dabs lie on the straight segment between consecutive vertices, so a segment is final once both its endpoints exist. An unstabilized stroke therefore never rewinds and never saves a checkpoint.
 
-**Laplacian relaxation** (`stabilizers/laplacian.rs`) is the current algorithm. It runs N iterations of Gauss-Seidel neighbor-averaging on interior points, with first and last points pinned. `iterations = ceil(strength * 10)`, so strength 0.0 is pass-through, strength 1.0 is 10 iterations.
+Diffing against rendered positions rather than the previous event bounds how stale a rendered vertex can get: a vertex that drifts a little on every event is re-rendered once its accumulated drift reaches the epsilon.
+
+**Resampling** (`resampler.rs`). Smoothing algorithms work on vertex indices, while raw samples arrive at whatever rate the platform delivers, so the spacing of raw samples depends on the event rate and the pen speed. The resampler commits a vertex every 6 CSS pixels of raw arc length (`RESAMPLE_SPACING_CSS_PX`), converted to canvas pixels through the device pixel ratio and the zoom at stroke start. An index therefore means the same distance on screen on every platform, at every pen speed, zoom and display density. The latest raw sample stays pinned as the last vertex (zero lag) and is replaced in place until the pen has travelled one spacing. At most 8 vertices commit per event (`MAX_COMMITS_PER_PUSH`); a longer jump gets 8 vertices spread evenly along it, which is the one place the output still depends on input density. The resampler's divergence window is the algorithm's plus 8: over `k` commits the algorithm can move vertices up to its own window behind the first commit, and the tip is `k` further on.
+
+**Prediction** (`PredictingStabilizer`). Appends 3 points past the real tip along the recent heading, spanning the look-ahead horizon at the recent pen speed. Its window is the inner window plus 3.
+
+**Laplacian relaxation** (`stabilizers/laplacian.rs`) is the current algorithm. It runs N iterations of Gauss-Seidel neighbor-averaging on interior points, with first and last points pinned. `iterations = ceil(strength * 10)`, so strength 0.0 is pass-through, strength 1.0 is 10 iterations. On resampled input its reach is about `N x 6` CSS pixels of pen travel, the same at any speed.
 
 Each stabilizer also reports `max_divergence_window()`: a *true* upper bound on `tip_vi − find_divergence().unwrap()`. The checkpoint ring depends on this being a real ceiling: violating it breaks coverage and degrades re-render to `O(total_stroke)`. The bound and the detector must be derived from the same algorithmic model.
 
@@ -199,10 +204,12 @@ Each tablet event follows one of three paths:
 3. Full re-render from index 0 in segments, saving checkpoints along the way
 4. Composite
 
-**No divergence (straight-line drawing, or strength=0):**
-1. Render only the new tail point
-2. Save a checkpoint if enough distance has passed since the last one
+**No divergence (strength 0, or no rendered vertex moved):**
+1. Render the newly appended vertices, continuing from the engine's render state
+2. Save a checkpoint if enough distance has passed since the last one (only when the stabilizer can diverge at all, `max_divergence_window > 0`)
 3. Composite
+
+For the Laplacian, a rendered vertex stays put only when its neighbours are collinear and equally spaced, so at strength above 0 most events still take a divergence path; the pinned tip being replaced in place is itself a divergence at the tip's own index.
 
 ## Performance Characteristics
 
@@ -220,7 +227,8 @@ The bbox grows monotonically as the stroke extends, but for typical brushes it's
 
 | File | Role |
 |------|------|
-| `brush/stabilizer.rs` | `StabilizerAlgorithm` trait, `PassThrough`, `StabilizerConfig`, `StabilizerRegistry` |
+| `brush/stabilizer.rs` | `StabilizerAlgorithm` trait, `PassThrough`, `DivergenceDiff`, `PredictingStabilizer`, `stroke_stabilizer_stack`, `StabilizerConfig`, `StabilizerRegistry` |
+| `brush/resampler.rs` | `ResamplingStabilizer` - fixed arc-length spacing ahead of the algorithm |
 | `brush/stabilizers/laplacian.rs` | Laplacian relaxation implementation |
 | `brush/stroke_engine.rs` | `StrokeEngine` - drives stabilizer + dab placement + render state |
 | `brush/stroke_buffer.rs` | `StrokeBuffer` - stroke and pre-stroke GPU textures, composite |
@@ -235,4 +243,6 @@ The bbox grows monotonically as the stroke extends, but for typical brushes it's
 3. Export `register() -> StabilizerRegistration` with params and factory
 4. Done. `build.rs` auto-discovers it; the registry picks it up.
 
-The checkpoint system is algorithm-agnostic. The only contract: `push()` returns a `divergence_index`, and `max_divergence_window()` returns a conservative upper bound. The ring spaces checkpoints accordingly.
+The checkpoint system is algorithm-agnostic. The only contract: `push()` returns a `divergence_index` (`None` when no rendered vertex moved), and `max_divergence_window()` returns a conservative upper bound. The ring spaces checkpoints accordingly. `DivergenceDiff` computes a conforming index against rendered positions.
+
+An algorithm in a stroke receives vertices at a fixed arc-length spacing from the resampler, so it can reason about its reach in spacing units.

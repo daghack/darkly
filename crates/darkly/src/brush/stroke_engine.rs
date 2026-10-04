@@ -4,13 +4,14 @@
 //! - Storing raw events in `StrokeRecord` (for re-rendering)
 //! - Stabilization (retroactive stroke reshaping via pluggable algorithm)
 //! - Computing derived sensor values (speed, distance, angle, tilt)
-//! - Interpolating between events and placing dabs at spacing intervals
+//! - Placing dabs at spacing intervals along the straight segment between
+//!   consecutive stabilized vertices
 //! - Evaluating the brush graph per dab (CPU + GPU)
 //! - Per-dab save points for rewind capability
 
 use super::eval::BrushGraphRunner;
 use super::gpu_context::BrushGpuContext;
-use super::interpolation::{lerp_paint_info, CatmullRomSegment};
+use super::interpolation::lerp_paint_info;
 use super::paint_info::{PaintInformation, StrokeRecord};
 use super::save_points::SavePointStore;
 use super::spacing::SpacingConfig;
@@ -67,6 +68,10 @@ pub struct StrokeEngine {
     last_dab_pos: Option<[f32; 2]>,
     /// Running dab index within the stroke.
     dab_count: u32,
+    /// Pointer timestamp (ms) of the stroke's first event: the origin of
+    /// `PaintInformation.time`. Kept in f64 so inter-sample intervals of a
+    /// few ms survive a large absolute page-uptime timestamp.
+    time_origin_ms: Option<f64>,
 
     /// Held stamp orientation (canvas-frame radians): the stroke axis the
     /// dab is currently facing, as opposed to the instantaneous travel
@@ -164,6 +169,7 @@ impl StrokeEngine {
             last_dab_size: [d, d],
             last_dab_pos: None,
             dab_count: 0,
+            time_origin_ms: None,
             stamp_angle: None,
             stamp_angle_rate,
             stroke_seed,
@@ -342,12 +348,13 @@ impl StrokeEngine {
         let start = start_vector_index.min(stab_len);
         let end = end_vector_index.min(stab_len - 1);
 
-        // When resuming from a checkpoint, snap last_point.pos to the current
-        // stabilized position.  Between checkpoint capture and now, intermediate
-        // frames may have shifted the polyline; the checkpoint's last_point
-        // reflects the old position.  Without this, the first segment bridges
-        // from the old position to the new next point, creating a tangent
-        // discontinuity ("broken chain" artifact at corners).
+        // When resuming mid-polyline, snap last_point.pos to the current
+        // stabilized position of vertex `start - 1`. The stabilizer only
+        // reports a vertex as moved once it shifts by at least its divergence
+        // epsilon, so that vertex can drift a little, event after event,
+        // after the checkpoint holding `last_point` was captured. Without the
+        // snap the first re-rendered segment starts off its vertex and the
+        // dab chain shows a step.
         if start > 0 {
             let snap_pos = self.stabilizer.stabilized().get(start - 1).map(|p| p.pos);
             if let (Some(pos), Some(lp)) = (snap_pos, self.last_point.as_mut()) {
@@ -357,18 +364,7 @@ impl StrokeEngine {
 
         // Walk the polyline, computing derived values and placing dabs.
         for i in start..=end {
-            let (raw, prev_neighbor, next_neighbor) = {
-                let stab = self.stabilizer.stabilized();
-                let raw = stab[i];
-                let prev = if i >= 2 { Some(stab[i - 2]) } else { None };
-                let next = if i + 1 < stab.len() {
-                    Some(stab[i + 1])
-                } else {
-                    None
-                };
-                (raw, prev, next)
-            };
-            let mut info = raw;
+            let mut info = self.stabilizer.stabilized()[i];
 
             // First point of the stroke: no segment to place dabs along.
             if self.last_point.is_none() {
@@ -382,23 +378,14 @@ impl StrokeEngine {
 
             let prev = self.last_point.unwrap();
 
-            // Build Catmull-Rom segment between prev (p1) and info (p2).
-            // Outer control points use stabilized neighbours when available;
-            // degenerate fallback duplicates the endpoint at stroke edges.
-            let p0_pt = prev_neighbor.unwrap_or(prev);
-            let p1_pt = prev;
-            let p2_pt = info;
-            let p3_pt = next_neighbor.unwrap_or(info);
-
-            let seg = CatmullRomSegment::new(&p0_pt, &p1_pt, &p2_pt, &p3_pt);
-            let arc_len = seg.arc_length();
-
-            // Segment-derived sensors use the Catmull-Rom arc length;
-            // chord distance would under-count on curved strokes.
-            info.derive_sensors(Some(&prev), arc_len);
+            // Dabs lie on the straight segment from the previous vertex to
+            // this one, so a segment is final as soon as both endpoints
+            // exist: nothing about it depends on vertices yet to arrive.
+            let seg_len = (info.pos[0] - prev.pos[0]).hypot(info.pos[1] - prev.pos[1]);
+            info.derive_sensors(Some(&prev), seg_len);
             self.accumulated_distance = info.distance;
 
-            if arc_len < 0.001 {
+            if seg_len < 0.001 {
                 self.last_point = Some(info);
                 self.save_points
                     .finalize_render_state(i, self.capture_render_state());
@@ -406,14 +393,8 @@ impl StrokeEngine {
             }
 
             let mut traveled = self.leftover_distance;
-            while traveled < arc_len {
-                // Position comes from the curve; sensors lerp between
-                // endpoints so they can't overshoot (pressure stays in-range,
-                // time stays monotonic, etc.).
-                let cr_dab = seg.eval_at_distance(traveled);
-                let t_lerp = traveled / arc_len;
-                let mut dab_info = lerp_paint_info(&prev, &info, t_lerp);
-                dab_info.pos = cr_dab.pos;
+            while traveled < seg_len {
+                let dab_info = lerp_paint_info(&prev, &info, traveled / seg_len);
                 self.place_dab(&dab_info, gpu, i);
                 let step = self.spacing.distance(self.effective_diameter());
                 debug_assert!(
@@ -423,7 +404,7 @@ impl StrokeEngine {
                 traveled += step;
             }
 
-            self.leftover_distance = traveled - arc_len;
+            self.leftover_distance = traveled - seg_len;
             self.last_point = Some(info);
 
             // Capture end-of-segment state on ALL save points for this vector
@@ -439,15 +420,16 @@ impl StrokeEngine {
         self.runner.flush_dabs(gpu);
     }
 
-    /// Process a raw pointer event: stabilize and render in one step.
+    /// Process a raw pointer event: stabilize, then render the newly
+    /// appended vertices.
     ///
-    /// Convenience method that combines `stabilize()` + `render_from_stabilized_tail()`.
     /// Used by the fallback path when no stroke buffer is active.
     /// When divergence occurs, the caller must handle rewind externally.
     pub fn move_to(&mut self, raw: PaintInformation, gpu: &mut BrushGpuContext) -> StabilizeResult {
+        let first_new = self.stabilizer.len();
         let result = self.stabilize(raw);
         if result.divergence_index.is_none() {
-            self.render_from_stabilized_tail(gpu);
+            self.render_from_stabilized_range(gpu, first_new);
         }
         result
     }
@@ -579,82 +561,6 @@ impl StrokeEngine {
         gpu.perf.record_dab();
     }
 
-    /// Render only the tail of the stabilized polyline: the latest point.
-    ///
-    /// Used when the stabilizer reports no divergence (only new points added).
-    /// The engine's internal state (last_point, leftover_distance) is still
-    /// valid from the previous render, so we continue from where we left off.
-    pub fn render_from_stabilized_tail(&mut self, gpu: &mut BrushGpuContext) {
-        let stabilized = self.stabilizer.stabilized();
-        let len = stabilized.len();
-        if len == 0 {
-            return;
-        }
-
-        let raw_pt = stabilized[len - 1];
-        let mut info = raw_pt;
-
-        if self.last_point.is_none() {
-            info.derive_sensors(None, 0.0);
-            self.place_dab(&info, gpu, len - 1);
-            self.last_point = Some(info);
-            self.save_points
-                .finalize_render_state(len - 1, self.capture_render_state());
-            // Terminals queue the dab and rely on `flush_dabs` to
-            // actually run the render pass. Without this, a single-
-            // event stroke (one `move_to` + `end_stroke`) leaves the
-            // queued first dab unflushed and the stroke renders as
-            // nothing.
-            self.runner.flush_dabs(gpu);
-            return;
-        }
-
-        let prev = self.last_point.unwrap();
-
-        // Tip segment: no future sample yet, so p3 = p2 (degenerate).
-        // The next input event re-renders this segment with proper
-        // lookahead via the synthesized tip-correction divergence.
-        let p0_pt = if len >= 3 { stabilized[len - 3] } else { prev };
-        let p1_pt = prev;
-        let p2_pt = info;
-        let p3_pt = info;
-
-        let seg = CatmullRomSegment::new(&p0_pt, &p1_pt, &p2_pt, &p3_pt);
-        let arc_len = seg.arc_length();
-
-        info.derive_sensors(Some(&prev), arc_len);
-        self.accumulated_distance = info.distance;
-
-        if arc_len < 0.001 {
-            self.last_point = Some(info);
-            return;
-        }
-
-        let mut traveled = self.leftover_distance;
-        while traveled < arc_len {
-            let cr_dab = seg.eval_at_distance(traveled);
-            let t_lerp = traveled / arc_len;
-            let mut dab_info = lerp_paint_info(&prev, &info, t_lerp);
-            dab_info.pos = cr_dab.pos;
-            self.place_dab(&dab_info, gpu, len - 1);
-            let step = self.spacing.distance(self.effective_diameter());
-            debug_assert!(
-                step >= super::spacing::ABSOLUTE_MIN_SPACING_PX,
-                "dab spacing dropped below 1px: {step}"
-            );
-            traveled += step;
-        }
-
-        self.leftover_distance = traveled - arc_len;
-        self.last_point = Some(info);
-        self.save_points
-            .finalize_render_state(len - 1, self.capture_render_state());
-
-        // Phase-end flush for compute-path terminals. See sibling call
-        // in `render_from_stabilized_range_to`.
-        self.runner.flush_dabs(gpu);
-    }
-
     /// Delegate the stroke-start / rewind-boundary lifecycle hook to every
     /// GPU terminal in the graph. Called by the engine at the start of a
     /// stroke and at every rewind boundary (full or partial): the paint
@@ -674,6 +580,13 @@ impl StrokeEngine {
     /// Finish the stroke, consuming the engine and returning the record.
     pub fn end(self) -> StrokeRecord {
         self.record
+    }
+
+    /// Seconds between the stroke's first event and a pointer timestamp in
+    /// ms. The first call fixes the origin.
+    pub fn stroke_seconds(&mut self, time_ms: f64) -> f32 {
+        let origin = *self.time_origin_ms.get_or_insert(time_ms);
+        ((time_ms - origin) / 1000.0) as f32
     }
 
     /// Number of dabs placed so far.

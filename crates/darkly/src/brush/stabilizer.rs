@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::paint_info::PaintInformation;
+use super::resampler::{ResamplingStabilizer, RESAMPLE_SPACING_CSS_PX};
 use crate::gpu::params::{ParamDef, ParamValue};
 
 /// Result of pushing a new point through the stabilizer.
@@ -26,26 +27,40 @@ pub struct StabilizeResult {
     pub divergence_index: Option<usize>,
 }
 
-/// Threshold in pixels below which a stabilized point is considered
-/// unchanged between frames.
-const DIVERGENCE_EPSILON: f32 = 0.5;
+/// Distance in CSS pixels below which a stabilized point is considered
+/// unchanged since it was rendered. [`stroke_stabilizer_stack`] scales it to
+/// canvas pixels at the stroke's zoom; a bare algorithm uses it unscaled.
+pub const DIVERGENCE_EPSILON: f32 = 0.5;
 
-/// Find the earliest index whose position changed from the previous frame,
-/// walking backward from the tip until either the per-index delta falls
-/// below [`DIVERGENCE_EPSILON`] or the influence bound `max_window` is hit.
+/// Find the earliest rendered index whose position has moved, walking
+/// backward from the tip until either an index lies within `epsilon` of its
+/// rendered position or the influence bound `max_window` is hit.
 ///
-/// `current` is this frame's stabilized polyline, `prev_positions` the
-/// previous frame's positions. The walk is bounded to `max_window` indices
-/// behind the tip (the caller's model of how far a perturbation can reach),
-/// so it never reports divergence at indices the model says cannot have moved.
+/// `current` is this push's polyline, `rendered` the positions its vertices
+/// were last rendered at. The walk is bounded to `max_window` indices behind
+/// the tip (the caller's model of how far a perturbation can reach), so it
+/// never reports divergence at indices the model says cannot have moved.
 ///
-/// Shared by [`LaplacianStabilizer`](crate::brush::stabilizers::laplacian::LaplacianStabilizer)
-/// (over its real polyline) and [`PredictingStabilizer`] (over its combined
-/// real+predicted polyline): one detector, two callers.
-pub fn find_divergence(
+/// Returns `None` when every rendered index is unchanged, even if the
+/// polyline grew: new indices have never been rendered, so appending them
+/// needs no rewind. Callers go through [`DivergenceDiff`].
+fn find_divergence(
     current: &[PaintInformation],
-    prev_positions: &[[f32; 2]],
+    rendered: &[[f32; 2]],
     max_window: usize,
+    epsilon: f32,
+) -> Option<usize> {
+    walk_divergence(current, rendered, max_window, epsilon).filter(|&k| k < rendered.len())
+}
+
+/// The backward walk behind [`find_divergence`]: the index just above the
+/// first unchanged index found walking down from the tip, which may name a
+/// newly appended index.
+fn walk_divergence(
+    current: &[PaintInformation],
+    rendered: &[[f32; 2]],
+    max_window: usize,
+    epsilon: f32,
 ) -> Option<usize> {
     let len = current.len();
     if len == 0 {
@@ -53,21 +68,21 @@ pub fn find_divergence(
     }
 
     // `earliest` is the lowest index whose position could possibly differ
-    // from the previous frame given the influence bound. Walking past it is
+    // since it was rendered given the influence bound. Walking past it is
     // wasted work and risks reporting spurious divergence.
     let earliest = len.saturating_sub(max_window + 1);
-    let eps2 = DIVERGENCE_EPSILON * DIVERGENCE_EPSILON;
+    let eps2 = epsilon * epsilon;
 
     // Squared position delta at index `i` (within bounds of both arrays here).
     let delta2 = |i: usize| -> f32 {
         let cur = current[i].pos;
-        let prev = prev_positions[i];
+        let prev = rendered[i];
         let dx = cur[0] - prev[0];
         let dy = cur[1] - prev[1];
         dx * dx + dy * dy
     };
 
-    if prev_positions.len() == len {
+    if rendered.len() == len {
         // Same length: walk backward from tip to `earliest`.
         for i in (earliest..len).rev() {
             if delta2(i) < eps2 {
@@ -76,11 +91,11 @@ pub fn find_divergence(
         }
         Some(earliest)
     } else {
-        // Polyline grew. New indices `[prev_positions.len(), len-1]` are by
+        // Polyline grew. New indices `[rendered.len(), len-1]` are by
         // definition new and cannot be compared. Existing indices that
-        // overlap with `prev_positions` are in `[0, overlap_end)`: walk
+        // overlap with `rendered` are in `[0, overlap_end)`: walk
         // those, descending, bounded below by `earliest`.
-        let overlap_end = prev_positions.len().min(len);
+        let overlap_end = rendered.len().min(len);
         if earliest >= overlap_end {
             // No overlap to check (e.g., first push of a stroke). The
             // divergence index is `earliest` itself, which equals 0 when
@@ -93,6 +108,43 @@ pub fn find_divergence(
             }
         }
         Some(earliest)
+    }
+}
+
+/// The positions each vertex of an output polyline was last rendered at, and
+/// the diff of a new polyline against them.
+///
+/// Comparing against rendered positions rather than the previous push keeps
+/// every rendered vertex within `epsilon` of where it now lies: a vertex that
+/// drifts a little on every push is re-rendered once its accumulated drift
+/// reaches `epsilon`, instead of never.
+pub struct DivergenceDiff {
+    rendered: Vec<[f32; 2]>,
+    epsilon: f32,
+}
+
+impl DivergenceDiff {
+    /// A diff that treats moves shorter than `epsilon` canvas px as unchanged.
+    pub fn new(epsilon: f32) -> Self {
+        Self {
+            rendered: Vec::with_capacity(256),
+            epsilon,
+        }
+    }
+
+    /// Diff `current` against the rendered positions and report the first
+    /// index to re-render, recording `current` as rendered from there on.
+    pub fn update(&mut self, current: &[PaintInformation], max_window: usize) -> Option<usize> {
+        let divergence = find_divergence(current, &self.rendered, max_window, self.epsilon);
+        let from = divergence.unwrap_or(self.rendered.len());
+        self.rendered.truncate(from);
+        self.rendered.extend(current[from..].iter().map(|p| p.pos));
+        divergence
+    }
+
+    /// Forget the rendered positions for a new stroke.
+    pub fn clear(&mut self) {
+        self.rendered.clear();
     }
 }
 
@@ -162,28 +214,30 @@ impl StabilizerAlgorithm for PassThrough {
     }
 }
 
-/// Minimum real samples before prediction engages: enough for a stable
-/// heading and a measured inter-sample Δt. Below this the decorator is a
-/// pass-through of the inner stabilizer's result.
+/// Minimum real vertices before prediction engages: enough for a stable
+/// heading and a measured speed. Below this the decorator is a pass-through
+/// of the inner stabilizer's result.
 const MIN_REAL_FOR_PREDICTION: usize = 3;
 
-/// Hard cap on the predicted point count, so a pathologically high sample
-/// rate (tiny Δt) can't blow up the divergence window / checkpoint spacing.
-const MAX_PREDICTED_POINTS: usize = 32;
+/// Predicted points appended past the real tip. Constant, so the divergence
+/// window is static and the tail's density does not depend on input cadence.
+const PREDICTED_POINTS: usize = 3;
 
-/// Number of recent real segments the heading, per-sample step, and Δt are
-/// averaged over: smooths raw last-two-frame jitter.
+/// Number of recent real segments the heading and speed are measured over.
+/// Under resampling the last one is the partial segment to the pinned tip;
+/// a speed (distance over elapsed time) is unaffected by its shorter length.
 const HEADING_WINDOW: usize = 3;
 
 /// Prediction decorator: wraps a real stabilizer and appends a short
 /// extrapolated tail past the real tip, so ink appears ahead of the pen and
 /// hides the residual pen-to-pixel latency.
 ///
-/// The predicted points live in `stabilized()` **and** in the buffer
-/// [`find_divergence`] diffs, so the engine's existing rewind rewrites them
+/// The predicted points live in `stabilized()` **and** in the polyline
+/// [`DivergenceDiff`] diffs, so the engine's existing rewind rewrites them
 /// every frame: no separate render target, no parallel path. The predicted
-/// count is held constant once established, so the combined polyline only ever
-/// grows-by-one + reshapes: the cases `find_divergence` already handles.
+/// count is constant once engaged, so the combined polyline grows as the
+/// inner's does (by any number of vertices per push under resampling) and
+/// reshapes: both cases the diff handles.
 ///
 /// Only constructed when a real stabilizer is active (strength > 0) and a
 /// look-ahead horizon is configured (> 0); see the engine's stroke-start path
@@ -192,66 +246,32 @@ pub struct PredictingStabilizer {
     inner: Box<dyn StabilizerAlgorithm>,
     /// Real + predicted polyline: what `stabilized()` returns.
     combined: Vec<PaintInformation>,
-    /// `combined` positions from the previous push (divergence diff input).
-    prev_positions: Vec<[f32; 2]>,
+    /// Rendered positions of `combined` (divergence diff input).
+    diff: DivergenceDiff,
     /// Look-ahead horizon in seconds (converted from the ms port value).
     horizon_secs: f32,
-    /// Predicted point count, fixed once prediction engages. `None` while
-    /// ramping up (too few real samples for a stable heading / Δt).
-    held_count: Option<usize>,
 }
 
 impl PredictingStabilizer {
-    /// Wrap `inner` with prediction over a `horizon_ms` millisecond look-ahead.
-    pub fn new(inner: Box<dyn StabilizerAlgorithm>, horizon_ms: f32) -> Self {
+    /// Wrap `inner` with prediction over a `horizon_ms` millisecond
+    /// look-ahead, treating moves under `epsilon` canvas px as unchanged.
+    pub fn new(inner: Box<dyn StabilizerAlgorithm>, horizon_ms: f32, epsilon: f32) -> Self {
         Self {
             inner,
             combined: Vec::with_capacity(256),
-            prev_positions: Vec::with_capacity(256),
+            diff: DivergenceDiff::new(epsilon),
             horizon_secs: (horizon_ms / 1000.0).max(0.0),
-            held_count: None,
         }
     }
 
-    /// The held predicted-point count. Establishes it once, on the first
-    /// frame with enough real samples and a measurable cadence, from the
-    /// horizon and the recent mean Δt; returns 0 while still ramping.
-    ///
-    /// `self.combined[..real_len]` holds the real polyline at call time (the
-    /// predicted tail has not been appended yet).
-    fn resolve_count(&mut self, real_len: usize) -> usize {
-        if let Some(n) = self.held_count {
-            return n;
+    /// Predicted points this decorator appends once engaged: none when the
+    /// horizon is off.
+    fn predicted_points(&self) -> usize {
+        if self.horizon_secs > 0.0 {
+            PREDICTED_POINTS
+        } else {
+            0
         }
-        // Horizon 0 → prediction off; the decorator is a transparent
-        // pass-through of the inner result (never latched to a nonzero count).
-        if self.horizon_secs <= 0.0 {
-            return 0;
-        }
-        if real_len < MIN_REAL_FOR_PREDICTION {
-            return 0;
-        }
-        let mean_dt = self.recent_mean_dt(real_len);
-        if mean_dt <= 0.0 {
-            return 0;
-        }
-        // N predicted samples span the configured *time* horizon at the
-        // current sample cadence: a time horizon, not a fixed dab count, so
-        // the predicted distance auto-scales with pen speed.
-        let n = (self.horizon_secs / mean_dt).round() as usize;
-        let n = n.clamp(1, MAX_PREDICTED_POINTS);
-        self.held_count = Some(n);
-        n
-    }
-
-    /// Mean inter-sample Δt over the last `HEADING_WINDOW` real segments.
-    fn recent_mean_dt(&self, real_len: usize) -> f32 {
-        let k = HEADING_WINDOW.min(real_len - 1);
-        if k == 0 {
-            return 0.0;
-        }
-        let dt = self.combined[real_len - 1].time - self.combined[real_len - 1 - k].time;
-        dt / k as f32
     }
 
     /// Append `n` extrapolated points past the real tip. Reads the real
@@ -271,10 +291,16 @@ impl PredictingStabilizer {
             return;
         }
         let heading = [dx / dist, dy / dist];
-        // Per-point step = the recent smoothed per-sample displacement. This
-        // makes the predicted distance speed-proportional by construction,
-        // whatever the sample rate.
-        let step = dist / k as f32;
+        // The tail spans the horizon at the recent pen speed, so the
+        // predicted distance is speed-proportional whatever the vertex
+        // spacing or input cadence. Without a measurable elapsed time, fall
+        // back to the mean per-vertex displacement.
+        let dt = tip.time - base.time;
+        let step = if dt > 0.0 {
+            self.horizon_secs * (dist / dt) / n as f32
+        } else {
+            dist / k as f32
+        };
 
         // Curvature/reversal damping pulls the tail toward the tip rather
         // than removing points: kills the reversal "whisker" and keeps the
@@ -312,11 +338,6 @@ impl PredictingStabilizer {
 
 impl StabilizerAlgorithm for PredictingStabilizer {
     fn push(&mut self, point: PaintInformation) -> StabilizeResult {
-        // Save previous combined positions for the divergence diff.
-        self.prev_positions.clear();
-        self.prev_positions
-            .extend(self.combined.iter().map(|p| p.pos));
-
         // Advance the inner (real) stabilizer, then rebuild the combined
         // polyline from its relaxed output.
         self.inner.push(point);
@@ -324,20 +345,17 @@ impl StabilizerAlgorithm for PredictingStabilizer {
         self.combined.extend_from_slice(self.inner.stabilized());
         let real_len = self.combined.len();
 
-        // Append the predicted extension (held count; 0 while ramping).
-        let n = self.resolve_count(real_len);
-        if n > 0 {
+        // Append the predicted extension once enough real vertices exist.
+        let n = self.predicted_points();
+        if n > 0 && real_len >= MIN_REAL_FOR_PREDICTION {
             self.append_prediction(real_len, n);
         }
 
         // Divergence over the FULL combined polyline (not the inner's
         // real-only result), with the widened window, which is what makes the
         // existing rewind rewrite the predicted tail every frame.
-        let divergence_index = find_divergence(
-            &self.combined,
-            &self.prev_positions,
-            self.max_divergence_window(),
-        );
+        let window = self.max_divergence_window();
+        let divergence_index = self.diff.update(&self.combined, window);
         StabilizeResult { divergence_index }
     }
 
@@ -349,14 +367,13 @@ impl StabilizerAlgorithm for PredictingStabilizer {
     /// checkpoint ring spaces its snapshots deep enough to rewind over the
     /// predicted region and the engine's coverage assert still holds.
     fn max_divergence_window(&self) -> usize {
-        self.inner.max_divergence_window() + self.held_count.unwrap_or(0)
+        self.inner.max_divergence_window() + self.predicted_points()
     }
 
     fn clear(&mut self) {
         self.inner.clear();
         self.combined.clear();
-        self.prev_positions.clear();
-        self.held_count = None;
+        self.diff.clear();
     }
 }
 
@@ -430,6 +447,43 @@ impl StabilizerRegistry {
                 );
                 Box::new(PassThrough::new())
             })
+    }
+}
+
+/// Build the stabilizer stack a stroke runs through: the configured
+/// algorithm fed by a [`ResamplingStabilizer`], wrapped in prediction when a
+/// look-ahead horizon is set.
+///
+/// `canvas_per_css_px` is the canvas pixels one CSS pixel of pen travel spans
+/// at the stroke's view (`device_pixel_ratio / zoom`). The resample spacing
+/// and the divergence epsilon are both scaled by it, so the smoothing reach
+/// and what counts as a move are the same on screen at every zoom and pixel
+/// ratio. Decorators engage only over an algorithm that can reshape rendered
+/// vertices (`max_divergence_window() > 0`).
+pub fn stroke_stabilizer_stack(
+    registry: &StabilizerRegistry,
+    config: &StabilizerConfig,
+    prediction_horizon_ms: f32,
+    canvas_per_css_px: f32,
+) -> Box<dyn StabilizerAlgorithm> {
+    let inner = registry.create_from_config(config);
+    if inner.max_divergence_window() == 0 {
+        return inner;
+    }
+    let epsilon = DIVERGENCE_EPSILON * canvas_per_css_px;
+    let inner = Box::new(ResamplingStabilizer::new(
+        inner,
+        RESAMPLE_SPACING_CSS_PX * canvas_per_css_px,
+        epsilon,
+    ));
+    if prediction_horizon_ms > 0.0 {
+        Box::new(PredictingStabilizer::new(
+            inner,
+            prediction_horizon_ms,
+            epsilon,
+        ))
+    } else {
+        inner
     }
 }
 
@@ -539,6 +593,50 @@ mod tests {
         assert!(types.iter().any(|(id, _, _)| *id == "laplacian"));
     }
 
+    // ── Stroke stabilizer stack ─────────────────────────────────────────
+
+    fn laplacian_config(strength: f32) -> StabilizerConfig {
+        StabilizerConfig {
+            algorithm: "laplacian".into(),
+            params: vec![ParamValue::Float(strength)],
+        }
+    }
+
+    /// Distance from the raw corner (40, 0) of an L path to the nearest
+    /// stabilized vertex, with the path sampled every `step` px.
+    fn l_corner_cut(step: f32) -> f32 {
+        let mut stab =
+            stroke_stabilizer_stack(&StabilizerRegistry::new(), &laplacian_config(0.8), 0.0, 1.0);
+        let n = (40.0 / step).round() as usize;
+        for i in 0..=n {
+            stab.push(mk(i as f32 * step, 0.0, 0.0));
+        }
+        for i in 1..=n {
+            stab.push(mk(40.0, i as f32 * step, 0.0));
+        }
+        stab.stabilized()
+            .iter()
+            .map(|p| dist(p.pos, [40.0, 0.0]))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Regression: the same path smooths the same whatever the pointer event
+    /// rate. The Laplacian's reach is a count of vertices, so dense raw input
+    /// (a high event rate, or a slow pen) used to shrink it to almost nothing.
+    #[test]
+    fn same_path_at_1x_and_8x_density_gives_the_same_geometry() {
+        let sparse = l_corner_cut(10.0);
+        let dense = l_corner_cut(1.25);
+        assert!(
+            sparse > 3.0 && dense > 3.0,
+            "the corner must be smoothed at both densities: sparse {sparse}, dense {dense}"
+        );
+        assert!(
+            (sparse - dense).abs() < 0.05,
+            "corner cut must not depend on sample density: sparse {sparse}, dense {dense}"
+        );
+    }
+
     // ── PredictingStabilizer ────────────────────────────────────────────
 
     /// A pen sample at position `(x, y)` and timestamp `t` (seconds).
@@ -571,7 +669,7 @@ mod tests {
     #[test]
     fn prediction_extends_tip_on_straight_stroke() {
         // 30ms horizon, samples 10px / 10ms apart ⇒ N = round(30/10) = 3.
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
         for i in 0..8 {
             stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
         }
@@ -599,7 +697,7 @@ mod tests {
     /// predicted tail is rewritten to follow the turn (self-correction).
     #[test]
     fn prediction_self_corrects_via_combined_divergence() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
         for i in 0..8 {
             stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
         }
@@ -635,7 +733,7 @@ mod tests {
     /// tip (no overshoot whisker) while keeping the point count constant.
     #[test]
     fn reversal_collapses_predicted_tail() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
         // Rightward…
         for i in 0..6 {
             stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
@@ -664,7 +762,7 @@ mod tests {
     /// divergence result match a bare inner stabilizer, frame for frame.
     #[test]
     fn horizon_zero_is_transparent() {
-        let mut pred = PredictingStabilizer::new(laplacian_inner(0.5), 0.0);
+        let mut pred = PredictingStabilizer::new(laplacian_inner(0.5), 0.0, DIVERGENCE_EPSILON);
         let mut bare = laplacian_inner(0.5);
         for i in 0..8 {
             let p = mk(i as f32 * 10.0, (i as f32).sin() * 5.0, i as f32 * 0.01);
@@ -679,29 +777,43 @@ mod tests {
         }
     }
 
-    /// T-H: with several real samples per frame (a high-Hz burst), the
-    /// per-point predicted step tracks the measured per-sample displacement,
-    /// not a fixed per-frame step: the guard against "one sample = one frame".
+    /// Regression: on fixed-spacing input the predicted tail spans the
+    /// horizon at the current pen speed, with a constant point count. A
+    /// cadence-derived count and a per-vertex step would freeze the tail at
+    /// `count x spacing` whatever the speed.
     #[test]
-    fn predicted_step_tracks_per_sample_displacement() {
-        // 240Hz-ish burst: 5px apart, ~4-5ms apart (unequal Δt), 40ms horizon.
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 40.0);
-        let times = [0.0, 0.004, 0.009, 0.013, 0.018, 0.022, 0.027];
-        for (i, &t) in times.iter().enumerate() {
-            stab.push(mk(i as f32 * 5.0, 0.0, t));
-        }
-        // Predicted points are the ones past the last real point (x = 30).
-        let preds: Vec<_> = stab
-            .stabilized()
-            .iter()
-            .filter(|p| p.pos[0] > 30.0 + 1e-3)
-            .collect();
-        assert!(preds.len() >= 2, "expected a multi-point predicted tail");
-        let spacing = preds[1].pos[0] - preds[0].pos[0];
+    fn prediction_on_fixed_spacing_spans_horizon_at_current_speed() {
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
+        // 6 px vertices: 500 px/s for 12 vertices, then 2000 px/s.
+        let (mut x, mut t) = (0.0f32, 0.0f32);
+        let mut tail_at = |stab: &mut PredictingStabilizer, speed: f32, n: usize| {
+            let mut tail = 0.0;
+            for _ in 0..n {
+                x += 6.0;
+                t += 6.0 / speed;
+                stab.push(mk(x, 0.0, t));
+                let pts = stab.stabilized();
+                let real = (x / 6.0).round() as usize;
+                if real >= MIN_REAL_FOR_PREDICTION {
+                    assert_eq!(
+                        pts.len(),
+                        real + PREDICTED_POINTS,
+                        "constant predicted count"
+                    );
+                }
+                tail = pts.last().unwrap().pos[0] - x;
+            }
+            tail
+        };
+        let slow = tail_at(&mut stab, 500.0, 12);
+        let fast = tail_at(&mut stab, 2000.0, 12);
         assert!(
-            (spacing - 5.0).abs() < 1.5,
-            "predicted step {spacing} should track the ~5px per-sample \
-             displacement, not a per-frame step"
+            (slow - 15.0).abs() < 3.0,
+            "slow tail {slow}, expected ~15 px"
+        );
+        assert!(
+            (fast - 60.0).abs() < 12.0,
+            "fast tail {fast}, expected ~60 px"
         );
     }
 
@@ -710,7 +822,7 @@ mod tests {
     /// divergence never reports outside the (ramping) window.
     #[test]
     fn stroke_start_ramps_without_breaking_growth() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
         let mut prev_len = 0usize;
         for i in 0..12 {
             let r = stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));

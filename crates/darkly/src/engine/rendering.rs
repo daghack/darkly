@@ -84,6 +84,7 @@ impl DarklyEngine {
         mirror_h: bool,
         screen_w: f32,
         screen_h: f32,
+        dpr: f32,
     ) {
         let rotation_changed = self.view_params.rotation != rotation;
         self.view_params = ViewParams {
@@ -94,6 +95,7 @@ impl DarklyEngine {
             mirror_h,
             screen_w,
             screen_h,
+            dpr,
         };
         self.rebuild_view_transform();
         // The cursor-preview mask was baked with the old view rotation;

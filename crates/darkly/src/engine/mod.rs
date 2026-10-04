@@ -674,6 +674,11 @@ pub struct DarklyEngine {
     /// via `test_stroke_full_rerender_events`.
     pub(crate) brush_full_rerender_events: u32,
 
+    /// Checkpoint rewinds attempted during this stroke: every event whose
+    /// stabilizer reported a divergence behind the already-rendered tip.
+    /// Surfaced via `test_stroke_rewind_events`.
+    pub(crate) brush_rewind_events: u32,
+
     /// Snapshot of `brush_perf` taken on the last `drain_brush_perf_delta`
     /// call. Subtracted from the current accumulator on each drain to
     /// produce a per-interval delta. Reset to default at `begin_stroke`
@@ -824,6 +829,7 @@ impl DarklyEngine {
             layer_growth_capped: false,
             brush_perf: BrushPerfCounters::default(),
             brush_full_rerender_events: 0,
+            brush_rewind_events: 0,
             last_brush_perf: BrushPerfCounters::default(),
             last_frame_phases: FrameRenderPhases::default(),
             recorder: ProcessRecorder::new(),
@@ -1395,6 +1401,13 @@ impl DarklyEngine {
     /// a stroke.
     pub fn test_stroke_full_rerender_events(&self) -> u32 {
         self.brush_full_rerender_events
+    }
+
+    /// Count of checkpoint rewinds (restore attempts) during the most
+    /// recent stroke. An unstabilized stroke never diverges, so it must
+    /// read zero.
+    pub fn test_stroke_rewind_events(&self) -> u32 {
+        self.brush_rewind_events
     }
 
     /// Total dabs placed during the most recent stroke. `brush_perf` is

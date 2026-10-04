@@ -246,7 +246,7 @@ pub struct DabBatch {
     /// Terminal-private per-dab CPU meta, packed by `evaluate_gpu` in
     /// lockstep with [`Self::bytes`] and drained by the terminal's
     /// `flush_dabs` hook. Used by terminals that need CPU-side state per
-    /// dab at flush time: the per-dab-feedback terminals (`smudge`,
+    /// dab at flush time: the per-dab-feedback terminals (`blur`,
     /// `liquify`) drive mirror-snapshot copies from it, and a
     /// dispatch-per-dab terminal (`paint`) sizes each dab's dispatch
     /// grid from it, neither re-deriving footprints from GPU memory.
@@ -293,7 +293,7 @@ pub struct DabBatch {
 
 impl DabBatch {
     /// Pack one dab record for the active compiled brush into [`Self::bytes`]
-    /// and bump [`Self::count`]. Every terminal (paint, watercolor, smudge,
+    /// and bump [`Self::count`]. Every terminal (paint, watercolor, blur,
     /// liquify) calls this from its `evaluate_gpu` after computing the
     /// per-dab geometry; the WGSL terminal reinterprets the bytes via its
     /// dab layout at flush time.
@@ -681,8 +681,8 @@ impl<'a> BrushGpuContext<'a> {
     /// The write region is the dab footprint (`position ± write_half`);
     /// the read region is the scratch-mirror snapshot footprint
     /// (`position ± read_half`). Read must be at least as large as write,
-    /// but a brush that samples the scratch at an offset (smudge: per-dab
-    /// `−motion`; clone: a stroke-scoped anchor) sizes the read region
+    /// but a brush that samples the scratch at an offset (blur: its kernel
+    /// reach; clone: a stroke-scoped anchor) sizes the read region
     /// wider so the offset sample always lies inside the snapshot. For a
     /// symmetric dab pass equal write/read halves (e.g. `radius`,
     /// `radius`, `radius`, `radius`).

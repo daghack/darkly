@@ -206,8 +206,8 @@ pub struct BrushGraphCapabilities {
     /// Iconify icon to show in the dab slot in place of a baked thumbnail,
     /// contributed by the first node that stages its preview (its
     /// evaluator's [`eval::BrushNodeEvaluator::preview_staging`]):
-    /// content-dependent nodes (clone, blur, smudge, liquify, the live
-    /// canvas sampler) whose still-dab bake renders blank.
+    /// content-dependent nodes (clone, blur, liquify, the live canvas
+    /// sampler) whose still-dab bake renders blank.
     pub preview_fallback_icon: Option<&'static str>,
     /// Field the stroke preview is rendered over, from the same declaration
     /// the icon comes from. [`PreviewBackdrop::Flat`] for a brush that deposits

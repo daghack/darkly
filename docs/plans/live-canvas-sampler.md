@@ -336,6 +336,22 @@ Material discoveries made while implementing, in the order they arose.
 9. **Bench**: `paint`, `pencil` and `dry-smudge` were run in one session;
    the Pencil is the fair baseline (same dial and spacing). Results are in
    `docs/paint-compute-perf-tracking.md` attempt #9.
+10. **The Dry Smudge became the Smudge, and the `smudge` terminal is
+    gone.** Trying the brush showed the live sampler at full build-up to
+    be the smudge worth keeping, and the dry-media specialisation (the
+    paper-grain chain, the wash dial, a second smudge in a second pack)
+    to be more than one step. `smudge.yaml` is now the sampler graph with
+    `paint.buildup` left at its default of 1 and not exposed, a plain
+    fingertip disc on the tip, one Strength dial into `build_flow`, and
+    opacity; `dry_smudge.yaml` is deleted and the Dry Media pack lists
+    four brushes. With no shipped brush on it, the `smudge` terminal
+    (`nodes/smudge.rs`, `tests/smudge.rs`, `tests/preview_smudge.rs`,
+    the equivalence test here) is deleted, which was this plan's recorded
+    follow-up; the read-mirror infrastructure stays for `blur` and
+    `liquify`. The bench's `smudge` topology now means the sampler on
+    `paint`. A smudge that tells pigment from paper (sampling and
+    depositing against the editor's primary and secondary colours) is
+    the next step, on this simpler base.
 
 This plan replaces an earlier draft of the same name whose design (a
 serialized one-dab-per-render-pass flush inside `paint`, with a
@@ -385,6 +401,8 @@ Two mechanisms are new, both generic:
 Ships with `crates/darkly/brushes/dry_smudge.yaml`. `smudge.yaml` and the
 `smudge` terminal are untouched; deleting `smudge` and `blur` once this
 capability exists is the follow-up the perf doc already lists.
+(Implementation note 10: the Dry Smudge has since become `smudge.yaml` and
+the `smudge` terminal is deleted.)
 
 Where the size comes from: an earlier draft of this plan was smaller
 because a `buildup == 1` restriction let a raw copy of one ground stand in

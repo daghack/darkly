@@ -879,14 +879,16 @@ two `set_bind_group(1)` and two dispatches, against one bind and one
 dispatch for a brush that samples nothing (group 0 is shared by the two
 pipelines' layouts and stays bound; groups 2 and 3 are outside the
 snapshot's layout and stay bound). `dispatches/ev` counts both, so it reads
-`2 * dabs/ev` for the Dry Smudge.
+`2 * dabs/ev` for the Smudge.
 
 **Measurements, on this machine** (Intel Raptor Lake-P iGPU, Mesa
 26.2.3), the recorded curvy stroke at `stabilize = 1`, native, realtime
 pacing, one session at `ce9622df` plus the change
 (`bench-results/stroke-replay-matrix-{paint,pencil,dry-smudge}-recorded_curvy_stroke-ce9622df0e.md`).
-The Pencil is the fair baseline: the Dry Smudge runs its dial (`buildup
-0.1`, two grounds) and its spacing (0.03). The two brushes' pressure-to-size
+The Pencil is the fair baseline: the Dry Smudge as measured ran its dial
+(`buildup 0.1`, two grounds) and its spacing (0.03). That brush has since
+become the shipped Smudge at full build-up (one ground, the dial hidden),
+which does strictly less work per thread than these rows. The two brushes' pressure-to-size
 curves differ, so at 100 px and above their dab counts differ and the rows
 compare per event only.
 
@@ -1073,13 +1075,12 @@ before each dab that renders the stroke's appearance under the dab's read
 region into a mirror the dab samples. That is one extra dispatch per dab,
 about 1.5 us of marginal cost on this machine, against the old framing's
 one render pass and one copy per dab (about 40 us, the read-mirror
-terminals' shape). The Dry Smudge is built this way, with every `paint`
-law and the full dial.
+terminals' shape). The Smudge is built this way, on every `paint` law at
+full build-up, and the `smudge` terminal is gone.
 
-What remains is the follow-up: delete the `smudge` and `blur` terminals in
-favour of samplers on `paint`, and move watercolor's pickup onto the same
-mechanism. Liquify warps rather than deposits, so it is a different
-question. The browser's per-call cost for the doubled dispatches is
+What remains is the follow-up: delete the `blur` terminal in favour of a
+sampler on `paint`, and move watercolor's pickup onto the same mechanism.
+Liquify warps rather than deposits, so it is a different question. The browser's per-call cost for the doubled dispatches is
 unmeasured (#9).
 
 ### F. Dispatch-per-dab on a resident storage scratch: B.1 revisited, *stages 1 and 2 passed*

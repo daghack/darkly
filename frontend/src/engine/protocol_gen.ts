@@ -85,9 +85,10 @@ export type BrushGraphCapabilities = {
 supports_erase: boolean, 
 /**
  * Iconify icon to show in the dab slot in place of a baked thumbnail,
- * contributed by the first node whose registration declares
- * `preview_staging`: content-dependent nodes (clone, blur, smudge,
- * liquify) whose still-dab bake renders blank.
+ * contributed by the first node that stages its preview (its
+ * evaluator's [`eval::BrushNodeEvaluator::preview_staging`]):
+ * content-dependent nodes (clone, blur, liquify, the live canvas
+ * sampler) whose still-dab bake renders blank.
  */
 preview_fallback_icon: string | null, 
 /**
@@ -620,7 +621,7 @@ is_terminal: boolean,
 /**
  * Whether this terminal honours erase mode (paint vs. erase).
  * Defaults `true`; smear/displace terminals that sample existing
- * pixels (smudge, watercolor, liquify) override to `false` so the
+ * pixels (blur, watercolor, liquify) override to `false` so the
  * brush-tool options bar hides the erase toggle.
  */
 supports_erase: boolean, 

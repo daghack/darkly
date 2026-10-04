@@ -558,7 +558,7 @@ export function registerActions() {
                 app.activeToolId = 'brush';
             }
             // No-op when the active brush's terminal opts out of erase
-            // (smudge, liquify, watercolor). Same reason the BrushOptions
+            // (blur, liquify, watercolor). Same reason the BrushOptions
             // toggle is hidden: flipping `gpu.blend_mode` would do
             // nothing, so the hotkey should match the visible UI.
             if (!brushGraph.supportsErase) {

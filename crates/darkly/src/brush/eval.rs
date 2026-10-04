@@ -409,7 +409,7 @@ pub trait BrushNodeEvaluator: Send + Sync {
     /// modes.
     ///
     /// Terminals that sample scratch / atlas in their stroke body
-    /// (watercolor's pickup atlas, smudge / liquify's `scratch_mirror`)
+    /// (watercolor's pickup atlas, blur / liquify's `scratch_mirror`)
     /// override this to emit a body that doesn't need those bindings:
     /// typically a neutral-color mask of the brush footprint. Only the
     /// `body` field of the returned `NodeWgsl` is consumed; decls /
@@ -1207,7 +1207,7 @@ impl BrushGraphRunner {
     /// The prologue is driven by the [`crate::brush::node::Lifecycle`]
     /// each node's registration declares: clearing the scratch to
     /// transparent (paint, watercolor) or seeding it from the
-    /// pre-stroke snapshot (smudge, liquify). This lives here, not in
+    /// pre-stroke snapshot (blur, liquify). This lives here, not in
     /// each terminal's `begin_stroke`, so adding a new terminal can't
     /// silently drift from the established lifecycles. The pending-dab
     /// queue is also reset here for the same reason: every terminal
@@ -1353,7 +1353,7 @@ impl BrushGraphRunner {
     /// Read the terminal's most recently published `dab_size` as a
     /// `(width, height)` pair of canvas pixels, or `None` if the graph
     /// has no terminal that publishes one yet. Each terminal owns the
-    /// unit of dab_size it returns: paint/watercolor/smudge/liquify
+    /// unit of dab_size it returns: paint/watercolor/blur/liquify
     /// all return the disc diameter for stroke spacing. The stroke
     /// engine uses this to size both dab spacing and save-point bboxes.
     ///

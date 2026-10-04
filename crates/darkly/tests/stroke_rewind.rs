@@ -301,7 +301,7 @@ fn lay_stripes(engine: &mut DarklyEngine, layer: LayerId, canvas: (u32, u32), br
     set_input(engine, "brush_settings", "stabilize", 0.0);
 }
 
-/// The recorded stroke through the Dry Smudge over a striped layer: every
+/// The recorded stroke through the Smudge over a striped layer: every
 /// rewind restores the grounds and the next dab's appearance snapshot
 /// reads them back, and the appearance mirror itself is never
 /// checkpointed, so a mirror texel a dab read without refreshing it shows
@@ -310,13 +310,13 @@ fn lay_stripes(engine: &mut DarklyEngine, layer: LayerId, canvas: (u32, u32), br
 fn live_sampler_rewinds_match_full_rerender() {
     let canvas = (1024, 512);
     let cell = Cell {
-        brush: "Dry Smudge",
+        brush: "Smudge",
         buildup: None,
         canvas,
         crop: None,
     };
     cell.assert_matches_oracle(|engine, layer| {
-        lay_stripes(engine, layer, canvas, "Dry Smudge");
+        lay_stripes(engine, layer, canvas, "Smudge");
         replay_recording(engine, layer, canvas);
     });
 }

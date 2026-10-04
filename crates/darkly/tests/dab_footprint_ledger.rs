@@ -9,10 +9,10 @@
 //! then cleared pixels outside the CPU bbox while restoring only into it,
 //! visibly truncating earlier dabs into a square as the artist kept painting.
 //!
-//! `smudge` gives a reachable instance. Its `read_half` early-outs on a
-//! stationary dab, and `advance_dab_motion` reports zero motion for the first
-//! dab of a stroke (there is no previous dab position yet), so that dab issues
-//! no pass and writes no pixels. A dab that wrote nothing must claim no damage.
+//! `liquify` gives a reachable instance. Its `read_half` early-outs on a dab
+//! that has travelled no distance, and the first dab of a stroke has travelled
+//! none (there is no previous dab position yet), so that dab issues no pass
+//! and writes no pixels. A dab that wrote nothing must claim no damage.
 //!
 //! Run with: `cargo test -p darkly --test dab_footprint_ledger --features
 //! darkly/testing -- --test-threads=1`
@@ -59,7 +59,7 @@ fn stroke_to(engine: &mut DarklyEngine, x: f32, y: f32, time_ms: f64) {
 
 fn painted_layer(engine: &mut DarklyEngine) -> LayerId {
     let layer_id = engine.add_raster_layer(None);
-    // Smudge drags existing pigment; give it something to drag so the
+    // Liquify pushes existing pigment; give it something to push so the
     // stationary early-out is the only reason a dab could write nothing.
     set_builtin_brush(engine, "Ink Pen");
     engine.begin_stroke(layer_id).unwrap();
@@ -82,14 +82,14 @@ fn dab_that_writes_nothing_records_no_damage() {
     let mut engine = test_engine();
     let layer_id = painted_layer(&mut engine);
 
-    set_builtin_brush(&mut engine, "Smudge");
+    set_builtin_brush(&mut engine, "Liquify");
     engine.begin_stroke(layer_id).unwrap();
     stroke_to(&mut engine, 128.0, 128.0, 0.0);
 
     let bbox = engine.test_stroke_save_point_bbox();
     assert!(
         bbox.is_none_or(|r| r.is_empty()),
-        "smudge's first dab is stationary and issues no pass, so it must \
+        "liquify's first dab is stationary and issues no pass, so it must \
          record an empty footprint; got {bbox:?}. A non-empty rect here means \
          the save-point bbox was recomputed from position and radius rather \
          than taken from what the terminal published: the divergence that \
@@ -99,7 +99,7 @@ fn dab_that_writes_nothing_records_no_damage() {
     engine.end_stroke();
 }
 
-/// The complement: once the stroke moves, smudge does issue a pass, and the
+/// The complement: once the stroke moves, liquify does issue a pass, and the
 /// recorded footprint must be non-empty. Without this the test above would
 /// pass just as well against a ledger that never records anything.
 #[test]
@@ -107,7 +107,7 @@ fn dab_that_writes_records_its_footprint() {
     let mut engine = test_engine();
     let layer_id = painted_layer(&mut engine);
 
-    set_builtin_brush(&mut engine, "Smudge");
+    set_builtin_brush(&mut engine, "Liquify");
     engine.begin_stroke(layer_id).unwrap();
     stroke_to(&mut engine, 100.0, 128.0, 0.0);
     for i in 1..=8 {
@@ -116,10 +116,10 @@ fn dab_that_writes_records_its_footprint() {
 
     let bbox = engine
         .test_stroke_save_point_bbox()
-        .expect("a moving smudge stroke places dabs");
+        .expect("a moving liquify stroke places dabs");
     assert!(
         !bbox.is_empty(),
-        "a smudge dab that issued a pass must record its write footprint; \
+        "a liquify dab that issued a pass must record its write footprint; \
          got an empty rect"
     );
 

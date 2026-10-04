@@ -1,10 +1,9 @@
 //! The live canvas sampler: `clone_source` on its Live source feeding
 //! `paint`, which refreshes the stroke's appearance under each dab's read
-//! region before that dab's dispatch (the Dry Smudge).
+//! region before that dab's dispatch (the Smudge brush).
 //!
-//! Runner-level harness in the shape of `tests/smudge.rs`: explicit dabs
-//! with explicit `motion`, one `flush_dabs`, one `commit`, a readback of
-//! the layer. Each render takes the layer's plane rect and the canvas
+//! Runner-level harness: explicit dabs with explicit `motion`, one
+//! `flush_dabs`, one `commit`, a readback of the layer. Each render takes the layer's plane rect and the canvas
 //! origin, so the frame-sensitive tests run once at the origin and once on
 //! an offset layer under a cropped canvas.
 
@@ -130,13 +129,11 @@ fn set(graph: &mut Graph<BrushWireType>, node: &str, name: &str, value: f32) {
     graph.set_port_default(&id(node), name, value).unwrap();
 }
 
-/// The shipped Dry Smudge with the paper grain unwired, so the tip is the
-/// fingertip disc alone, at a radius of 20 px under full pressure.
-fn smooth_dry_smudge(softness: f32, buildup: f32, strength: f32) -> Graph<BrushWireType> {
-    let mut g = builtin("Dry Smudge");
-    g.disconnect(&port("multiply", "result"), &port("stamp", "tip"));
-    g.connect(port("circle", "mask"), port("stamp", "tip"))
-        .unwrap();
+/// The shipped Smudge at a radius of 20 px under full pressure. `buildup`
+/// is a `paint` port the brush leaves at its default of 1; tests set it to
+/// pin the laws on either side of the dial.
+fn smooth_smudge(softness: f32, buildup: f32, strength: f32) -> Graph<BrushWireType> {
+    let mut g = builtin("Smudge");
     set(&mut g, "circle", "softness", softness);
     set(&mut g, "paint", "buildup", buildup);
     set(&mut g, "user_input", "value", strength);
@@ -269,14 +266,16 @@ fn centre(x: u32, y: u32) -> [f32; 2] {
 
 // ── Compile ─────────────────────────────────────────────────────────────
 
-/// The Dry Smudge plus an `image` on the tip compiles with a baked, a
-/// named and a live slot, reads the stroke appearance, and samples it only
-/// in the stroke module; the clone brush and a plain disc do not read it;
-/// and an instanced terminal cannot host it.
+/// The Smudge plus a `noise` grain and an `image` on the tip compiles with
+/// a baked, a named and a live slot, reads the stroke appearance, and
+/// samples it only in the stroke module; the clone brush and a plain disc
+/// do not read it; and an instanced terminal cannot host it.
 #[test]
 fn live_sampler_compiles_beside_baked_noise_and_image() {
     let reg = darkly::brush::registry();
-    let mut g = builtin("Dry Smudge");
+    let mut g = builtin("Smudge");
+    let noise = g.add_node("noise", reg.get("noise").unwrap().ports.clone());
+    let grain = g.add_node("multiply", reg.get("multiply").unwrap().ports.clone());
     let image = g.add_node("image", reg.get("image").unwrap().ports.clone());
     g.set_port_value(&image, "texture_name", InputValue::String("paper".into()))
         .unwrap();
@@ -286,9 +285,10 @@ fn live_sampler_compiles_beside_baked_noise_and_image() {
         node: node.clone(),
         port: port.into(),
     };
-    g.disconnect(&port("multiply", "result"), &port("stamp", "tip"));
-    g.connect(port("multiply", "result"), at(&paper, "a"))
-        .unwrap();
+    g.disconnect(&port("circle", "mask"), &port("stamp", "tip"));
+    g.connect(port("circle", "mask"), at(&grain, "a")).unwrap();
+    g.connect(at(&noise, "value"), at(&grain, "b")).unwrap();
+    g.connect(at(&grain, "result"), at(&paper, "a")).unwrap();
     g.connect(at(&image, "color"), at(&split, "color")).unwrap();
     g.connect(at(&split, "luminance"), at(&paper, "b")).unwrap();
     g.connect(at(&paper, "result"), port("stamp", "tip"))
@@ -329,7 +329,7 @@ fn live_sampler_compiles_beside_baked_noise_and_image() {
     }
 
     // Re-terminated in an instanced terminal that takes a colour.
-    let mut g = builtin("Dry Smudge");
+    let mut g = builtin("Smudge");
     g.remove_node(&id("paint")).unwrap();
     let wc = g.add_node("watercolor", reg.get("watercolor").unwrap().ports.clone());
     let at = |port: &str| PortRef {
@@ -359,7 +359,7 @@ fn live_sampler_compiles_beside_baked_noise_and_image() {
 #[test]
 fn sampler_reads_through_the_snapshot_not_the_racing_ground() {
     let pre = ramp();
-    let graph = smooth_dry_smudge(0.0, 1.0, 1.0);
+    let graph = smooth_smudge(0.0, 1.0, 1.0);
     let (c1, c2, m) = ([64.0, 64.0], [70.0, 64.0], [3.0, 0.0]);
     for frame in FRAMES {
         let one = render(&graph, frame, &pre, &[(c1, m)]);
@@ -407,7 +407,7 @@ fn sampler_reads_through_the_snapshot_not_the_racing_ground() {
 #[test]
 fn second_dab_reads_first_dabs_deposit() {
     let pre = two_tone();
-    let graph = smooth_dry_smudge(0.4, 1.0, 0.85);
+    let graph = smooth_smudge(0.4, 1.0, 0.85);
     let dab1 = ([60.0, 64.0], [30.0, 0.0]);
     let dab2 = ([90.0, 64.0], [30.0, 0.0]);
     let both = render(&graph, ORIGIN, &pre, &[dab1, dab2]);
@@ -419,55 +419,6 @@ fn second_dab_reads_first_dabs_deposit() {
 }
 
 // ── The laws ────────────────────────────────────────────────────────────
-
-/// At full build-up on an opaque canvas the chain is the `smudge`
-/// terminal's `mix(bg, src, rate * mask)`: the same three moving dabs
-/// through the shipped Smudge and through the sampler with the same disc
-/// agree everywhere.
-///
-/// Tolerance: the smudge side rounds a straight RGBA8 scratch once per
-/// dab; the paint side rounds the appearance in the snapshot and the
-/// premultiplied rgb and alpha of the ground separately, so each dab
-/// differs by up to one LSB, three dabs by three; bilinear filtering of
-/// differently rounded values on both sides and the commit's own rounding
-/// bound it at five, and six is that rounded up.
-#[test]
-fn matches_the_smudge_terminal_at_full_buildup() {
-    let pre = two_tone();
-    let dabs = [
-        ([40.0, 64.0], [8.0, 0.0]),
-        ([48.0, 64.0], [8.0, 0.0]),
-        ([56.0, 64.0], [8.0, 0.0]),
-    ];
-    let mut smudge = builtin("Smudge");
-    let term = darkly::brush::find_terminal(&smudge).unwrap();
-    smudge.set_port_default(&term, "rate", 0.6).unwrap();
-    smudge.set_port_default(&term, "opacity", 1.0).unwrap();
-    set(&mut smudge, "circle", "softness", 0.4);
-    let settings = darkly::brush::nodes::brush_settings::node_id(&smudge).unwrap();
-    smudge
-        .set_port_default(&settings, "size", RADIUS * 2.0 / 512.0)
-        .unwrap();
-    let reference = render(&smudge, ORIGIN, &pre, &dabs);
-    let sampler = render(&smooth_dry_smudge(0.4, 1.0, 0.6), ORIGIN, &pre, &dabs);
-
-    let mut worst = 0;
-    let mut moved = 0;
-    for y in 0..SIDE {
-        for x in 0..SIDE {
-            let (a, b) = (pixel(&reference.layer, x, y), pixel(&sampler.layer, x, y));
-            for c in 0..4 {
-                worst = worst.max((a[c] as i32 - b[c] as i32).abs());
-            }
-            moved += usize::from(a != pixel(&pre, x, y));
-        }
-    }
-    assert!(
-        moved > 500,
-        "the reference smudge moved pigment ({moved} px)"
-    );
-    assert!(worst <= 6, "worst channel difference {worst}");
-}
 
 /// The wash refuses a repeated smear at the same pressure like the Pencil
 /// refuses a retraced line; full build-up takes it. Two dabs at one
@@ -489,7 +440,7 @@ fn wash_refuses_a_repeated_smear_like_the_pencil() {
             .sum()
     };
 
-    let wash = smooth_dry_smudge(0.4, 0.0, 0.6);
+    let wash = smooth_smudge(0.4, 0.0, 0.6);
     let once = render(&wash, ORIGIN, &pre, &[dab]);
     let twice = render(&wash, ORIGIN, &pre, &[dab, dab]);
     assert!(
@@ -501,7 +452,7 @@ fn wash_refuses_a_repeated_smear_like_the_pencil() {
         "the wash takes a repeated smear once"
     );
 
-    let build = smooth_dry_smudge(0.4, 1.0, 0.6);
+    let build = smooth_smudge(0.4, 1.0, 0.6);
     let once = render(&build, ORIGIN, &pre, &[dab]);
     let twice = render(&build, ORIGIN, &pre, &[dab, dab]);
     assert!(
@@ -527,7 +478,7 @@ fn stationary_dab_deposits_nothing() {
         }
     });
     let run = render(
-        &smooth_dry_smudge(0.4, 1.0, 1.0),
+        &smooth_smudge(0.4, 1.0, 1.0),
         ORIGIN,
         &pre,
         &[([64.0, 64.0], [0.0, 0.0])],
@@ -554,8 +505,8 @@ fn opacity_is_a_commit_time_cap() {
         ([50.0, 64.0], [6.0, 0.0]),
         ([56.0, 64.0], [6.0, 0.0]),
     ];
-    let full = render(&smooth_dry_smudge(0.4, 1.0, 0.8), ORIGIN, &pre, &dabs);
-    let mut graph = smooth_dry_smudge(0.4, 1.0, 0.8);
+    let full = render(&smooth_smudge(0.4, 1.0, 0.8), ORIGIN, &pre, &dabs);
+    let mut graph = smooth_smudge(0.4, 1.0, 0.8);
     set(&mut graph, "paint", "opacity", 0.5);
     let half = render(&graph, ORIGIN, &pre, &dabs);
     let mut moved = 0;
@@ -587,7 +538,7 @@ fn border_dab_never_reads_the_opposite_edge() {
             [128, 128, 128, 255]
         }
     });
-    let graph = smooth_dry_smudge(0.0, 1.0, 1.0);
+    let graph = smooth_smudge(0.0, 1.0, 1.0);
     for frame in FRAMES {
         let run = render(&graph, frame, &pre, &[([118.0, 64.0], [-3.25, 0.0])]);
         for y in 0..SIDE {
@@ -609,12 +560,7 @@ fn border_dab_never_reads_the_opposite_edge() {
 #[test]
 fn live_sampling_dispatches_twice_per_dab() {
     let dabs = [([40.0, 64.0], [4.0, 0.0]), ([44.0, 64.0], [4.0, 0.0])];
-    let run = render(
-        &smooth_dry_smudge(0.4, 0.1, 0.6),
-        ORIGIN,
-        &two_tone(),
-        &dabs,
-    );
+    let run = render(&smooth_smudge(0.4, 0.1, 0.6), ORIGIN, &two_tone(), &dabs);
     assert_eq!(run.perf.flushed_dabs, 2);
     assert_eq!(run.perf.dispatches, 4);
 }
@@ -649,11 +595,7 @@ fn hover_preview_is_a_neutral_footprint() {
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    let mut graph = builtin("Dry Smudge");
-    graph
-        .set_port_value(&id("clone_source"), "source", InputValue::Int(1))
-        .unwrap();
-    let mut runner = compile_graph(&graph).expect("compiles");
+    let mut runner = compile_graph(&builtin("Smudge")).expect("compiles");
     let mut ctx = BrushGpuContext {
         encoder: device.create_command_encoder(&Default::default()),
         device: &device,
@@ -700,5 +642,32 @@ fn hover_preview_is_a_neutral_footprint() {
     assert!(
         (c[0] as i32 - c[1] as i32).abs() < 5 && (c[1] as i32 - c[2] as i32).abs() < 5,
         "neutral grey: {c:?}"
+    );
+}
+
+// ── Transparency ────────────────────────────────────────────────────────
+
+/// The sampler interpolates in premultiplied space: a sample point halfway
+/// between an opaque red texel and a transparent one is red at half alpha,
+/// not dark red (lesson 2 of `docs/lessons-learned/compositing-lessons-learned.md`).
+#[test]
+fn sampler_interpolates_premultiplied_across_a_transparent_edge() {
+    let pre = canvas(|x, _| {
+        if x < 64 {
+            [255, 0, 0, 255]
+        } else {
+            [0, 0, 0, 0]
+        }
+    });
+    // A hard disc at full flow replaces the field with the sample; motion
+    // of 3.5 px puts every sample point halfway between texels.
+    let graph = smooth_smudge(0.0, 1.0, 1.0);
+    let run = render(&graph, ORIGIN, &pre, &[([70.0, 64.0], [3.5, 0.0])]);
+    // Pixel 67 samples at 63.5: half red, half transparent.
+    let got = pixel(&run.layer, 67, 64);
+    assert!(got[3] > 100 && got[3] < 156, "{got:?}");
+    assert!(
+        got[0] > 240,
+        "red must stay red at a transparent edge: {got:?}"
     );
 }

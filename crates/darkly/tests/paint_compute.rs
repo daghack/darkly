@@ -175,7 +175,7 @@ fn dispatches_count_two_per_dab_for_a_live_sampler() {
     install_builtin(&mut engine, "Ink Pen");
     let layer = engine.add_raster_layer(None);
     stroke_row(&mut engine, layer, 64.0, 12.0, 244.0, 48);
-    install_builtin(&mut engine, "Dry Smudge");
+    install_builtin(&mut engine, "Smudge");
     let _ = engine.drain_brush_perf_delta();
     stroke_row(&mut engine, layer, 60.0, 12.0, 244.0, 48);
     let perf = engine.drain_brush_perf_delta();
@@ -187,7 +187,7 @@ fn dispatches_count_two_per_dab_for_a_live_sampler() {
     );
 }
 
-/// The Dry Smudge over painted rows, through the recorded curvy stroke at
+/// The Smudge over painted rows, through the recorded curvy stroke at
 /// full stabilisation: every event rewinds through the checkpoint ring and
 /// every dab's snapshot reads the restored grounds. Two fresh engines
 /// agree byte for byte, and the smudge moved pigment.
@@ -204,7 +204,7 @@ fn live_sampler_replay_is_deterministic_and_moves_pigment() {
             stroke_row(&mut engine, layer, y as f32, 8.0, canvas.0 as f32 - 8.0, 64);
         }
         let painted = layer_pixels(&engine, layer);
-        install_builtin(&mut engine, "Dry Smudge");
+        install_builtin(&mut engine, "Smudge");
         set_input(&mut engine, "brush_settings", "stabilize", 1.0);
         let timings = replay(
             &mut engine,

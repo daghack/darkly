@@ -21,7 +21,6 @@ pub mod paint_color;
 pub mod pen_input;
 pub mod polygon;
 pub mod random;
-pub mod smudge;
 pub mod split_color;
 pub mod stamp;
 pub mod subtract;
@@ -53,7 +52,6 @@ pub fn registrations() -> Vec<BrushNodeRegistration> {
         pen_input::register(),
         polygon::register(),
         random::register(),
-        smudge::register(),
         split_color::register(),
         stamp::register(),
         subtract::register(),

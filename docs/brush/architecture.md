@@ -91,8 +91,7 @@ The engine always creates a pair of stroke-scoped textures at stroke start:
 - **`stroke_scratch_texture`** - the stroke's working surface. What it
   *means* is up to the active terminal: paint terminals fill it with
   accumulated dab contributions, warp terminals fill it with a progressively-
-  deformed copy of the layer, smudge / blur / future terminals do something
-  else.
+  deformed copy of the layer, blur / future terminals do something else.
 - **`pre_stroke_texture`** - a snapshot of the layer at stroke start. Used
   both by the engine (as the rewind source) and by terminals that need the
   untouched canvas at commit time (e.g. `color_output` blends its scratch
@@ -374,7 +373,7 @@ the compute skeleton.
   `fs_packed` entry. Applies `gpu.blend_mode` (paint / erase toggle).
 
 **The appearance mirror.** A graph that samples the stroke at other
-pixels (the canvas sampler's Live source, which the Dry Smudge feeds into
+pixels (the canvas sampler's Live source, which the Smudge feeds into
 `stamp.color`) cannot read the ground from inside the dab's dispatch: the
 thread owning the texel it reads runs in the same dispatch, and WebGPU
 orders nothing within one. Such a graph requests
@@ -552,7 +551,7 @@ ring.
 ## Warp brushes (and other non-paint terminals)
 
 Terminals that transform the layer rather than depositing pigment
-(liquify, smudge, blur, displacement, future effects) fit the system
+(liquify, blur, displacement, future effects) fit the system
 through the **same** `begin_stroke` / `evaluate_gpu` / `commit` lifecycle
 as paint, without any warp-specific code in the engine.
 
@@ -599,8 +598,8 @@ that reads the canvas the stroke is changing (a smear, a blur, a pickup)
 can be a node feeding `paint` that requests
 `LiveSource::StrokeAppearance` and reports its per-dab `read_reach`;
 `paint` then supplies the ordering, the dial, flow, pressure size,
-selection, the hover preview, the commit and undo. The Dry Smudge is
-built that way. The `smudge` and `blur` terminals predate it.
+selection, the hover preview, the commit and undo. The Smudge is built
+that way; the `blur` terminal predates it.
 
 ## Performance anchors
 

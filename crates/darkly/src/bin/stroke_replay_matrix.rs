@@ -15,7 +15,7 @@
 //!   - Builds a fresh `DarklyEngine` at the cell's canvas size.
 //!   - Loads the topology's brush (`Ink Pen` for paint-family
 //!     topologies, `Smooth Watercolor` for the watercolor topology,
-//!     `Pencil` for the mid-dial one, `Dry Smudge` for the live sampler),
+//!     `Pencil` for the mid-dial one, `Smudge` for the live sampler),
 //!     sets `brush_settings.stabilize` to
 //!     `--stabilize` (default 1.0), the `brush_settings.size` base-size
 //!     knob to the cell's dab radius, and `paint.buildup` to `--buildup`
@@ -68,7 +68,6 @@ const BRUSH_NAME_ROUGH_INK: &str = "Rough Ink";
 const BRUSH_NAME_SMUDGE: &str = "Smudge";
 const BRUSH_NAME_LIQUIFY: &str = "Liquify";
 const BRUSH_NAME_PENCIL: &str = "Pencil";
-const BRUSH_NAME_DRY_SMUDGE: &str = "Dry Smudge";
 
 /// Default stabilizer strength (`--stabilize` overrides it). The recorded
 /// stroke is what stresses the stabilizer; 1.0 maximises the rewind
@@ -93,16 +92,15 @@ enum Topology {
     /// framework; same terminal as Paint but a more elaborate upstream
     /// graph (per-dab random nodes drive the perlin silhouette).
     RoughInk,
-    /// Smudge: `pen → circle → smudge`. Per-dab fragment
-    /// pass with a `copy_texture_to_texture` barrier between dabs so
-    /// each dab reads the prior dab's writeback. Stresses the per-dab
-    /// serialization path; expected dab counts per event are tens
-    /// rather than hundreds.
+    /// Smudge: the live canvas sampler on `paint` at full build-up,
+    /// spacing 0.03. Every dab is two dispatches, the appearance
+    /// snapshot over the dab's read region and the dab, with two
+    /// pipeline switches between them.
     Smudge,
-    /// Liquify: `pen → liquify`. Per-dab warp pass with the
-    /// same barrier shape as smudge; useful for measuring how the
-    /// per-dab regime scales with displacement padding (larger read
-    /// footprint vs. smudge).
+    /// Liquify: `pen → liquify`. Per-dab warp pass with a
+    /// `copy_texture_to_texture` barrier between dabs so each dab reads
+    /// the prior dab's writeback; stresses the per-dab serialization
+    /// path, where dab counts per event are tens rather than hundreds.
     Liquify,
     /// Pencil: the mid-dial `paint` brush (`buildup: 0.1`, so the
     /// dispatch loads and stores two packed grounds per thread), spacing
@@ -110,11 +108,6 @@ enum Topology {
     /// the curve/levels chain between them. Same terminal as Paint; the
     /// regime an artist actually shades in.
     Pencil,
-    /// Dry Smudge: the live canvas sampler on `paint` at the Pencil's
-    /// dial and spacing. Every dab is two dispatches, the appearance
-    /// snapshot over the dab's read region and the dab, with two
-    /// pipeline switches between them.
-    DrySmudge,
 }
 
 impl Topology {
@@ -126,7 +119,6 @@ impl Topology {
             "smudge" => Some(Topology::Smudge),
             "liquify" => Some(Topology::Liquify),
             "pencil" => Some(Topology::Pencil),
-            "dry-smudge" | "dry_smudge" => Some(Topology::DrySmudge),
             _ => None,
         }
     }
@@ -139,7 +131,6 @@ impl Topology {
             Topology::Smudge => "smudge",
             Topology::Liquify => "liquify",
             Topology::Pencil => "pencil",
-            Topology::DrySmudge => "dry-smudge",
         }
     }
 
@@ -150,10 +141,9 @@ impl Topology {
             Topology::Paint => "paint",
             Topology::Watercolor => "watercolor",
             Topology::RoughInk => "paint",
-            Topology::Smudge => "smudge",
+            Topology::Smudge => "paint",
             Topology::Liquify => "liquify",
             Topology::Pencil => "paint",
-            Topology::DrySmudge => "paint",
         }
     }
 
@@ -165,7 +155,6 @@ impl Topology {
             Topology::Smudge => BRUSH_NAME_SMUDGE,
             Topology::Liquify => BRUSH_NAME_LIQUIFY,
             Topology::Pencil => BRUSH_NAME_PENCIL,
-            Topology::DrySmudge => BRUSH_NAME_DRY_SMUDGE,
         }
     }
 
@@ -218,7 +207,7 @@ fn parse_args() -> Args {
                 topology = Topology::parse(&v).unwrap_or_else(|| {
                     panic!(
                         "unknown topology `{v}`, expected `paint`, `watercolor`, `rough-ink`, \
-                         `smudge`, `liquify`, `pencil`, or `dry-smudge`"
+                         `smudge`, `liquify`, or `pencil`"
                     )
                 });
             }
@@ -243,16 +232,16 @@ fn parse_args() -> Args {
                 eprintln!(
                     "stroke_replay_matrix --input <path> [--output <tsv>] [--stabilize <0..1>] \
                      [--buildup <0..1>] [--gpu-sync] [--only WxH:R]... \
-                     [--topology paint|watercolor|rough-ink|smudge|liquify|pencil|dry-smudge]\n\n\
+                     [--topology paint|watercolor|rough-ink|smudge|liquify|pencil]\n\n\
                      Replays a recording across the configured (dab_radius × resolution) matrix.\n\
                      Axes are constants at the top of stroke_replay_matrix.rs; `--only` picks cells.\n\
                      `--buildup` overrides `paint.buildup`; `--gpu-sync` blocks on the device after\n\
                      every event so `cpu` includes the GPU's work.\n\
                      `paint` = Ink Pen (compiled). `watercolor` = Smooth Watercolor (compiled).\n\
                      `rough-ink` = the demo brush with the upstream random graph.\n\
-                     `smudge` / `liquify` = the read-mirror terminals, one pass per dab.\n\
-                     `pencil` = the mid-dial Pencil on `paint` (two grounds per thread, spacing 0.03).\n\
-                     `dry-smudge` = the live canvas sampler on `paint` (a snapshot dispatch per dab)."
+                     `smudge` = the live canvas sampler on `paint` (a snapshot dispatch per dab).\n\
+                     `liquify` = the read-mirror terminal, one pass per dab.\n\
+                     `pencil` = the mid-dial Pencil on `paint` (two grounds per thread, spacing 0.03)."
                 );
                 std::process::exit(0);
             }

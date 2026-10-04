@@ -75,7 +75,7 @@ pub struct Scratch {
     read_mirror_texture: wgpu::Texture,
     read_mirror_view: wgpu::TextureView,
     /// Bind group over `read_mirror_texture` using the canvas-copy BGL:
-    /// the per-dab composite shaders (`composite.wgsl`, smudge,
+    /// the per-dab composite shaders (`composite.wgsl`, blur,
     /// liquify) bind this to sample the write side without an
     /// R/W hazard.
     read_mirror_bind_group: wgpu::BindGroup,
@@ -457,7 +457,7 @@ impl Scratch {
     /// Stroke-prologue helper: copy a full-canvas pre-stroke snapshot
     /// into the write side so the eventual scratch→layer commit
     /// reproduces unchanged pixels verbatim. Used by terminals whose
-    /// commit blits the entire scratch (smudge, liquify); see
+    /// commit blits the entire scratch (blur, liquify); see
     /// [`crate::brush::node::Lifecycle::SeedScratchFromPreStroke`].
     ///
     /// Caller is responsible for confirming the source matches the

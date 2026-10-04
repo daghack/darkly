@@ -551,7 +551,7 @@ pub fn compile_brush_to_wgsl(
         // (paint's stroke and preview bodies share one source, and so does
         // every upstream node), so a non-clone brush's preview body is
         // byte-identical to its stroke body. Overrides diverge:
-        // watercolor/smudge/liquify terminals emit a neutral body that
+        // watercolor/blur/liquify terminals emit a neutral body that
         // doesn't reference their `@group(3)` bindings; `clone_source`
         // (non-terminal) emits a neutral fill instead of sampling the
         // frozen source.
@@ -821,7 +821,7 @@ pub fn pack_uniforms(
 }
 
 /// Shared compiled-brush preview render path. Sized, packed, and
-/// dispatched identically across paint / watercolor / smudge /
+/// dispatched identically across paint / watercolor / blur /
 /// liquify, the only caller-supplied difference is `effective_radius`.
 /// Rotation lives entirely in the rendered mask (via the skeleton's
 /// `theta - view_rotation` and any wired `circle.rotation_input`), so

@@ -1,6 +1,6 @@
 //! Canvas Sampler node (`clone_source`): samples the canvas at an offset
 //! from each pixel, turning the reused `paint` terminal into a clone-stamp
-//! brush (the Snapshot source) or a dry-media smudge (the Live source).
+//! brush (the Snapshot source) or a smudge (the Live source).
 //!
 //! ## Two sources
 //!
@@ -391,7 +391,10 @@ fn compile_snapshot(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
 /// hardware filter's fixed-point weights do (a dab re-rendered after the
 /// layer grew would read a different LSB), and the taps clamp to the
 /// layer's edge, so the filter never reaches the opposite edge, whose
-/// mirror texels this dab never refreshed.
+/// mirror texels this dab never refreshed. The taps are premultiplied
+/// before they are mixed and the result is returned straight: the mirror
+/// is straight alpha, and mixing straight texels across a transparent
+/// edge darkens the colour instead of thinning the coverage.
 ///
 /// Every symbol the helper names (`u`, `graph_tex_N`) is declared in both
 /// shader variants, so the shared decls compile into the preview module,
@@ -401,8 +404,12 @@ fn compile_live(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
     let live_fn = cctx.ident("clone_live");
     let motion = cctx.input("motion").as_vec2();
     let tex = format!("graph_tex_{slot}");
+    let pre_fn = cctx.ident("clone_premul");
     wgsl.decls = format!(
-        "fn {live_fn}(tp: vec2<f32>, motion: vec2<f32>) -> vec4<f32> {{\n\
+        "fn {pre_fn}(c: vec4<f32>) -> vec4<f32> {{\n\
+         \x20   return vec4<f32>(c.rgb * c.a, c.a);\n\
+         }}\n\
+         fn {live_fn}(tp: vec2<f32>, motion: vec2<f32>) -> vec4<f32> {{\n\
          \x20   if (abs(motion.x) < {STATIONARY_MOTION_PX:.6} && abs(motion.y) < {STATIONARY_MOTION_PX:.6}) {{\n\
          \x20       return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n\
          \x20   }}\n\
@@ -419,9 +426,16 @@ fn compile_live(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
          \x20   let hi = size - vec2<i32>(1);\n\
          \x20   let p0 = clamp(base, vec2<i32>(0), hi);\n\
          \x20   let p1 = clamp(base + vec2<i32>(1), vec2<i32>(0), hi);\n\
-         \x20   let top = mix(textureLoad({tex}, p0, 0), textureLoad({tex}, vec2<i32>(p1.x, p0.y), 0), w.x);\n\
-         \x20   let bottom = mix(textureLoad({tex}, vec2<i32>(p0.x, p1.y), 0), textureLoad({tex}, p1, 0), w.x);\n\
-         \x20   return mix(top, bottom, w.y);\n\
+         \x20   // The mirror is straight alpha; interpolate premultiplied so a\n\
+         \x20   // transparent neighbour dilutes coverage, not colour, then\n\
+         \x20   // return straight for the stamp.\n\
+         \x20   let top = mix({pre_fn}(textureLoad({tex}, p0, 0)), {pre_fn}(textureLoad({tex}, vec2<i32>(p1.x, p0.y), 0)), w.x);\n\
+         \x20   let bottom = mix({pre_fn}(textureLoad({tex}, vec2<i32>(p0.x, p1.y), 0)), {pre_fn}(textureLoad({tex}, p1, 0)), w.x);\n\
+         \x20   let c = mix(top, bottom, w.y);\n\
+         \x20   if (c.a <= 0.0) {{\n\
+         \x20       return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n\
+         \x20   }}\n\
+         \x20   return vec4<f32>(c.rgb / c.a, c.a);\n\
          }}\n"
     );
     wgsl.body = format!("    let {out} = {live_fn}(target_pos, {motion});\n");

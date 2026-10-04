@@ -254,8 +254,8 @@ fn watercolor_terminal_clears_scratch_to_transparent() {
 }
 
 #[test]
-fn smudge_terminal_seeds_scratch_from_pre_stroke() {
-    let rgba = run_begin_stroke(&builtin_graph("Smudge"), Setup::PreStrokeWithSentinel);
+fn blur_terminal_seeds_scratch_from_pre_stroke() {
+    let rgba = run_begin_stroke(&builtin_graph("Blur"), Setup::PreStrokeWithSentinel);
     assert_all(&rgba, SENTINEL_RGBA);
 }
 

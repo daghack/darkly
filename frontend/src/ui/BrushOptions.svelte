@@ -81,7 +81,7 @@
         app.engine?.api.setBrushBlendMode({ mode: brushSession.eraseMode ? 1 : 0 });
     }
 
-    // Brushes whose terminal doesn't honor `gpu.blend_mode` (smudge,
+    // Brushes whose terminal doesn't honor `gpu.blend_mode` (blur,
     // liquify, watercolor) report `supportsErase = false`. Reactively
     // force erase-mode off when the artist switches to one of them so the
     // session flag and the engine flag don't drift out of sync with the
@@ -183,7 +183,7 @@
 
         <!-- Erase-mode toggle. Brush-tool session state lives on the tool
              itself; this toggle just mirrors it and pushes the engine flag.
-             Hidden for brushes whose terminal opts out of erase (smudge,
+             Hidden for brushes whose terminal opts out of erase (blur,
              liquify, watercolor) via `supports_erase = false` on its node
              registration: for those brushes flipping `gpu.blend_mode`
              would do nothing, so the toggle would be a lie. -->

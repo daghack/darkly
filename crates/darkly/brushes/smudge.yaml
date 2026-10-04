@@ -36,17 +36,26 @@ nodes:
     comment: Samples the stroke one dab behind along the pen's motion
     inputs:
       source: 1
+  footprint:
+    type: multiply
+    name: Finger footprint
+    comment: The fingertip where there is something to bring; a finger that has not moved displaces nothing
   stamp:
     type: stamp
   paint:
     type: paint
-    comment: Full build-up, so every touch moves more pigment, the way a finger does
+    comment: Set to Move, so each touch swaps part of what is under the finger for what the finger brought along. A smear can thin an edge as well as thicken it
+    inputs:
+      mode: 1
 connections:
 - pen_input.position -> paint.position
 - pen_input.motion -> sampler.motion
 - pen_input.pressure -> curve.input
 - curve.output -> paint.size
 - circle.mask -> stamp.tip
+- circle.mask -> footprint.a
+- sampler.coverage -> footprint.b
+- footprint.result -> paint.coverage
 - sampler.color -> stamp.color
 - stamp.dab -> paint.rgba
 - strength.value -> paint.build_flow

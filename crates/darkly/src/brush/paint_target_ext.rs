@@ -24,7 +24,7 @@
 //! v` and `pre.r = v`, the result equals `v` exactly. Smudge/warp produce
 //! `mix(v_dst, v_src, dab.a)`: identical to a pure-R8 blend.
 
-use crate::brush::composite_pipeline::{CompositePipeline, CompositeUniforms};
+use crate::brush::composite_pipeline::{CommitLaw, CompositePipeline, CompositeUniforms};
 use crate::brush::pipeline::BrushPipelines;
 use crate::gpu::paint_target::GpuPaintTarget;
 
@@ -48,6 +48,7 @@ pub struct CommitForegrounds<'a> {
     pub format: wgpu::TextureFormat,
     pub wash: Option<&'a wgpu::BindGroup>,
     pub build: Option<&'a wgpu::BindGroup>,
+    pub law: CommitLaw,
 }
 
 pub trait BrushPaintTargetExt {
@@ -116,6 +117,7 @@ impl BrushPaintTargetExt for GpuPaintTarget<'_> {
             format,
             wash,
             build,
+            law,
         } = foregrounds;
         // An absent slot still needs something bound to satisfy the
         // pipeline layout, so it borrows the present one and is switched
@@ -139,6 +141,7 @@ impl BrushPaintTargetExt for GpuPaintTarget<'_> {
             blend_mode,
             wash_opacity: if wash.is_some() { opacity } else { 0.0 },
             build_opacity: if build.is_some() { opacity } else { 0.0 },
+            law: law as u32,
         };
         let composite = brush_pipelines.get::<CompositePipeline>("composite");
         let offset = composite.write_uniforms(queue, &uniforms);

@@ -1,14 +1,15 @@
 // The stroke commit: lays a stroke's finished accumulations onto the layer.
 //
-// Two foreground slots, each with a fixed law and its own opacity, where an
-// opacity of zero means the slot is absent; the law itself is
+// Two foreground slots, each with its own opacity, where an opacity of zero
+// means the slot is absent, under the law `u.law` selects; the law itself is
 // `lib/commit_law.wgsl`'s, shared with the appearance snapshot.
 //
 // A terminal maps its accumulations onto the slots; the shader knows nothing
 // about brushes. One accumulation under one law is the common case (a brush
 // at either end of `paint.buildup`, or watercolor), and a brush inside the
-// dial fills both. Both foregrounds are premultiplied, which is how every
-// terminal's scratch and channels accumulate; the background (the pre-stroke
+// dial fills both. The foregrounds' alpha convention is the law's (the
+// deposit slots premultiplied, the move pigment straight), which is why the
+// law applies the slot opacities itself; the background (the pre-stroke
 // snapshot) is straight alpha, and so is the output.
 //
 // Two fragment entry points share one body: `fs_main` samples float
@@ -34,6 +35,7 @@ struct CompositeUniforms {
     blend_mode: u32,     // 0 = source-over, 1 = erase (destination-out)
     wash_opacity: f32,   // stroke opacity of the wash slot; 0 = absent
     build_opacity: f32,  // stroke opacity of the build slot; 0 = absent
+    law: u32,            // 0 = deposit (wash + build), 1 = move (coverage + pigment)
 }
 
 @group(0) @binding(0) var<uniform> u: CompositeUniforms;
@@ -80,10 +82,8 @@ struct VertexOutput {
 
 // Float foregrounds, sampled: the instanced terminals' scratch and channels.
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    // Each slot scaled by its own stroke opacity. Premultiplied, so one
-    // multiply covers rgb and alpha together.
-    let wash = textureSample(t_wash, s_wash, in.fg_uv) * u.wash_opacity;
-    let build = textureSample(t_build, s_build, in.fg_uv) * u.build_opacity;
+    let wash = textureSample(t_wash, s_wash, in.fg_uv);
+    let build = textureSample(t_build, s_build, in.fg_uv);
     return commit_fragment(in, wash, build);
 }
 
@@ -91,8 +91,8 @@ struct VertexOutput {
 // layer-sized and the quad is the layer, so the texel is exact.
 @fragment fn fs_packed(in: VertexOutput) -> @location(0) vec4f {
     let px = vec2<i32>(in.position.xy);
-    let wash = unpack4x8unorm(textureLoad(t_wash_packed, px, 0).r) * u.wash_opacity;
-    let build = unpack4x8unorm(textureLoad(t_build_packed, px, 0).r) * u.build_opacity;
+    let wash = unpack4x8unorm(textureLoad(t_wash_packed, px, 0).r);
+    let build = unpack4x8unorm(textureLoad(t_build_packed, px, 0).r);
     return commit_fragment(in, wash, build);
 }
 
@@ -102,5 +102,5 @@ struct VertexOutput {
 fn commit_fragment(in: VertexOutput, wash: vec4f, build: vec4f) -> vec4f {
     let copy_uv = (in.canvas_pos - floor(u.origin)) / vec2f(textureDimensions(t_bg));
     let bg = textureSample(t_bg, s_bg, copy_uv);
-    return commit_law(wash, build, bg, u.blend_mode, u.wash_opacity, u.build_opacity);
+    return commit_law(wash, build, bg, u.blend_mode, u.law, u.wash_opacity, u.build_opacity);
 }

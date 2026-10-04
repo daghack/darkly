@@ -40,6 +40,17 @@
 //!   (its footprint grown by the graph's per-dab read reach), and the dab
 //!   samples the mirror. Inside one dispatch the read would race the
 //!   threads writing the texels it reads; across dispatches it is ordered.
+//! - **Two laws.** Under `Deposit` the `buildup` dial splits each dab
+//!   between the wash ceiling and build-up source-over. Under `Move` the
+//!   dab is what a finger brought from elsewhere (a live sampler's output)
+//!   and `coverage` is how much of the pixel the finger displaced: the
+//!   ground lerps toward the dab by that coverage and a `coverage` channel
+//!   accumulates it, so the commit lays the moved pigment over `1 -
+//!   coverage` of the layer. A smear can then thin an edge as well as
+//!   thicken it, which source-over, whose coverage is its own alpha,
+//!   never can. The `Move` ground is stored straight, not premultiplied:
+//!   a dark colour under a light touch rounds to black in a premultiplied
+//!   8-bit texel (`accumulate_move`).
 //!
 //! Upstream nodes (`circle`, `stamp`, etc.) compile inline into the
 //! compute shader and evaluate per-pixel-per-dab, with no intermediate
@@ -67,8 +78,10 @@ use std::num::NonZeroU64;
 use crate::brush::appearance_snapshot::{
     AppearanceSnapshotPipeline, SnapshotRecord, SnapshotSources, APPEARANCE_SNAPSHOT_ID,
 };
+use crate::brush::composite_pipeline::CommitLaw;
 use crate::brush::eval::{BrushNodeEvaluator, EvalContext};
 use crate::brush::gpu_context::{BrushGpuContext, MAX_DABS_PER_PHASE};
+use crate::brush::input_value::InputValue;
 use crate::brush::node::{BrushNodeRegistration, DabPass, PACKED_GROUND_FORMAT};
 use crate::brush::paint_target_ext::{BrushPaintTargetExt, CommitForegrounds};
 use crate::brush::pipeline::{
@@ -101,6 +114,76 @@ const BUILD_CHANNEL: StrokeChannel = StrokeChannel {
     format: PACKED_GROUND_FORMAT,
     kind: ChannelUse::Storage,
 };
+
+/// Under the move law, how much of each pixel the finger has displaced
+/// this stroke, in the packed texel's alpha (`1 - prod(1 - cov_i)`). The
+/// commit lays the ground over `1 - coverage` of the layer.
+const COVERAGE_CHANNEL: StrokeChannel = StrokeChannel {
+    name: "coverage",
+    format: PACKED_GROUND_FORMAT,
+    kind: ChannelUse::Storage,
+};
+
+const MODE_DEPOSIT: i32 = 0;
+const MODE_MOVE: i32 = 1;
+
+/// The law a brush accumulates and commits under, from its `mode` port and,
+/// under `Deposit`, its `buildup` dial.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PaintLaw {
+    Deposit { buildup: f32 },
+    Move,
+}
+
+impl PaintLaw {
+    fn from_ports(mode: i32, buildup: f32) -> Self {
+        if mode == MODE_MOVE {
+            Self::Move
+        } else {
+            Self::Deposit { buildup }
+        }
+    }
+
+    fn of(ctx: &EvalContext) -> Self {
+        Self::from_ports(ctx.input("mode").as_f32() as i32, ctx.input_f32("buildup"))
+    }
+
+    fn commit_law(self) -> CommitLaw {
+        match self {
+            Self::Deposit { .. } => CommitLaw::Deposit,
+            Self::Move => CommitLaw::Move,
+        }
+    }
+
+    /// Which accumulation fills each of the commit law's two slots. Under
+    /// `Move` the coverage channel fills the first and the ground the
+    /// second. Under `Deposit`, `(wash, build)`: at either end of the dial
+    /// the ground is the only accumulation and fills its own law's slot;
+    /// between, the ground is the wash half and the build channel the build
+    /// half. The commit and the appearance snapshot both map through here,
+    /// so the stroke a sampler reads is the one the commit lays.
+    fn slots<T: Copy>(
+        self,
+        ground: T,
+        channel: impl FnOnce(&'static str) -> T,
+    ) -> (Option<T>, Option<T>) {
+        match self {
+            Self::Move => (Some(channel(COVERAGE_CHANNEL.name)), Some(ground)),
+            Self::Deposit { buildup } => {
+                let (wash_share, build_share) = shares(buildup);
+                let wash = (wash_share > 0.0).then_some(ground);
+                let build = if build_share <= 0.0 {
+                    None
+                } else if wash_share <= 0.0 {
+                    Some(ground)
+                } else {
+                    Some(channel(BUILD_CHANNEL.name))
+                };
+                (wash, build)
+            }
+        }
+    }
+}
 
 /// The laws a `paint` body stores through, with the ceiling's room
 /// arithmetic they share with the commit.
@@ -143,28 +226,6 @@ fn rgba_expr(cctx: &CompileWgslCtx) -> String {
 fn shares(buildup: f32) -> (f32, f32) {
     let b = buildup.clamp(0.0, 1.0);
     (1.0 - b, b)
-}
-
-/// Which accumulation fills each of the commit law's two slots, `(wash,
-/// build)`. At either end the ground is the only accumulation and fills
-/// its own law's slot; between, the ground is the wash half and the build
-/// channel the build half. The commit and the appearance snapshot both map
-/// through here, so the stroke a sampler reads is the one the commit lays.
-fn law_slots<T: Copy>(
-    buildup: f32,
-    ground: T,
-    build_channel: impl FnOnce() -> T,
-) -> (Option<T>, Option<T>) {
-    let (wash_share, build_share) = shares(buildup);
-    let wash = (wash_share > 0.0).then_some(ground);
-    let build = if build_share <= 0.0 {
-        None
-    } else if wash_share <= 0.0 {
-        Some(ground)
-    } else {
-        Some(build_channel())
-    };
-    (wash, build)
 }
 
 // ── Per-brush pipeline ──────────────────────────────────────────────────
@@ -533,12 +594,35 @@ pub fn register() -> BrushNodeRegistration {
                     .with_description(
                         "Per-touch size multiplier (wire pressure here for pressure-sensitive size). Multiplies onto the brush's base size, owned by pen_input.",
                     ),
+                PortDef::input("mode", BrushWireType::Enum)
+                    .with_enum_options(["Deposit", "Move"])
+                    .with_value(InputValue::Int(MODE_DEPOSIT))
+                    .with_label("Law")
+                    .stroke_constant()
+                    .with_description(
+                        "Deposit: each touch lays down pigment, the way a pen or brush does; \
+                         Build-up sets how repeated touches add up. Move: each touch carries \
+                         what was already under it along the stroke, the way a finger \
+                         smudges; Coverage sets how much of the spot it takes with it.",
+                    ),
+                PortDef::input("coverage", BrushWireType::Scalar)
+                    .with_range(0.0, 1.0, 1.0)
+                    .with_natural_range(0.0, 1.0)
+                    .with_label("Coverage")
+                    .with_unit(UnitType::Percent)
+                    .with_visible_when("mode", [MODE_MOVE])
+                    .with_description(
+                        "Under Move: how much of what is under this spot the finger takes \
+                         with each touch. Wire the tip shape here, multiplied by the Canvas \
+                         Sampler's Coverage.",
+                    ),
                 PortDef::input("wash_flow", BrushWireType::Scalar)
                     .with_range(0.0, 1.0, 1.0)
                     .with_natural_range(0.0, 1.0)
                     .with_label("Flow (Wash)")
                     .with_unit(UnitType::Percent)
                     .with_icon("fa6-solid:droplet")
+                    .with_visible_when("mode", [MODE_DEPOSIT])
                     .exposed()
                     .with_description(
                         "Per-dab strength of the Wash half. Inactive at Build-up 100%.",
@@ -574,6 +658,7 @@ pub fn register() -> BrushNodeRegistration {
                     .with_label("Build-up")
                     .with_unit(UnitType::Percent)
                     .with_icon("fa6-solid:layer-group")
+                    .with_visible_when("mode", [MODE_DEPOSIT])
                     .stroke_constant()
                     .exposed()
                     .with_description(
@@ -750,11 +835,12 @@ impl BrushNodeEvaluator for PaintEvaluator {
         let snapshot = gpu
             .pipelines
             .get::<AppearanceSnapshotPipeline>(APPEARANCE_SNAPSHOT_ID);
+        let law = PaintLaw::of(ctx);
         let snapshots = compiled.reads_stroke_appearance().then(|| {
-            let (wash, build) = law_slots(ctx.input_f32("buildup"), scratch.write_view(), || {
+            let (wash, build) = law.slots(scratch.write_view(), |name| {
                 scratch
-                    .channel_view(BUILD_CHANNEL.name)
-                    .expect("a brush inside the dial declares its build channel")
+                    .channel_view(name)
+                    .expect("a brush declares the channel its law accumulates into")
             });
             let records: Vec<SnapshotRecord> = metas.iter().map(|m| m.read).collect();
             snapshot.begin_flush(
@@ -765,6 +851,7 @@ impl BrushNodeEvaluator for PaintEvaluator {
                 SnapshotSources {
                     wash,
                     build,
+                    law: law.commit_law(),
                     pre_stroke: &pre_stroke_view,
                     appearance: scratch
                         .appearance_view()
@@ -887,18 +974,15 @@ impl BrushNodeEvaluator for PaintEvaluator {
             return;
         };
         let opacity = ctx.input_f32("opacity").clamp(0.0, 1.0);
-        // Each half this brush accumulated goes in the slot that commits
-        // under its law.
-        let (wash, build) = law_slots(
-            ctx.input_f32("buildup"),
-            stroke.scratch.write_bind_group(),
-            || {
-                stroke
-                    .scratch
-                    .channel_bind_group(BUILD_CHANNEL.name)
-                    .expect("a brush inside the dial declares its build channel")
-            },
-        );
+        // Each accumulation goes in the slot that commits it under the
+        // brush's law.
+        let law = PaintLaw::of(ctx);
+        let (wash, build) = law.slots(stroke.scratch.write_bind_group(), |name| {
+            stroke
+                .scratch
+                .channel_bind_group(name)
+                .expect("a brush declares the channel its law accumulates into")
+        });
         stroke.paint_target.commit_brush_dab(
             &mut gpu.encoder,
             gpu.pipelines,
@@ -907,6 +991,7 @@ impl BrushNodeEvaluator for PaintEvaluator {
                 format: stroke.scratch.format(),
                 wash,
                 build,
+                law: law.commit_law(),
             },
             stroke.pre_stroke_bind_group,
             opacity,
@@ -945,6 +1030,43 @@ impl BrushNodeEvaluator for PaintEvaluator {
             ..NodeWgsl::default()
         };
         let rgba_expr = rgba_expr(cctx);
+        let mut body = format!("    let rgba = {rgba_expr};\n");
+        // A ground's read-modify-write. `law` is the law's call with `DST`
+        // standing for the loaded texel. The store is skipped where the
+        // packed result equals the loaded word (a refused wash dab, say),
+        // which is exact: an equal store changes nothing.
+        let store = |target: &str, law: &str| {
+            let law = law.replace("DST", &format!("unpack_ground({target}_was)"));
+            format!(
+                "    let {target}_was = textureLoad({target}, layer_px);\n\
+                 \x20   let {target}_now = pack_ground({law});\n\
+                 \x20   if ({target}_now.r != {target}_was.r) {{\n\
+                 \x20       textureStore({target}, layer_px, {target}_now);\n\
+                 \x20   }}\n"
+            )
+        };
+        if cctx.input("mode").enum_index() == MODE_MOVE {
+            // Move: the finger displaces `cov` of the pixel and leaves what
+            // it brought. The pigment lerps in the ground; the coverage
+            // accumulates in its channel as a bare alpha under source-over,
+            // which is `1 - prod(1 - cov_i)`.
+            let flow = cctx.input("build_flow").as_f32();
+            let coverage = cctx.input("coverage").as_f32();
+            body.push_str(&format!(
+                "    let flow = clamp({flow}, 0.0, 1.0);\n\
+                 \x20   let cov = clamp({coverage}, 0.0, 1.0) * flow * sel;\n\
+                 \x20   if (cov == 0.0) {{\n        return;\n    }}\n\
+                 \x20   let src = rgba * flow * sel;\n"
+            ));
+            body.push_str(&store(GROUND_NAME, "accumulate_move(src, cov, DST)"));
+            body.push_str(&store(
+                COVERAGE_CHANNEL.name,
+                "accumulate_build(vec4<f32>(0.0, 0.0, 0.0, cov), DST)",
+            ));
+            wgsl.channels = vec![COVERAGE_CHANNEL];
+            wgsl.body = body;
+            return Ok(wgsl);
+        }
         // Per-dab flow, one per half, folded into the premultiplied rgba
         // (multiply all four components) the way the original terminal's
         // `color[3] *= flow` was. Wired values flow through their dab-record
@@ -960,7 +1082,6 @@ impl BrushNodeEvaluator for PaintEvaluator {
                 .to_string()
         })?;
         let (wash_share, build_share) = shares(buildup);
-        let mut body = format!("    let rgba = {rgba_expr};\n");
         // No coverage at this pixel: both laws would hand back the texel
         // they were given, so the thread skips the flows and the grounds.
         body.push_str("    if (rgba.a * sel == 0.0) {\n        return;\n    }\n");
@@ -972,26 +1093,14 @@ impl BrushNodeEvaluator for PaintEvaluator {
             let expr = cctx.input("build_flow").as_f32();
             body.push_str(&format!("    let build_flow = clamp({expr}, 0.0, 1.0);\n"));
         }
-        // A ground's read-modify-write. The store is skipped where the
-        // packed result equals the loaded word (a refused wash dab, say),
-        // which is exact: an equal store changes nothing.
-        let store = |target: &str, law: &str, src: &str| {
-            format!(
-                "    let {target}_was = textureLoad({target}, layer_px);\n\
-                 \x20   let {target}_now = pack_ground({law}({src}, unpack_ground({target}_was)));\n\
-                 \x20   if ({target}_now.r != {target}_was.r) {{\n\
-                 \x20       textureStore({target}, layer_px, {target}_now);\n\
-                 \x20   }}\n"
-            )
-        };
         if build_share <= 0.0 {
             // Wash alone: the ground takes the strongest dab.
             body.push_str("    let src = rgba * wash_flow * sel;\n");
-            body.push_str(&store(GROUND_NAME, "accumulate_wash", "src"));
+            body.push_str(&store(GROUND_NAME, "accumulate_wash(src, DST)"));
         } else if wash_share <= 0.0 {
             // Build-up alone: the ground composites every dab over the last.
             body.push_str("    let src = rgba * build_flow * sel;\n");
-            body.push_str(&store(GROUND_NAME, "accumulate_build", "src"));
+            body.push_str(&store(GROUND_NAME, "accumulate_build(src, DST)"));
         } else {
             // Both: the one dispatch writes each half into the
             // accumulation that runs its law, scaled by its share.
@@ -1001,8 +1110,11 @@ impl BrushNodeEvaluator for PaintEvaluator {
             body.push_str(&format!(
                 "    let build_src = rgba * build_flow * sel * {build_share:.6};\n"
             ));
-            body.push_str(&store(GROUND_NAME, "accumulate_wash", "wash_src"));
-            body.push_str(&store(BUILD_CHANNEL.name, "accumulate_build", "build_src"));
+            body.push_str(&store(GROUND_NAME, "accumulate_wash(wash_src, DST)"));
+            body.push_str(&store(
+                BUILD_CHANNEL.name,
+                "accumulate_build(build_src, DST)",
+            ));
             wgsl.channels = vec![BUILD_CHANNEL];
         }
         wgsl.body = body;
@@ -1021,7 +1133,11 @@ impl BrushNodeEvaluator for PaintEvaluator {
         let mut wgsl = NodeWgsl::default();
         let rgba_expr = rgba_expr(cctx);
         let buildup = cctx.input("buildup").as_f32_literal().unwrap_or(1.0);
-        let (_, build_share) = shares(buildup);
+        let (_, build_share) = if cctx.input("mode").enum_index() == MODE_MOVE {
+            (0.0, 1.0)
+        } else {
+            shares(buildup)
+        };
         let wash_expr = cctx.input("wash_flow").as_f32();
         let build_expr = cctx.input("build_flow").as_f32();
         wgsl.body = format!(

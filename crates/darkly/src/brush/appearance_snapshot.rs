@@ -19,6 +19,7 @@
 use std::any::Any;
 use std::num::NonZeroU64;
 
+use crate::brush::composite_pipeline::CommitLaw;
 use crate::brush::gpu_context::MAX_DABS_PER_PHASE;
 use crate::brush::pipeline::{BrushPipelineEntry, BrushPipelineRegistration, BuildContext};
 use crate::brush::wgsl::{DAB_SLOT_STRIDE, DAB_WORKGROUP};
@@ -45,13 +46,15 @@ pub struct SnapshotRecord {
     pub size: [u32; 2],
 }
 
-/// Which of the law's two slots hold an accumulation this stroke.
+/// Which of the two slots hold an accumulation this stroke, and the law
+/// they are laid under.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SnapshotUniforms {
     has_wash: u32,
     has_build: u32,
-    _pad: [u32; 2],
+    law: u32,
+    _pad: u32,
 }
 
 /// What one flush's snapshots read and write. The terminal maps its
@@ -60,6 +63,7 @@ struct SnapshotUniforms {
 pub struct SnapshotSources<'a> {
     pub wash: Option<&'a wgpu::TextureView>,
     pub build: Option<&'a wgpu::TextureView>,
+    pub law: CommitLaw,
     /// The pre-stroke snapshot, layer-sized like the grounds.
     pub pre_stroke: &'a wgpu::TextureView,
     /// The scratch's appearance mirror.
@@ -237,7 +241,8 @@ impl AppearanceSnapshotPipeline {
             bytemuck::bytes_of(&SnapshotUniforms {
                 has_wash: u32::from(sources.wash.is_some()),
                 has_build: u32::from(sources.build.is_some()),
-                _pad: [0; 2],
+                law: sources.law as u32,
+                _pad: 0,
             }),
         );
         queue.write_buffer(&self.records, 0, bytemuck::cast_slice(records));

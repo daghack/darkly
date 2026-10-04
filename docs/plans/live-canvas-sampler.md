@@ -352,6 +352,33 @@ Material discoveries made while implementing, in the order they arose.
     `paint`. A smudge that tells pigment from paper (sampling and
     depositing against the editor's primary and secondary colours) is
     the next step, on this simpler base.
+11. **The smudge is a lerp, so `paint` gained a `Move` law.** On a
+    transparent layer the source-over chain raised alpha wherever it was
+    partial: smearing a half-transparent field along itself changed it by
+    99 levels, which the artist saw as every soft edge darkening. A smudge
+    is a lerp (Krita's `COMPOSITE_COPY` when smearing alpha,
+    `KisColorSmudgeStrategyBase.cpp:137`; the deleted terminal's
+    `mix(bg, src, amount)`), and a lerp cannot be committed by laying a
+    ground over the pre-stroke, since source-over never lowers alpha.
+    `paint` has a `mode` port (`Deposit`, the dial; `Move`) and a
+    `coverage` port; under `Move` the ground lerps toward the dab by the
+    coverage and a `coverage` channel accumulates it, and the commit law
+    (and so the snapshot) lays the ground over `1 - coverage`
+    (`source_over_covering`). The sampler gained a `coverage` output, 0
+    for a dab with nothing to bring, so a stationary dab still moves
+    nothing. The sampler also interpolates its four taps premultiplied
+    (lesson 2 of the compositing lessons): mixing straight texels across
+    a transparent edge gave dark red at half alpha. Tests:
+    `smearing_a_translucent_field_along_itself_is_the_identity` (99 levels
+    before, 2 after, the 8-bit quantisation of three lerps),
+    `a_smear_thins_the_edge_it_leaves_and_thickens_where_it_lands`,
+    `sampler_interpolates_premultiplied_across_a_transparent_edge`.
+    The move ground is stored straight: premultiplied 8-bit storage turned
+    a dark colour black under a soft tip's few-percent coverage and drew a
+    thin dark line along stroke edges on a dark surface
+    (`a_soft_smear_over_a_dark_surface_is_the_identity`, 4 levels before).
+    The commit law applies the slot opacities itself, since a straight
+    slot's opacity must not scale its colour.
 
 This plan replaces an earlier draft of the same name whose design (a
 serialized one-dab-per-render-pass flush inside `paint`, with a

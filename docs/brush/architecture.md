@@ -129,9 +129,11 @@ is a packed ground (`PACKED_GROUND_FORMAT`, premultiplied RGBA8 in one
 `r32uint` texel) because core WebGPU reads and writes storage only in the
 32-bit single-channel formats. Dispatches in a pass are ordered and a
 dispatch's stores are visible to the next, so every dab sees the previous
-dab's output. Two laws exist, both in
+dab's output. Three laws exist, all in
 [`shaders/brush/paint_accumulate.wgsl`](../../crates/darkly/shaders/brush/paint_accumulate.wgsl),
-which the terminal emits into every brush it ends.
+which the terminal emits into every brush it ends. The first two are the
+ends of the accumulation dial, under the terminal's `Deposit` mode; the
+third is its `Move` mode.
 
 **`accumulate_build`** composites each dab over the last (premultiplied
 source-over). Coverage accumulates as `1 - prod(1 - a_i)`, so a pixel's
@@ -149,6 +151,27 @@ re-targets the pixel to its own coverage. A stroke cannot darken itself by
 crossing back over its own path, density stops depending on spacing
 (identical to the byte across a 30x spacing spread), and pressure becomes
 the only thing setting it.
+
+**`accumulate_move`** lerps the pixel toward the dab by the finger's
+coverage, `src + dst * (1 - cov)`, where `cov` comes from the terminal's
+`coverage` port (the tip mask, times a sampler's coverage) rather than
+from the dab's alpha. The dab is what a finger brought from elsewhere (a
+live canvas sampler's output), which may be bare paper, and the pixel
+gives up `cov` of what it had whatever arrives. The same `cov` accumulates
+in a `coverage` channel as a bare alpha under source-over, and the commit
+lays the ground over `1 - coverage` of the pre-stroke layer
+(`source_over_covering`): source-over with the coverage decoupled from the
+alpha. That is what lets a smear thin an edge as well as thicken it. This
+ground alone is stored straight rather than premultiplied: at a soft tip's
+edge a dab brings a few percent of coverage, and a dark colour times that
+coverage rounds to zero in a premultiplied 8-bit texel while the alpha
+does not, so the pigment the finger carried turned black and drew a thin
+dark line along every stroke edge on a dark surface. Under
+plain source-over a smear of a half-transparent field along itself raised
+its alpha with every pass, which showed as a darkening of every soft edge
+on a transparent layer. On an opaque layer the two laws agree exactly. A
+dab whose sampler has nothing to bring (a finger that has not moved, a
+sample point off the layer) reports zero coverage and moves nothing.
 
 ### The accumulation dial
 

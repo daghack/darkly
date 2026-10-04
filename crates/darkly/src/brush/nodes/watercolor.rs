@@ -57,6 +57,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::brush::composite_pipeline::CommitLaw;
 use crate::brush::eval::{BrushNodeEvaluator, EvalContext};
 use crate::brush::gpu_context::{BrushGpuContext, MAX_DABS_PER_PHASE};
 use crate::brush::node::BrushNodeRegistration;
@@ -1108,6 +1109,7 @@ impl BrushNodeEvaluator for WatercolorEvaluator {
                 format: stroke.scratch.format(),
                 wash: None,
                 build: Some(stroke.scratch.write_bind_group()),
+                law: CommitLaw::Deposit,
             },
             stroke.pre_stroke_bind_group,
             opacity,

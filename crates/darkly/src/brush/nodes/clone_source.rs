@@ -146,6 +146,12 @@ pub fn register() -> BrushNodeRegistration {
                     ),
                 PortDef::output("color", BrushWireType::Vec4)
                     .with_description("Straight RGBA sampled from the chosen source at the offset"),
+                PortDef::output("coverage", BrushWireType::Scalar).with_description(
+                    "1 where there is something under the finger to pick up, 0 where there \
+                     is not: a touch that has not moved yet, or one reaching off the layer. \
+                     Multiply into Paint's Coverage so a finger that picks up nothing \
+                     changes nothing.",
+                ),
             ],
             is_gpu: false,
             is_terminal: false,
@@ -241,7 +247,10 @@ impl BrushNodeEvaluator for CloneSourceEvaluator {
     /// `image`'s placeholder so mixed CPU/compiled graphs don't `NaN`
     /// through `color`.
     fn evaluate_cpu(&self, _ctx: &EvalContext) -> Vec<(String, ScalarValue)> {
-        vec![("color".into(), ScalarValue::Vec4([0.5, 0.5, 0.5, 1.0]))]
+        vec![
+            ("color".into(), ScalarValue::Vec4([0.5, 0.5, 0.5, 1.0])),
+            ("coverage".into(), ScalarValue::Scalar(1.0)),
+        ]
     }
 
     /// Both sources sample the canvas, so both stage their previews; the
@@ -274,18 +283,23 @@ impl BrushNodeEvaluator for CloneSourceEvaluator {
 
     fn compile_wgsl(&self, cctx: &CompileWgslCtx) -> Result<NodeWgsl, String> {
         let mut wgsl = NodeWgsl::default();
-        if !cctx.consumed_outputs.contains("color") {
+        if !cctx.consumed_outputs.contains("color") && !cctx.consumed_outputs.contains("coverage") {
             // Nothing downstream samples the source, so don't reserve the
             // binding or emit the sample.
             return Ok(wgsl);
         }
         let out = cctx.ident("clone_c");
+        let coverage = cctx.ident("clone_cov");
         if source_index_is_live(cctx.input("source").enum_index()) {
-            compile_live(cctx, &mut wgsl, &out);
+            compile_live(cctx, &mut wgsl, &out, &coverage);
         } else {
             compile_snapshot(cctx, &mut wgsl, &out);
+            // The frozen source always exists; off-frame is transparent, not
+            // absent, so a clone through Move replaces with transparency.
+            wgsl.body.push_str(&format!("    let {coverage} = 1.0;\n"));
         }
         wgsl.outputs.insert("color".into(), out);
+        wgsl.outputs.insert("coverage".into(), coverage);
         Ok(wgsl)
     }
 
@@ -301,12 +315,13 @@ impl BrushNodeEvaluator for CloneSourceEvaluator {
     /// expressions, still finds the variable.
     fn compile_cursor_preview_body(&self, cctx: &CompileWgslCtx) -> Result<NodeWgsl, String> {
         let mut wgsl = NodeWgsl::default();
-        if !cctx.consumed_outputs.contains("color") {
+        if !cctx.consumed_outputs.contains("color") && !cctx.consumed_outputs.contains("coverage") {
             return Ok(wgsl);
         }
         let out = cctx.ident("clone_c");
         wgsl.body = format!("    let {out} = vec4<f32>(0.6, 0.6, 0.6, 1.0);\n");
         wgsl.outputs.insert("color".into(), out);
+        wgsl.outputs.insert("coverage".into(), "1.0".into());
         Ok(wgsl)
     }
 }
@@ -399,19 +414,26 @@ fn compile_snapshot(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
 /// Every symbol the helper names (`u`, `graph_tex_N`) is declared in both
 /// shader variants, so the shared decls compile into the preview module,
 /// whose body never calls it.
-fn compile_live(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
+fn compile_live(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str, coverage: &str) {
     let slot = cctx.request_live_texture(LiveSource::StrokeAppearance);
     let live_fn = cctx.ident("clone_live");
+    let sample_ty = cctx.ident("CloneLiveSample");
     let motion = cctx.input("motion").as_vec2();
     let tex = format!("graph_tex_{slot}");
     let pre_fn = cctx.ident("clone_premul");
+    // `coverage` is 0 where there is no sample (a dab that has not moved,
+    // a sample point off the layer) and 1 where there is one, transparent
+    // or not: the difference between a finger that brings nothing and one
+    // that brings bare paper.
     wgsl.decls = format!(
-        "fn {pre_fn}(c: vec4<f32>) -> vec4<f32> {{\n\
+        "struct {sample_ty} {{ color: vec4<f32>, coverage: f32 }}\n\
+         fn {pre_fn}(c: vec4<f32>) -> vec4<f32> {{\n\
          \x20   return vec4<f32>(c.rgb * c.a, c.a);\n\
          }}\n\
-         fn {live_fn}(tp: vec2<f32>, motion: vec2<f32>) -> vec4<f32> {{\n\
+         fn {live_fn}(tp: vec2<f32>, motion: vec2<f32>) -> {sample_ty} {{\n\
+         \x20   let none = {sample_ty}(vec4<f32>(0.0, 0.0, 0.0, 0.0), 0.0);\n\
          \x20   if (abs(motion.x) < {STATIONARY_MOTION_PX:.6} && abs(motion.y) < {STATIONARY_MOTION_PX:.6}) {{\n\
-         \x20       return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n\
+         \x20       return none;\n\
          \x20   }}\n\
          \x20   // `tp` is a pixel centre, so in texel space (centres at\n\
          \x20   // integers) the sample point is the pixel's texel minus motion.\n\
@@ -421,7 +443,7 @@ fn compile_live(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
          \x20   let size = vec2<i32>(u.intrinsic.layer_size);\n\
          \x20   let at = vec2<f32>(base) + w;\n\
          \x20   if (any(at < vec2<f32>(-0.5)) || any(at > vec2<f32>(size) - vec2<f32>(0.5))) {{\n\
-         \x20       return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n\
+         \x20       return none;\n\
          \x20   }}\n\
          \x20   let hi = size - vec2<i32>(1);\n\
          \x20   let p0 = clamp(base, vec2<i32>(0), hi);\n\
@@ -433,12 +455,17 @@ fn compile_live(cctx: &CompileWgslCtx, wgsl: &mut NodeWgsl, out: &str) {
          \x20   let bottom = mix({pre_fn}(textureLoad({tex}, vec2<i32>(p0.x, p1.y), 0)), {pre_fn}(textureLoad({tex}, p1, 0)), w.x);\n\
          \x20   let c = mix(top, bottom, w.y);\n\
          \x20   if (c.a <= 0.0) {{\n\
-         \x20       return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n\
+         \x20       return {sample_ty}(vec4<f32>(0.0, 0.0, 0.0, 0.0), 1.0);\n\
          \x20   }}\n\
-         \x20   return vec4<f32>(c.rgb / c.a, c.a);\n\
+         \x20   return {sample_ty}(vec4<f32>(c.rgb / c.a, c.a), 1.0);\n\
          }}\n"
     );
-    wgsl.body = format!("    let {out} = {live_fn}(target_pos, {motion});\n");
+    let sample = cctx.ident("clone_s");
+    wgsl.body = format!(
+        "    let {sample} = {live_fn}(target_pos, {motion});\n\
+         \x20   let {out} = {sample}.color;\n\
+         \x20   let {coverage} = {sample}.coverage;\n"
+    );
 }
 
 /// CPU-side spec of the clone offset formula, mirrored by the WGSL
@@ -475,9 +502,9 @@ mod tests {
         let reg = register();
         assert_eq!(reg.node.type_id, "clone_source");
         assert_eq!(reg.node.category, "texture");
-        // Five inputs (source, motion, center, mode, merged) + one output
-        // (color).
-        assert_eq!(reg.node.ports.len(), 6);
+        // Five inputs (source, motion, center, mode, merged) + two outputs
+        // (color, coverage).
+        assert_eq!(reg.node.ports.len(), 7);
         let port = |name: &str| {
             reg.node
                 .ports

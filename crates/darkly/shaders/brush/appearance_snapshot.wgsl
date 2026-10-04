@@ -23,8 +23,8 @@ override WORKGROUP: u32 = 8u;
 struct SnapshotUniforms {
     has_wash: u32,       // 0 = slot absent
     has_build: u32,      // 0 = slot absent
-    _pad0: u32,
-    _pad1: u32,
+    law: u32,            // 0 = deposit, 1 = move (`lib/commit_law.wgsl`)
+    _pad: u32,
 };
 // One per dab, in lockstep with the dab records: the read region, in
 // write-side (layer-local) texels, already clamped to the layer.
@@ -49,6 +49,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let wash_px = unpack4x8unorm(textureLoad(wash, px, 0).r);
     let build_px = unpack4x8unorm(textureLoad(build, px, 0).r);
     let bg = textureLoad(pre_stroke, px, 0);
-    textureStore(appearance, px, commit_law(wash_px, build_px, bg, 0u,
+    textureStore(appearance, px, commit_law(wash_px, build_px, bg, 0u, flags.law,
                                             f32(flags.has_wash), f32(flags.has_build)));
 }

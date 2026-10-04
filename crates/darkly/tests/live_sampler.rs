@@ -129,13 +129,17 @@ fn set(graph: &mut Graph<BrushWireType>, node: &str, name: &str, value: f32) {
     graph.set_port_default(&id(node), name, value).unwrap();
 }
 
-/// The shipped Smudge at a radius of 20 px under full pressure. `buildup`
-/// is a `paint` port the brush leaves at its default of 1; tests set it to
-/// pin the laws on either side of the dial.
-fn smooth_smudge(softness: f32, buildup: f32, strength: f32) -> Graph<BrushWireType> {
+/// The shipped Smudge at a radius of 20 px under full pressure. `None`
+/// keeps the brush's move law; `Some(buildup)` switches `paint` to the
+/// deposit dial at that setting, to pin the laws on either side of it.
+fn smooth_smudge(softness: f32, buildup: Option<f32>, strength: f32) -> Graph<BrushWireType> {
     let mut g = builtin("Smudge");
     set(&mut g, "circle", "softness", softness);
-    set(&mut g, "paint", "buildup", buildup);
+    if let Some(buildup) = buildup {
+        g.set_port_value(&id("paint"), "mode", InputValue::Int(0))
+            .unwrap();
+        set(&mut g, "paint", "buildup", buildup);
+    }
     set(&mut g, "user_input", "value", strength);
     set(&mut g, "brush_settings", "size", RADIUS * 2.0 / 512.0);
     g
@@ -359,7 +363,7 @@ fn live_sampler_compiles_beside_baked_noise_and_image() {
 #[test]
 fn sampler_reads_through_the_snapshot_not_the_racing_ground() {
     let pre = ramp();
-    let graph = smooth_smudge(0.0, 1.0, 1.0);
+    let graph = smooth_smudge(0.0, None, 1.0);
     let (c1, c2, m) = ([64.0, 64.0], [70.0, 64.0], [3.0, 0.0]);
     for frame in FRAMES {
         let one = render(&graph, frame, &pre, &[(c1, m)]);
@@ -407,7 +411,7 @@ fn sampler_reads_through_the_snapshot_not_the_racing_ground() {
 #[test]
 fn second_dab_reads_first_dabs_deposit() {
     let pre = two_tone();
-    let graph = smooth_smudge(0.4, 1.0, 0.85);
+    let graph = smooth_smudge(0.4, None, 0.85);
     let dab1 = ([60.0, 64.0], [30.0, 0.0]);
     let dab2 = ([90.0, 64.0], [30.0, 0.0]);
     let both = render(&graph, ORIGIN, &pre, &[dab1, dab2]);
@@ -440,7 +444,7 @@ fn wash_refuses_a_repeated_smear_like_the_pencil() {
             .sum()
     };
 
-    let wash = smooth_smudge(0.4, 0.0, 0.6);
+    let wash = smooth_smudge(0.4, Some(0.0), 0.6);
     let once = render(&wash, ORIGIN, &pre, &[dab]);
     let twice = render(&wash, ORIGIN, &pre, &[dab, dab]);
     assert!(
@@ -452,7 +456,7 @@ fn wash_refuses_a_repeated_smear_like_the_pencil() {
         "the wash takes a repeated smear once"
     );
 
-    let build = smooth_smudge(0.4, 1.0, 0.6);
+    let build = smooth_smudge(0.4, Some(1.0), 0.6);
     let once = render(&build, ORIGIN, &pre, &[dab]);
     let twice = render(&build, ORIGIN, &pre, &[dab, dab]);
     assert!(
@@ -478,7 +482,7 @@ fn stationary_dab_deposits_nothing() {
         }
     });
     let run = render(
-        &smooth_smudge(0.4, 1.0, 1.0),
+        &smooth_smudge(0.4, None, 1.0),
         ORIGIN,
         &pre,
         &[([64.0, 64.0], [0.0, 0.0])],
@@ -505,8 +509,8 @@ fn opacity_is_a_commit_time_cap() {
         ([50.0, 64.0], [6.0, 0.0]),
         ([56.0, 64.0], [6.0, 0.0]),
     ];
-    let full = render(&smooth_smudge(0.4, 1.0, 0.8), ORIGIN, &pre, &dabs);
-    let mut graph = smooth_smudge(0.4, 1.0, 0.8);
+    let full = render(&smooth_smudge(0.4, None, 0.8), ORIGIN, &pre, &dabs);
+    let mut graph = smooth_smudge(0.4, None, 0.8);
     set(&mut graph, "paint", "opacity", 0.5);
     let half = render(&graph, ORIGIN, &pre, &dabs);
     let mut moved = 0;
@@ -538,7 +542,7 @@ fn border_dab_never_reads_the_opposite_edge() {
             [128, 128, 128, 255]
         }
     });
-    let graph = smooth_smudge(0.0, 1.0, 1.0);
+    let graph = smooth_smudge(0.0, None, 1.0);
     for frame in FRAMES {
         let run = render(&graph, frame, &pre, &[([118.0, 64.0], [-3.25, 0.0])]);
         for y in 0..SIDE {
@@ -560,7 +564,12 @@ fn border_dab_never_reads_the_opposite_edge() {
 #[test]
 fn live_sampling_dispatches_twice_per_dab() {
     let dabs = [([40.0, 64.0], [4.0, 0.0]), ([44.0, 64.0], [4.0, 0.0])];
-    let run = render(&smooth_smudge(0.4, 0.1, 0.6), ORIGIN, &two_tone(), &dabs);
+    let run = render(
+        &smooth_smudge(0.4, Some(0.1), 0.6),
+        ORIGIN,
+        &two_tone(),
+        &dabs,
+    );
     assert_eq!(run.perf.flushed_dabs, 2);
     assert_eq!(run.perf.dispatches, 4);
 }
@@ -647,6 +656,82 @@ fn hover_preview_is_a_neutral_footprint() {
 
 // ── Transparency ────────────────────────────────────────────────────────
 
+/// Smearing a uniform half-transparent field along itself is the identity:
+/// every sample equals the pixel it lands on, so a finger that only moves
+/// pigment leaves the field as it was. A law that lays the sample *over*
+/// the pixel instead raises alpha wherever it is partial, which reads as a
+/// darkening of every soft edge on a transparent layer (99 levels here).
+///
+/// Tolerance: the moved pigment and the coverage are each stored at 8 bits
+/// per dab, so three dabs can drift by a couple of levels.
+#[test]
+fn smearing_a_translucent_field_along_itself_is_the_identity() {
+    let pre = canvas(|x, _| {
+        if (20..110).contains(&x) {
+            [40, 40, 40, 128]
+        } else {
+            [0, 0, 0, 0]
+        }
+    });
+    let graph = smooth_smudge(0.4, None, 0.6);
+    let dabs = [
+        ([64.0, 50.0], [0.0, 6.0]),
+        ([64.0, 56.0], [0.0, 6.0]),
+        ([64.0, 62.0], [0.0, 6.0]),
+    ];
+    let run = render(&graph, ORIGIN, &pre, &dabs);
+    let mut worst = 0;
+    for y in 0..SIDE {
+        for x in 30..100 {
+            let (got, want) = (pixel(&run.layer, x, y), pixel(&pre, x, y));
+            for c in 0..4 {
+                worst = worst.max((got[c] as i32 - want[c] as i32).abs());
+            }
+        }
+    }
+    assert!(worst <= 2, "the field changed by up to {worst} levels");
+}
+
+/// Dragging bare paper onto a translucent edge thins it, and dragging the
+/// edge onto bare paper thickens the paper: the finger moves pigment, so
+/// alpha falls behind the stroke and rises ahead of it.
+#[test]
+fn a_smear_thins_the_edge_it_leaves_and_thickens_where_it_lands() {
+    let pre = canvas(|x, _| {
+        if x < 64 {
+            [40, 40, 40, 128]
+        } else {
+            [0, 0, 0, 0]
+        }
+    });
+    // A hard disc at full flow, moving right by 8 px: every pixel takes
+    // what was 8 px to its left.
+    let run = render(
+        &smooth_smudge(0.0, None, 1.0),
+        ORIGIN,
+        &pre,
+        &[([64.0, 64.0], [8.0, 0.0])],
+    );
+    let ahead = pixel(&run.layer, 68, 64);
+    let behind = pixel(&run.layer, 60, 64);
+    assert_eq!(ahead, [40, 40, 40, 128], "pigment landed on bare paper");
+    assert_eq!(behind[3], 128, "the interior is unchanged");
+    // At the trailing edge of the layer's own bar nothing came from the
+    // left of pixel 8: the dab did not reach it. Check instead that a dab
+    // whose samples come from bare paper erases the bar.
+    let run = render(
+        &smooth_smudge(0.0, None, 1.0),
+        ORIGIN,
+        &pre,
+        &[([60.0, 64.0], [-8.0, 0.0])],
+    );
+    let thinned = pixel(&run.layer, 60, 64);
+    assert_eq!(
+        thinned[3], 0,
+        "bare paper dragged onto the edge thinned it: {thinned:?}"
+    );
+}
+
 /// The sampler interpolates in premultiplied space: a sample point halfway
 /// between an opaque red texel and a transparent one is red at half alpha,
 /// not dark red (lesson 2 of `docs/lessons-learned/compositing-lessons-learned.md`).
@@ -661,7 +746,7 @@ fn sampler_interpolates_premultiplied_across_a_transparent_edge() {
     });
     // A hard disc at full flow replaces the field with the sample; motion
     // of 3.5 px puts every sample point halfway between texels.
-    let graph = smooth_smudge(0.0, 1.0, 1.0);
+    let graph = smooth_smudge(0.0, None, 1.0);
     let run = render(&graph, ORIGIN, &pre, &[([70.0, 64.0], [3.5, 0.0])]);
     // Pixel 67 samples at 63.5: half red, half transparent.
     let got = pixel(&run.layer, 67, 64);
@@ -670,4 +755,29 @@ fn sampler_interpolates_premultiplied_across_a_transparent_edge() {
         got[0] > 240,
         "red must stay red at a transparent edge: {got:?}"
     );
+}
+
+/// Smearing a uniform dark opaque surface along itself is the identity to
+/// the level, at the soft edge too. A soft tip brings a few percent of
+/// coverage per dab there; under premultiplied 8-bit storage a dark colour
+/// times that coverage rounds to zero while the alpha does not, so the
+/// pigment the finger carries turns black and the stroke's edge darkens.
+#[test]
+fn a_soft_smear_over_a_dark_surface_is_the_identity() {
+    let pre = canvas(|_, _| [17, 22, 28, 255]);
+    let graph = smooth_smudge(1.0, None, 0.5);
+    let dabs: Vec<([f32; 2], [f32; 2])> = (0..40)
+        .map(|i| ([30.0 + i as f32, 64.0], [1.0, 0.0]))
+        .collect();
+    let run = render(&graph, ORIGIN, &pre, &dabs);
+    let mut worst = 0;
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let (got, want) = (pixel(&run.layer, x, y), pixel(&pre, x, y));
+            for c in 0..4 {
+                worst = worst.max((got[c] as i32 - want[c] as i32).abs());
+            }
+        }
+    }
+    assert!(worst <= 1, "the surface changed by up to {worst} levels");
 }

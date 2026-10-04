@@ -49,6 +49,21 @@ pub struct CompositeUniforms {
     /// Stroke opacity of the foreground composited source-over on top.
     /// `0.0` means that slot is absent and is not read.
     pub build_opacity: f32,
+    /// Which law the two slots commit under; see [`CommitLaw`].
+    pub law: u32,
+}
+
+/// The law the commit (and the appearance snapshot) lays a terminal's two
+/// slots under. The numbering is the shader's (`lib/commit_law.wgsl`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitLaw {
+    /// The first slot deposits through the ceiling, the second composites
+    /// source-over on top: the accumulation dial's two halves.
+    Deposit = 0,
+    /// The first slot's alpha is the coverage a finger displaced, the
+    /// second the pigment it brought, laid over `1 - coverage` of the
+    /// background.
+    Move = 1,
 }
 
 pub struct CompositePipeline {

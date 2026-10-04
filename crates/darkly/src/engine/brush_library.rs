@@ -52,8 +52,8 @@ pub(crate) const DAB_PREVIEW_BASE_SIZE: f32 = 0.3;
 /// (`circle`'s amplitude, ≤ 1.5×) and any future displacement node's padding,
 /// both declared through the extent protocol. At a ≈ 77 px radius that is a
 /// ≈ 116 px reach inside the 896 px half-canvas, far less than this constant
-/// allows; sizing it per graph from `compose_brush_extent` is tracked in
-/// `docs/plans/brush-node-preview-spatiality.md`.
+/// allows; sizing it per graph from `compose_brush_extent` is a possible
+/// follow-up.
 pub(crate) const BRUSH_DAB_RENDER_SIZE: (u32, u32) = (1792, 1792);
 
 #[handlers]

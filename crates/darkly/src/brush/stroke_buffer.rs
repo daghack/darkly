@@ -11,7 +11,8 @@
 //! - The per-event composite step writes the final result to the layer:
 //!   source-over blend of the scratch onto the pre-stroke snapshot.
 
-use crate::brush::pipeline::BrushPipelines;
+use crate::brush::node::DabPass;
+use crate::brush::pipeline::{BrushPipelines, CanvasCopyLayout};
 use crate::brush::scratch::Scratch;
 use crate::coord::CanvasRect;
 
@@ -64,28 +65,29 @@ pub struct StrokeBuffer {
 impl StrokeBuffer {
     /// Create a new stroke buffer matching the given canvas dimensions.
     ///
-    /// `pipelines` provides the canvas-copy BGL/sampler that the embedded
-    /// `Scratch` needs for both its read-mirror and write bind groups.
-    /// `scratch_format` comes from the stroke's terminal
-    /// ([`BrushNodeRegistration::scratch_format`](crate::brush::node::BrushNodeRegistration::scratch_format)).
+    /// `pipelines` provides the canvas-copy layouts that the embedded
+    /// `Scratch` needs for its read-mirror, write and channel bind groups.
+    /// `scratch_format` and `dab_pass` come from the stroke's terminal
+    /// ([`BrushNodeRegistration::scratch_format`](crate::brush::node::BrushNodeRegistration::scratch_format),
+    /// [`BrushNodeRegistration::dab_pass`](crate::brush::node::BrushNodeRegistration::dab_pass)).
     /// The pre-stroke snapshot stays `Rgba8Unorm` regardless; it holds the
-    /// layer's pixels, which a warp terminal resolves *through* its field.
+    /// layer's pixels, which a warp terminal resolves *through* its field
+    /// and a compute terminal commits its packed ground onto.
     pub fn new(
         device: &wgpu::Device,
         width: u32,
         height: u32,
         pipelines: &BrushPipelines,
         scratch_format: wgpu::TextureFormat,
+        dab_pass: DabPass,
     ) -> Self {
-        let (canvas_copy_bgl, canvas_copy_sampler) =
-            pipelines.canvas_copy_layout_for(scratch_format);
         let scratch = Scratch::new(
             device,
             width,
             height,
-            canvas_copy_bgl,
-            canvas_copy_sampler,
+            pipelines.canvas_copy_layouts(),
             scratch_format,
+            dab_pass,
         );
 
         let pre_stroke_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -120,7 +122,7 @@ impl StrokeBuffer {
 
         let pre_stroke_bind_group = build_pre_stroke_bind_group(
             device,
-            pipelines.canvas_copy_bind_group_layout(),
+            pipelines.canvas_copy_layout(),
             &pre_stroke_view,
             &pre_stroke_sampler,
         );
@@ -291,7 +293,7 @@ impl StrokeBuffer {
         new_h: u32,
         dst_offset_x: u32,
         dst_offset_y: u32,
-        canvas_copy_bgl: &wgpu::BindGroupLayout,
+        canvas_copy: &CanvasCopyLayout,
     ) {
         if new_w == self.width && new_h == self.height && dst_offset_x == 0 && dst_offset_y == 0 {
             return;
@@ -333,28 +335,14 @@ impl StrokeBuffer {
         // Copy existing pre-stroke contents into the new texture at the
         // canvas-anchored offset.
         if self.width > 0 && self.height > 0 {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.pre_stroke_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &new_pre_stroke_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: dst_offset_x,
-                        y: dst_offset_y,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: self.width,
-                    height: self.height,
-                    depth_or_array_layers: 1,
-                },
+            crate::gpu::blit_region(
+                encoder,
+                &self.pre_stroke_texture,
+                (0, 0),
+                &new_pre_stroke_tex,
+                (dst_offset_x, dst_offset_y),
+                self.width,
+                self.height,
             );
         }
 
@@ -366,7 +354,7 @@ impl StrokeBuffer {
         });
         let new_pre_stroke_bg = build_pre_stroke_bind_group(
             device,
-            canvas_copy_bgl,
+            canvas_copy,
             &new_pre_stroke_view,
             &pre_stroke_sampler,
         );
@@ -381,22 +369,9 @@ impl StrokeBuffer {
 
 fn build_pre_stroke_bind_group(
     device: &wgpu::Device,
-    canvas_copy_bgl: &wgpu::BindGroupLayout,
+    canvas_copy: &CanvasCopyLayout,
     view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("pre-stroke-bg"),
-        layout: canvas_copy_bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    })
+    canvas_copy.bind(device, "pre-stroke-bg", view, Some(sampler))
 }

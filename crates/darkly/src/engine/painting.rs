@@ -340,39 +340,30 @@ impl DarklyEngine {
         self.clone_source_layer = layer;
     }
 
-    /// `true` when the active brush graph contains a `clone_source` node,
-    /// i.e. it needs a set-source anchor before it can paint. The
-    /// frontend polls this to arm the set-source gesture and show the
-    /// "set a source" hint. A structural graph check (no compile): the
-    /// `clone_source` node is exactly what sets `CompiledBrush::samples_source`.
+    /// `true` when the active brush graph samples the canvas snapshot at a
+    /// set source point, i.e. it needs a set-source anchor before it can
+    /// paint. The frontend polls this to arm the set-source gesture and
+    /// show the "set a source" hint. A structural graph check (no
+    /// compile), answered by the sampler node's own module.
     #[handler]
     pub fn active_brush_needs_source(&self) -> bool {
         use crate::brush::state::BrushState;
         let tool = self.tool_session.read();
-        let Some(brush) = tool.get::<BrushState>() else {
-            return false;
-        };
-        brush
-            .graph
-            .nodes()
-            .values()
-            .any(|n| n.type_id == crate::brush::nodes::clone_source::TYPE_ID)
+        tool.get::<BrushState>().is_some_and(|brush| {
+            crate::brush::nodes::clone_source::graph_needs_source(&brush.graph)
+        })
     }
 
-    /// Structural read of one of the active brush's `clone_source` port
+    /// Structural read of one of the active brush's snapshot sampler's port
     /// defaults: no compile, just the graph under the session read lock.
-    /// `None` when there is no `clone_source` node (or no such port).
+    /// `None` when there is no such sampler (or no such port).
     /// Shared by the mode / merged queries below so they resolve the node
     /// identically.
     fn clone_source_port_default(&self, port: &str) -> Option<f32> {
         use crate::brush::state::BrushState;
         let tool = self.tool_session.read();
         let brush = tool.get::<BrushState>()?;
-        brush
-            .graph
-            .nodes()
-            .values()
-            .find(|n| n.type_id == crate::brush::nodes::clone_source::TYPE_ID)
+        crate::brush::nodes::clone_source::snapshot_sampler(&brush.graph)
             .and_then(|n| n.ports.iter().find(|p| p.name == port))
             .map(|p| p.value.as_f32())
     }
@@ -691,7 +682,7 @@ impl DarklyEngine {
                     new_extent.height,
                     dx,
                     dy,
-                    self.brush_pipelines.canvas_copy_bind_group_layout(),
+                    self.brush_pipelines.canvas_copy_layout(),
                 );
             });
         }
@@ -1012,17 +1003,21 @@ impl DarklyEngine {
                 let layer_extent = layer_tex.layer_extent();
                 // The terminal decides what its scratch holds: colour for
                 // most brushes, a displacement field for liquify.
-                let scratch_format = self
+                let (scratch_format, dab_pass) = self
                     .brush_stroke_engine
                     .as_ref()
-                    .map(|e| e.scratch_format())
-                    .unwrap_or(crate::brush::node::COLOR_SCRATCH_FORMAT);
+                    .map(|e| (e.scratch_format(), e.dab_pass()))
+                    .unwrap_or((
+                        crate::brush::node::COLOR_SCRATCH_FORMAT,
+                        crate::brush::node::DabPass::InstancedDraw,
+                    ));
                 let mut stroke_buffer = StrokeBuffer::new(
                     &self.gpu.device,
                     layer_extent.width,
                     layer_extent.height,
                     &self.brush_pipelines,
                     scratch_format,
+                    dab_pass,
                 );
                 let paint_target = GpuPaintTarget::from_node(layer_tex, self.doc.canvas_rect());
                 self.gpu.encode("stroke-buffer-init", |encoder| {
@@ -1213,63 +1208,87 @@ impl DarklyEngine {
             // First event of the stroke: let the terminal set up its scratch.
             if need_begin_stroke {
                 let mut gpu_ctx = make_gpu_ctx!("brush-begin-stroke");
-                engine.begin_stroke(&mut gpu_ctx);
+                engine.begin_stroke(&mut gpu_ctx, None);
                 self.brush_perf += gpu_ctx.submit_final();
             }
 
             if let Some(div_idx) = div_idx {
                 // Divergence: try checkpoint-based partial re-render.
                 self.brush_rewind_events += 1;
-                // The terminal's `begin_stroke` establishes outside-bbox
-                // state for whichever path we take below; the checkpoint
-                // ring no longer clears on its own.
-                {
-                    let mut gpu_ctx = make_gpu_ctx!("brush-begin-stroke-rewind");
-                    engine.begin_stroke(&mut gpu_ctx);
-                    self.brush_perf += gpu_ctx.submit_final();
+                #[cfg(any(test, feature = "testing"))]
+                if self.test_full_rerender {
+                    self.checkpoint_ring.clear();
                 }
+                // Read before the save points are truncated below: the
+                // region a rewind undoes is the footprint of every dab
+                // after the checkpoint, under the history being discarded.
+                let found = self
+                    .checkpoint_ring
+                    .find_before(div_idx, &engine.save_points);
 
-                let stroke_frame = crate::gpu::atlas::CanvasFrame {
-                    texture: stroke_buffer.scratch().write_texture(),
-                    canvas_extent: paint_target.canvas_frame().canvas_extent,
-                };
-                // Stroke channels rewind with the scratch. A channel left
-                // holding contributions from dabs this rewind discarded
-                // would feed those values back to the dabs replayed over
-                // the same pixels.
-                let channels: Vec<&wgpu::Texture> =
-                    stroke_buffer.scratch().channel_textures().iter().collect();
-                let restore = self.gpu.encode_ret("stroke-checkpoint-restore", |encoder| {
-                    self.checkpoint_ring
-                        .restore_before(encoder, &stroke_frame, &channels, div_idx)
-                });
-                self.brush_perf.submits = self.brush_perf.submits.saturating_add(1);
-
-                let start_vi = if let Some(cp) = restore {
-                    // Restored from checkpoint: truncate and resume.
-                    engine.save_points.truncate(cp.save_point_index + 1);
+                let start_vi = if let Some(cp) = found {
+                    // Partial restore. Everything outside the rewound
+                    // region already holds the checkpoint's state; inside
+                    // it, the part the slot's frame does not cover is
+                    // reset to the terminal's baseline, then the ring
+                    // copies the covered part back. One submission for
+                    // both.
+                    {
+                        let mut gpu_ctx = make_gpu_ctx!("brush-rewind");
+                        let reset = cp
+                            .reset
+                            .and_then(|r| paint_target.canvas_frame().canvas_to_layer_rect(r));
+                        if let Some(reset) = reset {
+                            engine.begin_stroke(&mut gpu_ctx, Some(reset));
+                        }
+                        // Stroke channels rewind with the scratch. A
+                        // channel left holding contributions from dabs
+                        // this rewind discarded would feed those values
+                        // back to the dabs replayed over the same pixels.
+                        let stroke = gpu_ctx
+                            .stroke
+                            .as_ref()
+                            .expect("stroke resources are wired by make_gpu_ctx");
+                        let stroke_frame = stroke.scratch_frame();
+                        let channels = stroke.channel_textures();
+                        self.checkpoint_ring.restore(
+                            &mut gpu_ctx.encoder,
+                            &stroke_frame,
+                            &channels,
+                            &cp,
+                        );
+                        self.brush_perf += gpu_ctx.submit_final();
+                    }
+                    engine.save_points.truncate(cp.rewind.save_point_index + 1);
                     engine.restore_render_state(&cp.render_state);
                     // Only invalidate from the divergence point onward:
                     // checkpoints between the restore point and div_idx
                     // are still valid (the stroke buffer content there
                     // didn't change, only positions >= div_idx diverged).
-                    self.checkpoint_ring.invalidate_from(div_idx);
+                    self.checkpoint_ring.invalidate_from(div_idx, cp.rewind);
                     cp.vector_index + 1
                 } else {
-                    // No checkpoint before divergence: full re-render.
+                    // No checkpoint before divergence: full re-render from
+                    // the terminal's whole-scratch prologue.
                     //
                     // Two cases here. If the ring had valid slots but none
                     // satisfied `vi < div_idx`, the coverage invariant has
                     // failed (the architectural defect the ring's eviction
                     // policy is designed to prevent). If the ring was
-                    // empty, this is initialization (the first divergence
-                    // event of the stroke, before any checkpoint has been
-                    // saved), which is structurally unavoidable and cheap
-                    // (`tip_vi` is small, so the re-render is short).
-                    // Only the former is a "mid-stroke full re-render
-                    // fallback" worth counting.
-                    if self.checkpoint_ring.has_any_valid() {
+                    // empty, or `div_idx` is 0 (no index exists below it,
+                    // so no slot could ever serve it), this is
+                    // initialization: the first divergence event of the
+                    // stroke, structurally unavoidable and cheap (`tip_vi`
+                    // is small, so the re-render is short). Only the former
+                    // is a "mid-stroke full re-render fallback" worth
+                    // counting.
+                    if div_idx > 0 && self.checkpoint_ring.has_any_valid() {
                         self.brush_full_rerender_events += 1;
+                    }
+                    {
+                        let mut gpu_ctx = make_gpu_ctx!("brush-begin-stroke-rewind");
+                        engine.begin_stroke(&mut gpu_ctx, None);
+                        self.brush_perf += gpu_ctx.submit_final();
                     }
                     engine.reset_render_state();
                     self.checkpoint_ring.clear();
@@ -1291,37 +1310,19 @@ impl DarklyEngine {
                         continue;
                     }
 
-                    // Render segment.
+                    // Render the segment and save its checkpoint in the
+                    // same submission.
                     let mut gpu_ctx = make_gpu_ctx!("brush-rerender-seg");
                     engine.render_from_stabilized_range_to(&mut gpu_ctx, seg_start, boundary);
+                    save_checkpoint(
+                        &mut self.checkpoint_ring,
+                        &mut gpu_ctx,
+                        &engine,
+                        boundary,
+                        tip_vi,
+                        max_div,
+                    );
                     self.brush_perf += gpu_ctx.submit_final();
-
-                    // Save checkpoint at this boundary.
-                    if let Some(bbox) = engine.save_points.full_bbox() {
-                        let sp_idx = engine.save_points.len().saturating_sub(1);
-                        let render_state = engine.capture_render_state();
-                        let stroke_frame = crate::gpu::atlas::CanvasFrame {
-                            texture: stroke_buffer.scratch().write_texture(),
-                            canvas_extent: paint_target.canvas_frame().canvas_extent,
-                        };
-                        let channels: Vec<&wgpu::Texture> =
-                            stroke_buffer.scratch().channel_textures().iter().collect();
-                        self.gpu.encode("checkpoint-save", |encoder| {
-                            self.checkpoint_ring.save(
-                                &self.gpu.device,
-                                encoder,
-                                &stroke_frame,
-                                &channels,
-                                sp_idx,
-                                boundary,
-                                bbox,
-                                render_state,
-                                tip_vi,
-                                max_div,
-                            );
-                        });
-                        self.brush_perf.submits = self.brush_perf.submits.saturating_add(1);
-                    }
 
                     seg_start = boundary + 1;
                 }
@@ -1334,48 +1335,34 @@ impl DarklyEngine {
                 }
             } else {
                 // Nothing already rendered moved: render the appended
-                // vertices, continuing from the engine's render state.
-                if first_new <= tip_vi {
-                    let mut gpu_ctx = make_gpu_ctx!("brush-dab");
-                    engine.render_from_stabilized_range(&mut gpu_ctx, first_new);
-                    self.brush_perf += gpu_ctx.submit_final();
-                }
-
-                // Periodically save a checkpoint to keep the ring fresh. A
-                // stabilizer with a zero divergence window can never report
-                // a rendered index, so it never restores and needs none.
+                // vertices, continuing from the engine's render state, and
+                // periodically save a checkpoint in the same submission to
+                // keep the ring fresh. A stabilizer with a zero divergence
+                // window can never report a rendered index, so it never
+                // restores and needs none.
                 let spacing = CheckpointRing::spacing(max_div);
                 let should_save = max_div > 0
                     && match self.checkpoint_ring.newest_vector_index() {
                         Some(newest_vi) => tip_vi.saturating_sub(newest_vi) >= spacing,
                         None => true,
                     };
-                if should_save && !engine.save_points.is_empty() {
-                    if let Some(bbox) = engine.save_points.full_bbox() {
-                        let sp_idx = engine.save_points.len() - 1;
-                        let render_state = engine.capture_render_state();
-                        let stroke_frame = crate::gpu::atlas::CanvasFrame {
-                            texture: stroke_buffer.scratch().write_texture(),
-                            canvas_extent: paint_target.canvas_frame().canvas_extent,
-                        };
-                        let channels: Vec<&wgpu::Texture> =
-                            stroke_buffer.scratch().channel_textures().iter().collect();
-                        self.gpu.encode("checkpoint-save", |encoder| {
-                            self.checkpoint_ring.save(
-                                &self.gpu.device,
-                                encoder,
-                                &stroke_frame,
-                                &channels,
-                                sp_idx,
-                                tip_vi,
-                                bbox,
-                                render_state,
-                                tip_vi,
-                                max_div,
-                            );
-                        });
-                        self.brush_perf.submits = self.brush_perf.submits.saturating_add(1);
+                let has_new = first_new <= tip_vi;
+                if has_new || should_save {
+                    let mut gpu_ctx = make_gpu_ctx!("brush-dab");
+                    if has_new {
+                        engine.render_from_stabilized_range(&mut gpu_ctx, first_new);
                     }
+                    if should_save {
+                        save_checkpoint(
+                            &mut self.checkpoint_ring,
+                            &mut gpu_ctx,
+                            &engine,
+                            tip_vi,
+                            tip_vi,
+                            max_div,
+                        );
+                    }
+                    self.brush_perf += gpu_ctx.submit_final();
                 }
             }
 
@@ -1741,4 +1728,42 @@ impl DarklyEngine {
         );
         Some(texture)
     }
+}
+
+/// Save a checkpoint of the stroke scratch at `vector_index` into the
+/// event's live context, after the dabs it covers have been recorded.
+/// A copy recorded after a pass in the same encoder reads the pass's
+/// result, so the save needs no submission of its own. No-op before the
+/// first save point exists.
+fn save_checkpoint(
+    ring: &mut CheckpointRing,
+    gpu_ctx: &mut BrushGpuContext<'_>,
+    engine: &StrokeEngine,
+    vector_index: usize,
+    tip_vi: usize,
+    max_div: usize,
+) {
+    if engine.save_points.is_empty() {
+        return;
+    }
+    let sp_idx = engine.save_points.len() - 1;
+    let render_state = engine.capture_render_state();
+    let stroke = gpu_ctx
+        .stroke
+        .as_ref()
+        .expect("stroke resources are wired by make_gpu_ctx");
+    let stroke_frame = stroke.scratch_frame();
+    let channels = stroke.channel_textures();
+    ring.save(
+        gpu_ctx.device,
+        &mut gpu_ctx.encoder,
+        &stroke_frame,
+        &channels,
+        sp_idx,
+        vector_index,
+        &engine.save_points,
+        render_state,
+        tip_vi,
+        max_div,
+    );
 }

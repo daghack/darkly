@@ -22,6 +22,7 @@ use super::stabilizer::PassThrough;
 use super::stroke_buffer::StrokeBuffer;
 use super::stroke_engine::StrokeEngine;
 use super::wire::BrushWireType;
+use crate::brush::node::DabPass;
 use crate::gpu::preview::PreviewBackdrop;
 use crate::nodegraph::Graph;
 
@@ -43,6 +44,8 @@ struct PreviewTarget {
     /// terminal's scratch holds a float field rather than colour, so a
     /// buffer cached for one is unbindable by the other.
     scratch_format: wgpu::TextureFormat,
+    /// Likewise the dab pass: decides the scratch's storage usage.
+    dab_pass: DabPass,
     layer_texture: wgpu::Texture,
     layer_view: wgpu::TextureView,
     stroke_buffer: StrokeBuffer,
@@ -55,6 +58,7 @@ impl PreviewTarget {
         height: u32,
         pipelines: &BrushPipelines,
         scratch_format: wgpu::TextureFormat,
+        dab_pass: DabPass,
     ) -> Self {
         let layer_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("brush-preview-layer"),
@@ -74,11 +78,13 @@ impl PreviewTarget {
             view_formats: &[],
         });
         let layer_view = layer_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let stroke_buffer = StrokeBuffer::new(device, width, height, pipelines, scratch_format);
+        let stroke_buffer =
+            StrokeBuffer::new(device, width, height, pipelines, scratch_format, dab_pass);
         Self {
             width,
             height,
             scratch_format,
+            dab_pass,
             layer_texture,
             layer_view,
             stroke_buffer,
@@ -128,8 +134,14 @@ impl BrushStrokePreviewRenderer {
         // brushes, so previewing a warp terminal after a colour one must
         // reallocate rather than bind a colour scratch to a field pipeline.
         let scratch_format = runner.scratch_format();
+        let dab_pass = runner.dab_pass();
         let target_changed = match &self.target {
-            Some(t) => t.width != width || t.height != height || t.scratch_format != scratch_format,
+            Some(t) => {
+                t.width != width
+                    || t.height != height
+                    || t.scratch_format != scratch_format
+                    || t.dab_pass != dab_pass
+            }
             None => true,
         };
         if target_changed {
@@ -139,6 +151,7 @@ impl BrushStrokePreviewRenderer {
                 height,
                 pipelines,
                 scratch_format,
+                dab_pass,
             ));
         }
         let target = self.target.as_mut().unwrap();
@@ -286,7 +299,7 @@ impl BrushStrokePreviewRenderer {
         // Terminal setup: color_output clears the scratch to transparent.
         {
             let mut ctx = make_gpu_ctx!("brush-preview-begin-stroke");
-            engine.begin_stroke(&mut ctx);
+            engine.begin_stroke(&mut ctx, None);
             ctx.submit_final();
         }
 

@@ -114,7 +114,7 @@ The key insight: instead of re-rendering the entire stroke every frame when earl
 1. The resampler turns the raw point into zero or more vertices at a fixed arc-length spacing, and replaces the provisional tip in the algorithm's polyline
 2. The algorithm smooths its polyline, committed vertices and tip alike, with the tip pinned
 3. Prediction appends a short extrapolated tail
-4. The output is diffed against the positions each vertex was last rendered at to find the **divergence index**: the earliest rendered vertex that has since moved more than 0.5 CSS pixels
+4. The output is diffed against the positions each vertex was last rendered at to find the **divergence index**: the earliest rendered vertex that has since moved more than 0.1 CSS pixels (a wider tolerance shows as ripple on quick wide curves, since neighbouring vertices are re-rendered at different moments)
 
 The divergence index tells the rendering system "everything from here to the tip changed, re-render it." `None` means no rendered vertex moved: the new vertices are appended and rendered with no rewind. Dabs lie on the straight segment between consecutive vertices, so a segment is final once both its endpoints exist. An unstabilized stroke therefore never rewinds and never saves a checkpoint.
 

@@ -30,7 +30,13 @@ pub struct StabilizeResult {
 /// Distance in CSS pixels below which a stabilized point is considered
 /// unchanged since it was rendered. [`stroke_stabilizer_stack`] scales it to
 /// canvas pixels at the stroke's zoom; a bare algorithm uses it unscaled.
-pub const DIVERGENCE_EPSILON: f32 = 0.5;
+///
+/// Neighbouring vertices are re-rendered at different moments, so this is
+/// also the amplitude of the ripple the rendered stroke can carry that the
+/// smoothed polyline does not. A tenth of a pixel keeps that below what a
+/// thin antialiased stroke shows; a wider tolerance made quick wide curves
+/// look faintly jagged.
+pub const DIVERGENCE_EPSILON: f32 = 0.1;
 
 /// Find the earliest rendered index whose position is more than `epsilon`
 /// from where it was rendered, looking no further back than `max_window`
@@ -614,7 +620,7 @@ mod tests {
             for (j, (a, b)) in rendered.iter().zip(cur).enumerate() {
                 let d = (a[0] - b.pos[0]).hypot(a[1] - b.pos[1]);
                 assert!(
-                    d < 0.5 + 1e-3,
+                    d < DIVERGENCE_EPSILON + 1e-3,
                     "push {i}: vertex {j} is rendered {d:.2} px from where it now lies"
                 );
             }

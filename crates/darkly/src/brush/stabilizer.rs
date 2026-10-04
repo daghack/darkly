@@ -32,16 +32,19 @@ pub struct StabilizeResult {
 /// canvas pixels at the stroke's zoom; a bare algorithm uses it unscaled.
 pub const DIVERGENCE_EPSILON: f32 = 0.5;
 
-/// Find the earliest rendered index whose position has moved, walking
-/// backward from the tip until either an index lies within `epsilon` of its
-/// rendered position or the influence bound `max_window` is hit.
+/// Find the earliest rendered index whose position is more than `epsilon`
+/// from where it was rendered, looking no further back than `max_window`
+/// indices behind the tip.
 ///
 /// `current` is this push's polyline, `rendered` the positions its vertices
-/// were last rendered at. The walk is bounded to `max_window` indices behind
-/// the tip (the caller's model of how far a perturbation can reach), so it
-/// never reports divergence at indices the model says cannot have moved.
+/// were last rendered at. Vertices behind the window cannot have moved since
+/// their last render (the window is the caller's bound on how far a push
+/// reaches), so the scan is bounded. Within the window every index is
+/// checked: vertices are re-rendered at different times, so one that sits
+/// within tolerance of its own recent render says nothing about the older
+/// renders behind it.
 ///
-/// Returns `None` when every rendered index is unchanged, even if the
+/// Returns `None` when every rendered index is within tolerance, even if the
 /// polyline grew: new indices have never been rendered, so appending them
 /// needs no rewind. Callers go through [`DivergenceDiff`].
 fn find_divergence(
@@ -50,65 +53,16 @@ fn find_divergence(
     max_window: usize,
     epsilon: f32,
 ) -> Option<usize> {
-    walk_divergence(current, rendered, max_window, epsilon).filter(|&k| k < rendered.len())
-}
-
-/// The backward walk behind [`find_divergence`]: the index just above the
-/// first unchanged index found walking down from the tip, which may name a
-/// newly appended index.
-fn walk_divergence(
-    current: &[PaintInformation],
-    rendered: &[[f32; 2]],
-    max_window: usize,
-    epsilon: f32,
-) -> Option<usize> {
-    let len = current.len();
-    if len == 0 {
-        return None;
-    }
-
-    // `earliest` is the lowest index whose position could possibly differ
-    // since it was rendered given the influence bound. Walking past it is
-    // wasted work and risks reporting spurious divergence.
-    let earliest = len.saturating_sub(max_window + 1);
+    let overlap = rendered.len().min(current.len());
+    let earliest = current.len().saturating_sub(max_window + 1);
     let eps2 = epsilon * epsilon;
-
-    // Squared position delta at index `i` (within bounds of both arrays here).
-    let delta2 = |i: usize| -> f32 {
+    (earliest..overlap).find(|&i| {
         let cur = current[i].pos;
-        let prev = rendered[i];
-        let dx = cur[0] - prev[0];
-        let dy = cur[1] - prev[1];
-        dx * dx + dy * dy
-    };
-
-    if rendered.len() == len {
-        // Same length: walk backward from tip to `earliest`.
-        for i in (earliest..len).rev() {
-            if delta2(i) < eps2 {
-                return if i + 1 < len { Some(i + 1) } else { None };
-            }
-        }
-        Some(earliest)
-    } else {
-        // Polyline grew. New indices `[rendered.len(), len-1]` are by
-        // definition new and cannot be compared. Existing indices that
-        // overlap with `rendered` are in `[0, overlap_end)`: walk
-        // those, descending, bounded below by `earliest`.
-        let overlap_end = rendered.len().min(len);
-        if earliest >= overlap_end {
-            // No overlap to check (e.g., first push of a stroke). The
-            // divergence index is `earliest` itself, which equals 0 when
-            // there is nothing prior to compare against.
-            return Some(earliest);
-        }
-        for i in (earliest..overlap_end).rev() {
-            if delta2(i) < eps2 {
-                return Some(i + 1);
-            }
-        }
-        Some(earliest)
-    }
+        let was = rendered[i];
+        let dx = cur[0] - was[0];
+        let dy = cur[1] - was[1];
+        dx * dx + dy * dy >= eps2
+    })
 }
 
 /// The positions each vertex of an output polyline was last rendered at, and
@@ -394,7 +348,11 @@ pub struct StabilizerRegistration {
     pub type_id: &'static str,
     pub display_name: &'static str,
     pub params: &'static [ParamDef],
-    pub from_params: fn(&[ParamValue]) -> Box<dyn StabilizerAlgorithm>,
+    /// Build the algorithm from its parameter values and the stroke's view
+    /// scale (canvas pixels per CSS pixel), so distances and speeds the
+    /// algorithm reasons about in CSS pixels can be expressed in canvas
+    /// units.
+    pub from_params: fn(&[ParamValue], f32) -> Box<dyn StabilizerAlgorithm>,
 }
 
 /// Auto-discovered stabilizer registry.
@@ -433,25 +391,31 @@ impl StabilizerRegistry {
         self.entries.get(type_id).map(|e| e.params).unwrap_or(&[])
     }
 
-    /// Create a stabilizer algorithm instance from a type string and parameters.
+    /// Create a stabilizer algorithm instance from a type string, parameters
+    /// and the stroke's view scale (canvas pixels per CSS pixel).
     /// Returns `None` if the type_id is not found.
     pub fn create(
         &self,
         type_id: &str,
         params: &[ParamValue],
+        canvas_per_css_px: f32,
     ) -> Option<Box<dyn StabilizerAlgorithm>> {
         self.entries
             .get(type_id)
-            .map(|reg| (reg.from_params)(params))
+            .map(|reg| (reg.from_params)(params, canvas_per_css_px))
     }
 
     /// Create a stabilizer from a `StabilizerConfig`.
     /// Returns a pass-through if the config has no algorithm set.
-    pub fn create_from_config(&self, config: &StabilizerConfig) -> Box<dyn StabilizerAlgorithm> {
+    pub fn create_from_config(
+        &self,
+        config: &StabilizerConfig,
+        canvas_per_css_px: f32,
+    ) -> Box<dyn StabilizerAlgorithm> {
         if config.algorithm.is_empty() || config.algorithm == "none" {
             return Box::new(PassThrough::new());
         }
-        self.create(&config.algorithm, &config.params)
+        self.create(&config.algorithm, &config.params, canvas_per_css_px)
             .unwrap_or_else(|| {
                 log::warn!(
                     "unknown stabilizer algorithm '{}', using pass-through",
@@ -467,10 +431,10 @@ impl StabilizerRegistry {
 /// look-ahead horizon is set.
 ///
 /// `canvas_per_css_px` is the canvas pixels one CSS pixel of pen travel spans
-/// at the stroke's view (`device_pixel_ratio / zoom`). The resample spacing
-/// and the divergence epsilon are both scaled by it, so the smoothing reach
-/// and what counts as a move are the same on screen at every zoom and pixel
-/// ratio. Decorators engage only over an algorithm that can reshape rendered
+/// at the stroke's view (`device_pixel_ratio / zoom`). The resample spacing,
+/// the divergence epsilon and the algorithm's own CSS-pixel quantities are
+/// all scaled by it, so the smoothing reach and what counts as a move are
+/// the same on screen at every zoom and pixel ratio. Decorators engage only over an algorithm that can reshape rendered
 /// vertices (`max_divergence_window() > 0`).
 pub fn stroke_stabilizer_stack(
     registry: &StabilizerRegistry,
@@ -478,7 +442,7 @@ pub fn stroke_stabilizer_stack(
     prediction_horizon_ms: f32,
     canvas_per_css_px: f32,
 ) -> Box<dyn StabilizerAlgorithm> {
-    let inner = registry.create_from_config(config);
+    let inner = registry.create_from_config(config, canvas_per_css_px);
     if inner.max_divergence_window() == 0 {
         return inner;
     }
@@ -573,7 +537,7 @@ mod tests {
 
         // Empty config → pass-through.
         let config = StabilizerConfig::default();
-        let stab = registry.create_from_config(&config);
+        let stab = registry.create_from_config(&config, 1.0);
         assert_eq!(stab.len(), 0);
 
         // "none" → pass-through.
@@ -581,7 +545,7 @@ mod tests {
             algorithm: "none".into(),
             params: vec![],
         };
-        let stab = registry.create_from_config(&config);
+        let stab = registry.create_from_config(&config, 1.0);
         assert_eq!(stab.len(), 0);
 
         // Known algorithm.
@@ -589,7 +553,7 @@ mod tests {
             algorithm: "laplacian".into(),
             params: vec![ParamValue::Float(0.5)],
         };
-        let mut stab = registry.create_from_config(&config);
+        let mut stab = registry.create_from_config(&config, 1.0);
         stab.push(PaintInformation::default());
         assert_eq!(stab.len(), 1);
     }
@@ -603,6 +567,58 @@ mod tests {
             "registry should discover at least one algorithm"
         );
         assert!(types.iter().any(|(id, _, _)| *id == "laplacian"));
+    }
+
+    // ── DivergenceDiff ──────────────────────────────────────────────────
+
+    fn at(x: f32) -> PaintInformation {
+        PaintInformation {
+            pos: [x, 0.0],
+            ..Default::default()
+        }
+    }
+
+    /// Regression: a vertex that moved is reported even when a vertex nearer
+    /// the tip did not. The walk used to stop at the first unchanged vertex,
+    /// so vertices behind a freshly rendered one accumulated drift unchecked
+    /// and snapped into place much later, leaving a visible disconnect.
+    #[test]
+    fn moved_vertex_behind_an_unchanged_one_is_reported() {
+        let mut diff = DivergenceDiff::new(0.5);
+        assert_eq!(diff.update(&[at(0.0), at(10.0), at(20.0)], 10), None);
+        assert_eq!(
+            diff.update(&[at(0.0), at(10.6), at(20.0)], 10),
+            Some(1),
+            "the moved vertex sits behind an unchanged tip"
+        );
+    }
+
+    /// After every push, every rendered vertex is within the epsilon of its
+    /// current position: the invariant the renderer relies on, checked over a
+    /// fast wide curve at full strength where drift accumulates far behind
+    /// the tip.
+    #[test]
+    fn rendered_positions_stay_within_epsilon() {
+        let mut stab =
+            stroke_stabilizer_stack(&StabilizerRegistry::new(), &laplacian_config(1.0), 0.0, 1.0);
+        let mut rendered: Vec<[f32; 2]> = vec![];
+        for i in 0..1200 {
+            let th = i as f32 * 0.003;
+            let r = stab.push(mk(300.0 * th.cos(), 300.0 * th.sin(), i as f32 * 0.002));
+            let cur = stab.stabilized();
+            // Mirror the engine: re-render from the reported index, or
+            // append the new vertices.
+            let from = r.divergence_index.unwrap_or(rendered.len());
+            rendered.truncate(from);
+            rendered.extend(cur[from..].iter().map(|p| p.pos));
+            for (j, (a, b)) in rendered.iter().zip(cur).enumerate() {
+                let d = (a[0] - b.pos[0]).hypot(a[1] - b.pos[1]);
+                assert!(
+                    d < 0.5 + 1e-3,
+                    "push {i}: vertex {j} is rendered {d:.2} px from where it now lies"
+                );
+            }
+        }
     }
 
     // ── Stroke stabilizer stack ─────────────────────────────────────────
@@ -665,7 +681,7 @@ mod tests {
     /// (avoids depending on the generated module path).
     fn laplacian_inner(strength: f32) -> Box<dyn StabilizerAlgorithm> {
         StabilizerRegistry::new()
-            .create("laplacian", &[ParamValue::Float(strength)])
+            .create("laplacian", &[ParamValue::Float(strength)], 1.0)
             .expect("laplacian registered")
     }
 

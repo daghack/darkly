@@ -214,7 +214,7 @@ mod tests {
 
     fn laplacian(strength: f32) -> ResamplingStabilizer {
         let inner = StabilizerRegistry::new()
-            .create("laplacian", &[ParamValue::Float(strength)])
+            .create("laplacian", &[ParamValue::Float(strength)], 1.0)
             .expect("laplacian registered");
         ResamplingStabilizer::new(inner, SPACING, DIVERGENCE_EPSILON)
     }

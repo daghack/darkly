@@ -13,6 +13,10 @@
 //! points along the stroke, so an unevenly spaced segment, such as the
 //! short one to a provisional tip, does not pull its neighbours after it.
 //!
+//! Each point is pulled onto that chord in proportion to the pen's speed as
+//! it passed, up to [`REFERENCE_SPEED_CSS_PX_PER_S`]. Fast motion is smoothed
+//! in full; a slow pivot keeps its corner; a stopped pen is exact.
+//!
 //! The tip is always pinned at the cursor (zero lag).  The stroke behind
 //! the pen continuously reshapes as direction changes: the "taffy" feel.
 //!
@@ -39,12 +43,12 @@ pub fn register() -> StabilizerRegistration {
         type_id: "laplacian",
         display_name: "Laplacian Relaxation",
         params: PARAMS,
-        from_params: |params| {
+        from_params: |params, canvas_per_css_px| {
             let strength = match params.first() {
                 Some(ParamValue::Float(v)) => *v,
                 _ => 0.5,
             };
-            Box::new(LaplacianStabilizer::new(strength))
+            Box::new(LaplacianStabilizer::new(strength, canvas_per_css_px))
         },
     }
 }
@@ -53,34 +57,52 @@ pub fn register() -> StabilizerRegistration {
 /// smooths over about ten spacings.
 const MAX_SWEEPS: f32 = 160.0;
 
+/// Pen speed at and above which a point is pulled fully onto the chord
+/// between its neighbours each sweep. Below it the pull falls off linearly
+/// with speed.
+pub const REFERENCE_SPEED_CSS_PX_PER_S: f32 = 500.0;
+
 pub struct LaplacianStabilizer {
     raw_points: Vec<PaintInformation>,
     stabilized: Vec<PaintInformation>,
     /// Per interior point, its arc-length proportion between its raw
     /// neighbours: where on their chord relaxation places it.
     chord_t: Vec<f32>,
+    /// Per interior point, how far toward that chord each sweep moves it:
+    /// the pen's speed past it over the reference speed, at most 1.
+    pull: Vec<f32>,
     diff: DivergenceDiff,
     sweeps: u32,
+    /// Reference speed in canvas px/s at this stroke's view.
+    reference_speed: f32,
 }
 
 impl LaplacianStabilizer {
-    pub fn new(strength: f32) -> Self {
+    /// `canvas_per_css_px` is the stroke's view scale, which puts the
+    /// reference speed into canvas units.
+    pub fn new(strength: f32, canvas_per_css_px: f32) -> Self {
         let strength = strength.clamp(0.0, 1.0);
         Self {
             raw_points: Vec::with_capacity(256),
             stabilized: Vec::with_capacity(256),
             chord_t: Vec::with_capacity(256),
+            pull: Vec::with_capacity(256),
             diff: DivergenceDiff::new(DIVERGENCE_EPSILON),
             sweeps: (strength * strength * MAX_SWEEPS).ceil() as u32,
+            reference_speed: REFERENCE_SPEED_CSS_PX_PER_S * canvas_per_css_px,
         }
     }
 
     /// Each interior point's arc-length proportion between its raw
-    /// neighbours; 0.5 where a neighbour coincides with it.
-    fn compute_chord_t(&mut self) {
+    /// neighbours (0.5 where a neighbour coincides with it) and its pull,
+    /// from the pen's speed across those neighbours. Without timing (equal
+    /// timestamps) the pull is full.
+    fn compute_weights(&mut self) {
         self.chord_t.clear();
+        self.pull.clear();
         let raw = &self.raw_points;
         self.chord_t.push(0.5);
+        self.pull.push(1.0);
         for i in 1..raw.len().saturating_sub(1) {
             let before =
                 (raw[i].pos[0] - raw[i - 1].pos[0]).hypot(raw[i].pos[1] - raw[i - 1].pos[1]);
@@ -89,6 +111,12 @@ impl LaplacianStabilizer {
             let total = before + after;
             self.chord_t
                 .push(if total > 0.0 { before / total } else { 0.5 });
+            let dt = raw[i + 1].time - raw[i - 1].time;
+            self.pull.push(if dt > 0.0 {
+                (total / dt / self.reference_speed).min(1.0)
+            } else {
+                1.0
+            });
         }
     }
 
@@ -105,20 +133,25 @@ impl LaplacianStabilizer {
                 let prev = self.stabilized[i - 1];
                 let next = self.stabilized[i + 1];
                 let t = self.chord_t[i];
+                let pull = self.pull[i];
                 let cur = &mut self.stabilized[i];
 
-                // Position and every continuous sensor move onto the chord
-                // between their neighbours, at this point's own proportion.
+                // Position and every continuous sensor move toward the chord
+                // between their neighbours, at this point's own proportion,
+                // by this point's pull.
                 macro_rules! smooth_field {
                     ($field:ident) => {
-                        cur.$field = prev.$field + (next.$field - prev.$field) * t;
+                        let target = prev.$field + (next.$field - prev.$field) * t;
+                        cur.$field += (target - cur.$field) * pull;
                     };
                 }
 
-                cur.pos = [
+                let target = [
                     prev.pos[0] + (next.pos[0] - prev.pos[0]) * t,
                     prev.pos[1] + (next.pos[1] - prev.pos[1]) * t,
                 ];
+                cur.pos[0] += (target[0] - cur.pos[0]) * pull;
+                cur.pos[1] += (target[1] - cur.pos[1]) * pull;
                 smooth_field!(pressure);
                 smooth_field!(x_tilt);
                 smooth_field!(y_tilt);
@@ -142,7 +175,7 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
         self.stabilized.extend_from_slice(&self.raw_points);
 
         // Run relaxation.
-        self.compute_chord_t();
+        self.compute_weights();
         self.relax();
 
         // Find divergence. The walk is bounded by `max_divergence_window`,
@@ -191,6 +224,7 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
         self.raw_points.clear();
         self.stabilized.clear();
         self.chord_t.clear();
+        self.pull.clear();
         self.diff.clear();
     }
 }
@@ -217,7 +251,7 @@ mod tests {
 
     #[test]
     fn straight_line_stays_straight() {
-        let mut stab = LaplacianStabilizer::new(0.8);
+        let mut stab = LaplacianStabilizer::new(0.8, 1.0);
         for i in 0..10 {
             stab.push(make_point(i as f32 * 10.0, 0.0));
         }
@@ -230,7 +264,7 @@ mod tests {
 
     #[test]
     fn sharp_turn_is_smoothed() {
-        let mut stab = LaplacianStabilizer::new(0.8);
+        let mut stab = LaplacianStabilizer::new(0.8, 1.0);
 
         // Straight right, then sharp turn down.
         for i in 0..5 {
@@ -253,7 +287,7 @@ mod tests {
 
     #[test]
     fn strength_zero_is_pass_through() {
-        let mut stab = LaplacianStabilizer::new(0.0);
+        let mut stab = LaplacianStabilizer::new(0.0, 1.0);
         let points: Vec<_> = (0..5)
             .map(|i| make_point(i as f32 * 10.0, (i as f32).sin() * 5.0))
             .collect();
@@ -272,7 +306,7 @@ mod tests {
 
     #[test]
     fn first_and_last_pinned() {
-        let mut stab = LaplacianStabilizer::new(1.0);
+        let mut stab = LaplacianStabilizer::new(1.0, 1.0);
 
         // Zigzag pattern.
         stab.push(make_point(0.0, 0.0));
@@ -303,7 +337,7 @@ mod tests {
 
     #[test]
     fn divergence_detected_near_turn() {
-        let mut stab = LaplacianStabilizer::new(0.5);
+        let mut stab = LaplacianStabilizer::new(0.5, 1.0);
 
         // Build a straight stroke much longer than the smoothing reach.
         for i in 0..200 {
@@ -324,7 +358,7 @@ mod tests {
     fn sensor_values_smoothed() {
         // Gentle enough that a five-point stroke does not fully converge to
         // a straight ramp between its pinned ends.
-        let mut stab = LaplacianStabilizer::new(0.1);
+        let mut stab = LaplacianStabilizer::new(0.1, 1.0);
 
         // Pressure spike in the middle.
         stab.push(make_point_with_pressure(0.0, 0.0, 0.3));
@@ -356,7 +390,7 @@ mod tests {
     #[test]
     fn higher_strength_smooths_more() {
         fn corner_displacement(strength: f32) -> f32 {
-            let mut stab = LaplacianStabilizer::new(strength);
+            let mut stab = LaplacianStabilizer::new(strength, 1.0);
             for i in 0..5 {
                 stab.push(make_point(i as f32 * 10.0, 0.0));
             }
@@ -383,7 +417,7 @@ mod tests {
     /// midpoint rule does, and which made the stroke lurch at every commit.
     #[test]
     fn uneven_spacing_on_a_line_does_not_slide_points() {
-        let mut stab = LaplacianStabilizer::new(1.0);
+        let mut stab = LaplacianStabilizer::new(1.0, 1.0);
         for i in 0..20 {
             stab.push(make_point(i as f32 * 6.0, 0.0));
         }
@@ -398,13 +432,58 @@ mod tests {
         }
     }
 
+    /// Regression: smoothing follows the pen's speed. A corner the pen slowed
+    /// into keeps its shape, while the same corner taken at speed is cut.
+    #[test]
+    fn slow_corner_keeps_its_shape() {
+        fn corner_cut(slow_near_corner: bool) -> f32 {
+            let mut stab = LaplacianStabilizer::new(1.0, 1.0);
+            let mut t = 0.0f32;
+            let pts: Vec<[f32; 2]> = (0..=20)
+                .map(|i| [i as f32 * 6.0, 0.0])
+                .chain((1..=20).map(|i| [120.0, i as f32 * 6.0]))
+                .collect();
+            for (i, p) in pts.iter().enumerate() {
+                let near_corner = (i as i32 - 20).abs() <= 3;
+                let speed = if slow_near_corner && near_corner {
+                    40.0
+                } else {
+                    1000.0
+                };
+                t += 6.0 / speed;
+                stab.push(PaintInformation {
+                    pos: *p,
+                    time: t,
+                    ..Default::default()
+                });
+            }
+            stab.stabilized()
+                .iter()
+                .map(|p| (p.pos[0] - 120.0).hypot(p.pos[1]))
+                .fold(f32::INFINITY, f32::min)
+        }
+        let fast = corner_cut(false);
+        let slow = corner_cut(true);
+        assert!(
+            fast > 20.0,
+            "a corner taken at speed is smoothed: cut {fast}"
+        );
+        assert!(
+            slow < fast / 4.0,
+            "a corner the pen slowed into keeps its shape: cut {slow} vs {fast} at speed"
+        );
+    }
+
     /// `max_divergence_window` is the contract the checkpoint ring relies on
     /// for coverage. Lock the value to the influence-radius derivation so any
     /// future change is forced through this test (and the documentation).
     #[test]
     fn max_divergence_window_matches_influence_radius() {
         // strength = 0 → pass-through, no relaxation, no divergence window.
-        assert_eq!(LaplacianStabilizer::new(0.0).max_divergence_window(), 0);
+        assert_eq!(
+            LaplacianStabilizer::new(0.0, 1.0).max_divergence_window(),
+            0
+        );
 
         // sweeps = ceil(strength^2 * 160); window = sweeps + 1.
         for (strength, expected_iters) in [
@@ -414,7 +493,7 @@ mod tests {
             (0.8, 103),
             (1.0, 160),
         ] {
-            let stab = LaplacianStabilizer::new(strength);
+            let stab = LaplacianStabilizer::new(strength, 1.0);
             assert_eq!(
                 stab.max_divergence_window(),
                 expected_iters as usize + 1,
@@ -429,7 +508,7 @@ mod tests {
     /// `max_divergence_window` indices behind it.
     #[test]
     fn find_divergence_respects_max_window() {
-        let mut stab = LaplacianStabilizer::new(1.0);
+        let mut stab = LaplacianStabilizer::new(1.0, 1.0);
         let max_back = stab.max_divergence_window();
 
         // Build a long stroke with curvature so divergence is detected on

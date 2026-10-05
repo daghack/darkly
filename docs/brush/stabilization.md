@@ -209,6 +209,8 @@ Each tablet event follows one of three paths:
 2. Save a checkpoint in the same submission if enough distance has passed since the last one
 3. Composite
 
+**Whole-path strokes** (`stroke_path`) bypass this flow and the ring: every sample is stabilized in one batch and the final polyline is rendered once from the stroke-start state, which is what the full re-render path above converges to.
+
 ## Performance Characteristics
 
 | Metric | Naive approach | With checkpoint ring |

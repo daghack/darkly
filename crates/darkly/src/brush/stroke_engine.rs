@@ -9,7 +9,7 @@
 //! - Per-dab save points for rewind capability
 
 use super::eval::BrushGraphRunner;
-use super::gpu_context::BrushGpuContext;
+use super::gpu_context::{BrushGpuContext, MAX_DABS_PER_PHASE};
 use super::interpolation::{lerp_paint_info, CatmullRomSegment};
 use super::paint_info::{PaintInformation, StrokeRecord};
 use super::save_points::SavePointStore;
@@ -226,6 +226,13 @@ impl StrokeEngine {
     pub fn stabilize(&mut self, raw: PaintInformation) -> StabilizeResult {
         self.record.push(raw);
         self.stabilizer.push(raw)
+    }
+
+    /// Feed a whole known path to the stabilizer at once (see
+    /// [`StabilizerAlgorithm::push_all`]).
+    pub fn stabilize_all(&mut self, raws: &[PaintInformation]) {
+        self.record.events.extend_from_slice(raws);
+        self.stabilizer.push_all(raws);
     }
 
     /// The stabilizer's conservative max divergence window (vector indices).
@@ -583,6 +590,15 @@ impl StrokeEngine {
 
         self.dab_count += 1;
         gpu.perf.record_dab();
+
+        // A dab-batching terminal holds its whole queue until the phase
+        // flushes, in one buffer sized to `MAX_DABS_PER_PHASE`. A phase that
+        // reaches the cap (a long path drawn in one go) flushes and submits
+        // here so the next dab starts a fresh queue.
+        if gpu.dab_batch.count >= MAX_DABS_PER_PHASE {
+            self.runner.flush_dabs(gpu);
+            gpu.submit_and_continue("brush-dab-cap-flush");
+        }
     }
 
     /// Render only the tail of the stabilized polyline: the latest point.
@@ -674,6 +690,20 @@ impl StrokeEngine {
         region: Option<crate::coord::LayerRect>,
     ) {
         self.runner.begin_stroke(gpu, region);
+    }
+
+    /// Render the whole stabilized polyline from the terminal's stroke-start
+    /// state and commit it, all into `gpu`: the stroke as a from-scratch
+    /// re-render of its final polyline would leave it. For a path whose
+    /// every sample is known up front (the brush preview, a whole-path
+    /// stroke), so no segment is ever drawn without its real lookahead.
+    pub fn render_whole(&mut self, gpu: &mut BrushGpuContext) {
+        self.begin_stroke(gpu, None);
+        self.reset_render_state();
+        if let Some(end) = self.stabilizer.len().checked_sub(1) {
+            self.render_from_stabilized_range_to(gpu, 0, end);
+        }
+        self.commit(gpu);
     }
 
     /// Delegate the per-pen-event commit hook to every GPU terminal. Called

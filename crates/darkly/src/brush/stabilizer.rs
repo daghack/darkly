@@ -101,6 +101,16 @@ pub trait StabilizerAlgorithm: Send {
     /// Append a raw input point, run the algorithm, and return the result.
     fn push(&mut self, point: PaintInformation) -> StabilizeResult;
 
+    /// Append a whole known path at once. The stabilized polyline afterwards
+    /// is the one `push`ing each point in turn would leave; no divergence is
+    /// reported, since nothing was drawn before. An algorithm whose `push`
+    /// redoes whole-stroke work overrides this to do it once.
+    fn push_all(&mut self, points: &[PaintInformation]) {
+        for point in points {
+            self.push(*point);
+        }
+    }
+
     /// The current stabilized polyline (full stroke).
     fn stabilized(&self) -> &[PaintInformation];
 

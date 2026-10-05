@@ -151,6 +151,19 @@ impl StabilizerAlgorithm for LaplacianStabilizer {
         StabilizeResult { divergence_index }
     }
 
+    /// `push` relaxes the whole polyline from the raw points every time, so
+    /// the last push's result depends only on the full raw list: relaxing
+    /// once gives the same polyline, bit for bit, in O(N·L) instead of
+    /// O(N·L²).
+    fn push_all(&mut self, points: &[PaintInformation]) {
+        self.raw_points.extend_from_slice(points);
+        self.stabilized.clear();
+        self.stabilized.extend_from_slice(&self.raw_points);
+        self.relax();
+        // Only `push` reads these, and it overwrites them first.
+        self.prev_positions.clear();
+    }
+
     fn stabilized(&self) -> &[PaintInformation] {
         &self.stabilized
     }
@@ -201,6 +214,52 @@ mod tests {
             pressure,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn push_all_matches_sequential_push() {
+        let points: Vec<PaintInformation> = (0..200)
+            .map(|i| {
+                let t = i as f32 * 0.1;
+                PaintInformation {
+                    pos: [t * 20.0 + (t * 3.0).sin() * 7.0, (t * 1.7).cos() * 30.0],
+                    pressure: 0.5 + 0.4 * (t * 2.3).sin(),
+                    x_tilt: (t * 0.9).sin(),
+                    y_tilt: (t * 1.1).cos(),
+                    rotation: t * 0.2,
+                    tangential_pressure: (t * 0.5).sin(),
+                    speed: (t * 0.7).cos().abs(),
+                    tilt_magnitude: (t * 0.3).sin().abs(),
+                    tilt_direction: t * 0.4,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let mut sequential = LaplacianStabilizer::new(0.6);
+        for p in &points {
+            sequential.push(*p);
+        }
+        let mut batch = LaplacianStabilizer::new(0.6);
+        batch.push_all(&points[..1]);
+        batch.push_all(&points[1..]);
+        let bits = |p: &PaintInformation| {
+            [
+                p.pos[0],
+                p.pos[1],
+                p.pressure,
+                p.x_tilt,
+                p.y_tilt,
+                p.rotation,
+                p.tangential_pressure,
+                p.speed,
+                p.tilt_magnitude,
+                p.tilt_direction,
+            ]
+            .map(f32::to_bits)
+        };
+        let a: Vec<_> = sequential.stabilized().iter().map(bits).collect();
+        let b: Vec<_> = batch.stabilized().iter().map(bits).collect();
+        assert_eq!(a, b);
     }
 
     #[test]

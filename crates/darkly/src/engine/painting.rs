@@ -474,17 +474,16 @@ impl DarklyEngine {
         self.gpu_stroke_to(layer_id, op);
     }
 
-    /// GPU paint path for all stroke operations.
-    fn gpu_stroke_to(&mut self, layer_id: LayerId, op: StrokeOp) {
+    /// What every stroke op needs before it draws: the lock and paintability
+    /// gate, growing the target to cover the op, and (first op of a stroke)
+    /// the undo snapshot. Returns `false` when the op must not draw.
+    fn prepare_stroke_op(&mut self, layer_id: LayerId, op: &StrokeOp) -> bool {
         // Defensive: `begin_stroke` already gates on the lock and paintability,
         // but stroke ops can arrive from other paths (e.g. flood-fill StrokeOp
         // routed directly). One predicate at the choke point covers all of them.
         if !self.doc.is_node_editable(layer_id) || !self.is_node_paintable(layer_id) {
-            return;
+            return false;
         }
-        let canvas_w = self.compositor.canvas_width();
-        let canvas_h = self.compositor.canvas_height();
-
         // An op can reach past the target's current canvas extent: a brush
         // wanders off a paste-extent layer, a gradient claims a canvas the
         // layer predates. Grow the texture in chunked steps first, so the dab
@@ -512,7 +511,7 @@ impl DarklyEngine {
             // so split borrowing of `region_scratch` works.
             let (frame, format) = match self.compositor.node_texture(layer_id) {
                 Some(t) => (t.canvas_frame(), t.format()),
-                None => return,
+                None => return false,
             };
 
             let saved_rect = frame.canvas_extent;
@@ -527,6 +526,70 @@ impl DarklyEngine {
             });
             self.scratch_snapshot = Some(snap);
         }
+        true
+    }
+
+    /// Paint a whole brush stroke whose samples are all known up front.
+    ///
+    /// The result is what `begin_stroke(layer)`, `stroke_to(op)` for each op
+    /// and `end_stroke()` leave behind when every event re-renders the final
+    /// polyline from scratch: the stroke is stabilized as a whole and drawn
+    /// once, with no per-event redraw, rewind, commit or prediction. Undo is
+    /// recorded as for any stroke. Only `StrokeOp::BrushStroke` ops are
+    /// accepted; anything else, or an open stroke, refuses before any state
+    /// changes.
+    pub fn stroke_path(&mut self, layer: LayerId, ops: &[StrokeOp]) -> Result<(), String> {
+        if self.active_stroke_layer.is_some() {
+            return Err("a stroke is already in progress".into());
+        }
+        let mut samples = Vec::with_capacity(ops.len());
+        let mut color = None;
+        for (i, op) in ops.iter().enumerate() {
+            let (info, c) = op
+                .pen_sample()
+                .ok_or_else(|| format!("stroke_path op {i} is not a brush stroke sample"))?;
+            color.get_or_insert(c);
+            samples.push(info);
+        }
+        self.begin_stroke(layer)?;
+        if let Some(color) = color {
+            // Every op's growth and the undo snapshot first, so the stroke
+            // buffer is created once at the final extent.
+            let mut paintable = true;
+            for op in ops {
+                paintable &= self.prepare_stroke_op(layer, op);
+            }
+            if paintable {
+                let canvas_w = self.compositor.canvas_width();
+                let canvas_h = self.compositor.canvas_height();
+                self.brush_stroke_to(
+                    layer,
+                    BrushRender::Path(&samples),
+                    color,
+                    canvas_w,
+                    canvas_h,
+                );
+                self.compositor.mark_node_pixels_dirty(layer);
+            }
+        }
+        self.end_stroke();
+        Ok(())
+    }
+
+    /// Seed every following stroke's `random` nodes with `seed`, or with a
+    /// fresh wall-clock seed per stroke when `None` (the default). For
+    /// embedders that need random-node brushes to render reproducibly.
+    pub fn set_stroke_seed(&mut self, seed: Option<u32>) {
+        self.stroke_seed = seed;
+    }
+
+    /// GPU paint path for all stroke operations.
+    fn gpu_stroke_to(&mut self, layer_id: LayerId, op: StrokeOp) {
+        if !self.prepare_stroke_op(layer_id, &op) {
+            return;
+        }
+        let canvas_w = self.compositor.canvas_width();
+        let canvas_h = self.compositor.canvas_height();
 
         match op {
             StrokeOp::LinearGradient {
@@ -591,31 +654,12 @@ impl DarklyEngine {
                     tolerance,
                 );
             }
-            StrokeOp::BrushStroke {
-                x,
-                y,
-                pressure,
-                x_tilt,
-                y_tilt,
-                rotation,
-                tangential_pressure,
-                time_ms,
-                cr,
-                cg,
-                cb,
-                ca,
-            } => {
+            StrokeOp::BrushStroke { .. } => {
+                let (info, color) = op.pen_sample().expect("a brush stroke op is a pen sample");
                 self.brush_stroke_to(
                     layer_id,
-                    x,
-                    y,
-                    pressure,
-                    x_tilt,
-                    y_tilt,
-                    rotation,
-                    tangential_pressure,
-                    time_ms,
-                    [cr, cg, cb, ca],
+                    BrushRender::Event(info),
+                    color,
                     canvas_w,
                     canvas_h,
                 );
@@ -889,14 +933,7 @@ impl DarklyEngine {
     fn brush_stroke_to(
         &mut self,
         layer_id: LayerId,
-        x: f32,
-        y: f32,
-        pressure: f32,
-        x_tilt: f32,
-        y_tilt: f32,
-        rotation: f32,
-        tangential_pressure: f32,
-        time_ms: f64,
+        render: BrushRender<'_>,
         color: [f32; 4],
         canvas_w: u32,
         canvas_h: u32,
@@ -960,7 +997,7 @@ impl DarklyEngine {
             // inner stabilizer is used bare.
             let horizon_ms = self.prediction_horizon_ms();
             let stabilizer: Box<dyn crate::brush::stabilizer::StabilizerAlgorithm> =
-                if strength > 0.0 && horizon_ms > 0.0 {
+                if strength > 0.0 && horizon_ms > 0.0 && render.predicts() {
                     Box::new(crate::brush::stabilizer::PredictingStabilizer::new(
                         inner, horizon_ms,
                     ))
@@ -975,7 +1012,7 @@ impl DarklyEngine {
                 self.active_base_size(),
                 stabilizer,
                 clone_source_anchor,
-                StrokeEngine::random_seed(),
+                self.stroke_seed.unwrap_or_else(StrokeEngine::random_seed),
                 self.active_stamp_angle_rate(),
                 self.doc.dpi,
             ));
@@ -1090,18 +1127,6 @@ impl DarklyEngine {
             }
         }
 
-        // Build PaintInformation from the raw tablet data.
-        let info = PaintInformation {
-            pos: [x, y],
-            pressure,
-            x_tilt,
-            y_tilt,
-            rotation,
-            tangential_pressure,
-            time: (time_ms / 1000.0) as f32,
-            ..Default::default()
-        };
-
         // Get the paint target (layer or mask): encapsulates format and
         // brush-side commit dispatch so the brush stack stays format-agnostic.
         // Inline dispatch (vs `self.paint_target(...)`) for borrow-checker
@@ -1115,7 +1140,7 @@ impl DarklyEngine {
 
         // Take the stroke engine and buffer out to avoid borrow conflicts.
         let mut engine = self.brush_stroke_engine.take().unwrap();
-        let mut stroke_buffer = self.stroke_buffer.take();
+        let mut stroke_buffer_slot = self.stroke_buffer.take();
 
         let sel_bg = if self.has_selection() {
             self.compositor
@@ -1126,7 +1151,7 @@ impl DarklyEngine {
             &self.brush_pipelines.default_selection_bind_group
         };
 
-        if let Some(ref mut stroke_buffer) = stroke_buffer {
+        if let Some(ref mut stroke_buffer) = stroke_buffer_slot {
             // Refresh the clone source frame every pen event: the frozen
             // snapshot's rect when one exists (cross-layer / merged),
             // else the paint target's *current* extent, which re-reads
@@ -1141,39 +1166,6 @@ impl DarklyEngine {
             // Stabilized path: dabs render into the scratch, then the
             // terminal's `commit` hook lands them on the layer.
             self.brush_pipelines.reset_uniform_rings();
-            let result = engine.stabilize(info);
-            let max_div = engine.max_divergence_window();
-            let tip_vi = engine.stabilizer_len().saturating_sub(1);
-
-            // Synthesize divergence on the previously-rendered tip segment.
-            // It was drawn with a degenerate `p3 = p2` because the next
-            // sample hadn't arrived yet; now it has, so re-render that
-            // segment with proper Catmull-Rom lookahead.  `tip_div` is
-            // the deeper of the two when the stabilizer also reports
-            // divergence (take the earliest vi that needs rebuild).
-            let tip_div = tip_vi.saturating_sub(1);
-            let div_idx = match result.divergence_index {
-                Some(k) => Some(k.min(tip_div)),
-                None if tip_vi >= 1 => Some(tip_div),
-                None => None,
-            };
-
-            // The checkpoint ring's coverage invariant depends on
-            // `max_divergence_window` being a true upper bound on
-            // `tip_vi - find_divergence().unwrap()`. Make any future drift
-            // between the stabilizer's bound and its detector loud in debug
-            // builds. (The synthetic tip-divergence path is always within
-            // bound by construction, but `result.divergence_index` is what
-            // the stabilizer reported.)
-            #[cfg(debug_assertions)]
-            if let Some(k) = result.divergence_index {
-                let earliest = tip_vi.saturating_sub(max_div);
-                debug_assert!(
-                    k >= earliest,
-                    "stabilizer returned divergence_index={k} but max_div={max_div} \
-                     requires >= {earliest} (tip_vi={tip_vi})",
-                );
-            }
 
             // Helper macro: create a BrushGpuContext wired with the stroke
             // scratch, paint target (layer or mask), and pre-stroke snapshot.
@@ -1220,6 +1212,56 @@ impl DarklyEngine {
                         dab_batch: DabBatch::default(),
                     }
                 }};
+            }
+
+            let info = match render {
+                // The whole path is known: stabilize it in one batch and
+                // render it once with every segment's real lookahead. No
+                // checkpoints, rewinds or per-event commits, and no
+                // first-event `begin_stroke` below (`render_whole` runs it).
+                BrushRender::Path(points) => {
+                    engine.stabilize_all(points);
+                    let mut gpu_ctx = make_gpu_ctx!("brush-stroke-path");
+                    engine.render_whole(&mut gpu_ctx);
+                    self.brush_perf += gpu_ctx.submit_final();
+                    self.brush_stroke_engine = Some(engine);
+                    self.stroke_buffer = stroke_buffer_slot;
+                    return;
+                }
+                BrushRender::Event(info) => info,
+            };
+            let result = engine.stabilize(info);
+            let max_div = engine.max_divergence_window();
+            let tip_vi = engine.stabilizer_len().saturating_sub(1);
+
+            // Synthesize divergence on the previously-rendered tip segment.
+            // It was drawn with a degenerate `p3 = p2` because the next
+            // sample hadn't arrived yet; now it has, so re-render that
+            // segment with proper Catmull-Rom lookahead.  `tip_div` is
+            // the deeper of the two when the stabilizer also reports
+            // divergence (take the earliest vi that needs rebuild).
+            let tip_div = tip_vi.saturating_sub(1);
+            let div_idx = match result.divergence_index {
+                Some(k) => Some(k.min(tip_div)),
+                None if tip_vi >= 1 => Some(tip_div),
+                None => None,
+            };
+
+            // The checkpoint ring's coverage invariant depends on
+            // `max_divergence_window` being a true upper bound on
+            // `tip_vi - find_divergence().unwrap()`. Make any future drift
+            // between the stabilizer's bound and its detector loud in debug
+            // builds. (The synthetic tip-divergence path is always within
+            // bound by construction, but `result.divergence_index` is what
+            // the stabilizer reported.)
+            #[cfg(debug_assertions)]
+            if let Some(k) = result.divergence_index {
+                let earliest = tip_vi.saturating_sub(max_div);
+                debug_assert!(
+                    k >= earliest,
+                    "stabilizer returned divergence_index={k} but max_div={max_div} \
+                     requires >= {earliest} (tip_vi={tip_vi})",
+                );
             }
 
             // First event of the stroke: let the terminal set up its scratch.
@@ -1416,14 +1458,16 @@ impl DarklyEngine {
                     dab_batch: DabBatch::default(),
                 };
                 self.brush_pipelines.reset_uniform_rings();
-                engine.move_to(info, &mut gpu_ctx);
+                for info in render.samples() {
+                    engine.move_to(*info, &mut gpu_ctx);
+                }
                 let _ = gpu_ctx.submit_final();
             }
         }
 
         // Put the engine and buffer back.
         self.brush_stroke_engine = Some(engine);
-        self.stroke_buffer = stroke_buffer;
+        self.stroke_buffer = stroke_buffer_slot;
     }
 
     /// Start async GPU flood fill: readback paint target texture, then
@@ -1773,4 +1817,27 @@ fn save_checkpoint(
         tip_vi,
         max_div,
     );
+}
+
+/// What a call to `brush_stroke_to` renders: one live pen event, or a whole
+/// path whose every sample is already known (`DarklyEngine::stroke_path`).
+enum BrushRender<'a> {
+    Event(PaintInformation),
+    Path(&'a [PaintInformation]),
+}
+
+impl BrushRender<'_> {
+    /// Prediction hides pen-to-pixel latency by drawing ahead of the pen. A
+    /// whole path has no latency to hide, and a predicted tail would extend
+    /// it past its last sample.
+    fn predicts(&self) -> bool {
+        matches!(self, BrushRender::Event(_))
+    }
+
+    fn samples(&self) -> &[PaintInformation] {
+        match self {
+            BrushRender::Event(info) => std::slice::from_ref(info),
+            BrushRender::Path(points) => points,
+        }
+    }
 }

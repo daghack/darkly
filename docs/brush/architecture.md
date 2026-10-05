@@ -84,6 +84,19 @@ no policy about what paint strokes vs warp strokes do; each terminal
 declares its semantics in its own file, and `BrushGraphRunner` dispatches the
 hooks at the right moments.
 
+### Whole-path strokes
+
+`DarklyEngine::stroke_path(layer, &[StrokeOp])` paints a stroke whose every
+sample is known up front (offline rendering, replay). It runs each op's
+growth and undo prelude first, so the stroke buffer is created once at the
+final extent, then stabilizes all samples in one batch
+(`StabilizerAlgorithm::push_all`) and calls `StrokeEngine::render_whole`:
+`begin_stroke`, every dab of the final polyline, `commit`, in one submission
+(more only at the dab-queue cap). No checkpoints, rewinds, per-event commits
+or prediction. The result equals the live path forced through a full
+re-render on every event; at stabilizer strength 0 it also equals the
+default live path. The brush preview renders through `render_whole` too.
+
 ## Why the stroke buffer exists
 
 The engine always creates a pair of stroke-scoped textures at stroke start:
@@ -484,7 +497,10 @@ Each pipeline owns a `DynamicUniformRing` (~256 slots). A dab's uniform block
 is written to the next slot; the dynamic offset is passed to `set_bind_group`.
 This means all dabs in a stroke segment go through **one** encoder and **one**
 `queue.submit()`, instead of per-dab submission. When any ring nears capacity
-the engine flushes mid-stroke (cheap: a few per 1000 dabs).
+the engine flushes mid-stroke (cheap: a few per 1000 dabs). Dab-batching
+terminals hold their queue on the CPU in a buffer sized to
+`MAX_DABS_PER_PHASE`; `StrokeEngine::place_dab` flushes the terminals and
+submits when a phase reaches it, which only a whole-path render does.
 
 ### `ensure_canvas_copy`
 

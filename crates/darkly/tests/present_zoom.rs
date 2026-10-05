@@ -98,8 +98,16 @@ fn assert_eighth_zoom_box_average(rotation: f32) {
             );
         }
     }
+    // Each mip level is stored as 8-bit colour, and every halving of this
+    // pattern lands on an exact half (127.5, 191.5, 223.5). How a store rounds
+    // a tie is implementation-defined, so level 3 reads 223 on some adapters
+    // and 224 on others (Mesa lavapipe). Both are within 1 of the true mean.
     let mean = sum as f32 / (vw * vh) as f32;
-    assert!((mean - 223.0).abs() < 1.0, "viewport mean {mean}, want 223");
+    let box_mean = 255.0 * 7.0 / 8.0;
+    assert!(
+        (mean - box_mean).abs() < 1.0,
+        "viewport mean {mean}, want {box_mean} +- 1"
+    );
 }
 
 #[test]

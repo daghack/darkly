@@ -1299,6 +1299,19 @@ impl DarklyEngine {
         self.compositor.composite_runs()
     }
 
+    /// Root mip chains actually regenerated for the present: see
+    /// [`crate::gpu::compositor::Compositor::present_mip_runs`].
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_present_mip_runs(&self) -> u64 {
+        self.compositor.present_mip_runs()
+    }
+
+    /// Mip levels the root composite texture was allocated with.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_root_mip_levels(&self) -> u32 {
+        self.compositor.composited_texture().mip_level_count()
+    }
+
     /// Group walks that resumed from a captured prefix. Lets a reuse test
     /// prove it exercised the resume path rather than silently full-walking.
     #[cfg(any(test, feature = "testing"))]

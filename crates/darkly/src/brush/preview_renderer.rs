@@ -225,6 +225,9 @@ impl BrushStrokePreviewRenderer {
             spacing,
             base_size,
             Box::new(PassThrough::new()),
+            // A preview renders its path once and never diffs, so the
+            // epsilon is unused; the reference scale is the honest value.
+            crate::brush::stroke_engine::DIVERGENCE_EPSILON,
             clone_source_anchor,
             PREVIEW_STROKE_SEED,
             brush_settings::stamp_angle_rate(graph),
@@ -246,7 +249,7 @@ impl BrushStrokePreviewRenderer {
         // `render_from_stabilized_range_to` walks them verbatim. No
         // smoothing, no lag: the S-curve is exactly what we handed in.
         for pt in path {
-            let _ = engine.stabilize(*pt);
+            engine.stabilize(*pt);
         }
 
         let sel_bg = pipelines.default_selection_bind_group();

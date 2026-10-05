@@ -19,99 +19,16 @@ use super::paint_info::PaintInformation;
 use super::resampler::{ResamplingStabilizer, RESAMPLE_SPACING_CSS_PX};
 use crate::gpu::params::{ParamDef, ParamValue};
 
-/// Result of pushing a new point through the stabilizer.
-pub struct StabilizeResult {
-    /// Earliest dab index that needs re-rendering (everything from here
-    /// to the tip has changed).  `None` means nothing diverged: only
-    /// new points were appended.
-    pub divergence_index: Option<usize>,
-}
-
-/// Distance in CSS pixels below which a stabilized point is considered
-/// unchanged since it was rendered. [`stroke_stabilizer_stack`] scales it to
-/// canvas pixels at the stroke's zoom; a bare algorithm uses it unscaled.
-///
-/// Neighbouring vertices are re-rendered at different moments, so this is
-/// also the amplitude of the ripple the rendered stroke can carry that the
-/// smoothed polyline does not. A tenth of a pixel keeps that below what a
-/// thin antialiased stroke shows; a wider tolerance made quick wide curves
-/// look faintly jagged.
-pub const DIVERGENCE_EPSILON: f32 = 0.1;
-
-/// Find the earliest rendered index whose position is more than `epsilon`
-/// from where it was rendered, looking no further back than `max_window`
-/// indices behind the tip.
-///
-/// `current` is this push's polyline, `rendered` the positions its vertices
-/// were last rendered at. Vertices behind the window cannot have moved since
-/// their last render (the window is the caller's bound on how far a push
-/// reaches), so the scan is bounded. Within the window every index is
-/// checked: vertices are re-rendered at different times, so one that sits
-/// within tolerance of its own recent render says nothing about the older
-/// renders behind it.
-///
-/// Returns `None` when every rendered index is within tolerance, even if the
-/// polyline grew: new indices have never been rendered, so appending them
-/// needs no rewind. Callers go through [`DivergenceDiff`].
-fn find_divergence(
-    current: &[PaintInformation],
-    rendered: &[[f32; 2]],
-    max_window: usize,
-    epsilon: f32,
-) -> Option<usize> {
-    let overlap = rendered.len().min(current.len());
-    let earliest = current.len().saturating_sub(max_window + 1);
-    let eps2 = epsilon * epsilon;
-    (earliest..overlap).find(|&i| {
-        let cur = current[i].pos;
-        let was = rendered[i];
-        let dx = cur[0] - was[0];
-        let dy = cur[1] - was[1];
-        dx * dx + dy * dy >= eps2
-    })
-}
-
-/// The positions each vertex of an output polyline was last rendered at, and
-/// the diff of a new polyline against them.
-///
-/// Comparing against rendered positions rather than the previous push keeps
-/// every rendered vertex within `epsilon` of where it now lies: a vertex that
-/// drifts a little on every push is re-rendered once its accumulated drift
-/// reaches `epsilon`, instead of never.
-pub struct DivergenceDiff {
-    rendered: Vec<[f32; 2]>,
-    epsilon: f32,
-}
-
-impl DivergenceDiff {
-    /// A diff that treats moves shorter than `epsilon` canvas px as unchanged.
-    pub fn new(epsilon: f32) -> Self {
-        Self {
-            rendered: Vec::with_capacity(256),
-            epsilon,
-        }
-    }
-
-    /// Diff `current` against the rendered positions and report the first
-    /// index to re-render, recording `current` as rendered from there on.
-    pub fn update(&mut self, current: &[PaintInformation], max_window: usize) -> Option<usize> {
-        let divergence = find_divergence(current, &self.rendered, max_window, self.epsilon);
-        let from = divergence.unwrap_or(self.rendered.len());
-        self.rendered.truncate(from);
-        self.rendered.extend(current[from..].iter().map(|p| p.pos));
-        divergence
-    }
-
-    /// Forget the rendered positions for a new stroke.
-    pub fn clear(&mut self) {
-        self.rendered.clear();
-    }
-}
-
 /// The trait that all stabilizer algorithms implement.
+///
+/// An algorithm is pure geometry: it turns input points into a polyline and
+/// bounds how far a push can reach behind the tip. Which vertices moved since
+/// the stroke was last rendered is the renderer's question, answered by the
+/// stroke engine's [`DivergenceDiff`](super::stroke_engine::DivergenceDiff)
+/// against that bound.
 pub trait StabilizerAlgorithm: Send {
-    /// Append a raw input point, run the algorithm, and return the result.
-    fn push(&mut self, point: PaintInformation) -> StabilizeResult;
+    /// Append a raw input point and run the algorithm.
+    fn push(&mut self, point: PaintInformation);
 
     /// Forget the most recent point, so the next `push` replaces it. The
     /// polyline is only meaningful again after that push.
@@ -130,9 +47,11 @@ pub trait StabilizerAlgorithm: Send {
         self.stabilized().is_empty()
     }
 
-    /// Conservative upper bound on how far back from the tip divergence
-    /// can reach (in vector indices). Used to space checkpoints so the
-    /// oldest one is past the divergence boundary.
+    /// Conservative upper bound, in vector indices, on how far behind the tip
+    /// as it stood before a push that push can move a vertex. Measured from
+    /// the earlier tip, the bound holds over any number of pushes between two
+    /// renders. Used to bound the divergence walk and to space checkpoints so
+    /// the oldest one is past the divergence boundary.
     fn max_divergence_window(&self) -> usize {
         0
     }
@@ -162,11 +81,8 @@ impl PassThrough {
 }
 
 impl StabilizerAlgorithm for PassThrough {
-    fn push(&mut self, point: PaintInformation) -> StabilizeResult {
+    fn push(&mut self, point: PaintInformation) {
         self.points.push(point);
-        StabilizeResult {
-            divergence_index: None,
-        }
     }
 
     fn retract_tip(&mut self) {
@@ -200,12 +116,12 @@ const HEADING_WINDOW: usize = 3;
 /// extrapolated tail past the real tip, so ink appears ahead of the pen and
 /// hides the residual pen-to-pixel latency.
 ///
-/// The predicted points live in `stabilized()` **and** in the polyline
-/// [`DivergenceDiff`] diffs, so the engine's existing rewind rewrites them
-/// every frame: no separate render target, no parallel path. The predicted
-/// count is constant once engaged, so the combined polyline grows as the
-/// inner's does (by any number of vertices per push under resampling) and
-/// reshapes: both cases the diff handles.
+/// The predicted points live in `stabilized()`, which the stroke engine diffs
+/// against what it rendered, so its existing rewind rewrites them every
+/// frame: no separate render target, no parallel path. The predicted count is
+/// constant once engaged, so the combined polyline grows as the inner's does
+/// (by any number of vertices per push under resampling) and reshapes: both
+/// cases the diff handles.
 ///
 /// Only constructed when a real stabilizer is active (strength > 0) and a
 /// look-ahead horizon is configured (> 0); see the engine's stroke-start path.
@@ -213,21 +129,26 @@ pub struct PredictingStabilizer {
     inner: Box<dyn StabilizerAlgorithm>,
     /// Real + predicted polyline: what `stabilized()` returns.
     combined: Vec<PaintInformation>,
-    /// Rendered positions of `combined` (divergence diff input).
-    diff: DivergenceDiff,
+    /// Length of the real (inner) prefix of `combined`.
+    real_len: usize,
     /// Look-ahead horizon in seconds (converted from the ms port value).
     horizon_secs: f32,
+    /// Vertices copied from the inner polyline, for tests that bound it.
+    #[cfg(test)]
+    copied_vertices: u64,
 }
 
 impl PredictingStabilizer {
     /// Wrap `inner` with prediction over a `horizon_ms` millisecond
-    /// look-ahead, treating moves under `epsilon` canvas px as unchanged.
-    pub fn new(inner: Box<dyn StabilizerAlgorithm>, horizon_ms: f32, epsilon: f32) -> Self {
+    /// look-ahead.
+    pub fn new(inner: Box<dyn StabilizerAlgorithm>, horizon_ms: f32) -> Self {
         Self {
             inner,
             combined: Vec::with_capacity(256),
-            diff: DivergenceDiff::new(epsilon),
+            real_len: 0,
             horizon_secs: (horizon_ms / 1000.0).max(0.0),
+            #[cfg(test)]
+            copied_vertices: 0,
         }
     }
 
@@ -304,26 +225,32 @@ impl PredictingStabilizer {
 }
 
 impl StabilizerAlgorithm for PredictingStabilizer {
-    fn push(&mut self, point: PaintInformation) -> StabilizeResult {
+    fn push(&mut self, point: PaintInformation) {
         // Advance the inner (real) stabilizer, then rebuild the combined
-        // polyline from its relaxed output.
+        // polyline from its relaxed output. The push cannot have moved inner
+        // vertices further than its window behind the previous real tip, so
+        // the prefix before that is already in `combined` and only the rest,
+        // with the stale predicted tail, is replaced.
         self.inner.push(point);
-        self.combined.clear();
-        self.combined.extend_from_slice(self.inner.stabilized());
-        let real_len = self.combined.len();
+        let inner = self.inner.stabilized();
+        let unchanged = self
+            .real_len
+            .min(inner.len())
+            .saturating_sub(self.inner.max_divergence_window() + 1);
+        self.combined.truncate(unchanged);
+        self.combined.extend_from_slice(&inner[unchanged..]);
+        #[cfg(test)]
+        {
+            self.copied_vertices += (inner.len() - unchanged) as u64;
+        }
+        let real_len = inner.len();
+        self.real_len = real_len;
 
         // Append the predicted extension once enough real vertices exist.
         let n = self.predicted_points();
         if n > 0 && real_len >= MIN_REAL_FOR_PREDICTION {
             self.append_prediction(real_len, n);
         }
-
-        // Divergence over the FULL combined polyline (not the inner's
-        // real-only result), with the widened window, which is what makes the
-        // existing rewind rewrite the predicted tail every frame.
-        let window = self.max_divergence_window();
-        let divergence_index = self.diff.update(&self.combined, window);
-        StabilizeResult { divergence_index }
     }
 
     fn retract_tip(&mut self) {
@@ -344,7 +271,7 @@ impl StabilizerAlgorithm for PredictingStabilizer {
     fn clear(&mut self) {
         self.inner.clear();
         self.combined.clear();
-        self.diff.clear();
+        self.real_len = 0;
     }
 }
 
@@ -436,10 +363,10 @@ impl StabilizerRegistry {
 /// look-ahead horizon is set.
 ///
 /// `canvas_per_css_px` is the canvas pixels one CSS pixel of pen travel spans
-/// at the stroke's view (`device_pixel_ratio / zoom`). The resample spacing,
-/// the divergence epsilon and the algorithm's own CSS-pixel quantities are
-/// all scaled by it, so the smoothing reach and what counts as a move are
-/// the same on screen at every zoom and pixel ratio. Decorators engage only over an algorithm that can reshape rendered
+/// at the stroke's view (`device_pixel_ratio / zoom`). The resample spacing
+/// and the algorithm's own CSS-pixel quantities are scaled by it, so the
+/// smoothing reach is the same on screen at every zoom and pixel ratio.
+/// Decorators engage only over an algorithm that can reshape rendered
 /// vertices (`max_divergence_window() > 0`).
 pub fn stroke_stabilizer_stack(
     registry: &StabilizerRegistry,
@@ -451,18 +378,12 @@ pub fn stroke_stabilizer_stack(
     if inner.max_divergence_window() == 0 {
         return inner;
     }
-    let epsilon = DIVERGENCE_EPSILON * canvas_per_css_px;
     let inner = Box::new(ResamplingStabilizer::new(
         inner,
         RESAMPLE_SPACING_CSS_PX * canvas_per_css_px,
-        epsilon,
     ));
     if prediction_horizon_ms > 0.0 {
-        Box::new(PredictingStabilizer::new(
-            inner,
-            prediction_horizon_ms,
-            epsilon,
-        ))
+        Box::new(PredictingStabilizer::new(inner, prediction_horizon_ms))
     } else {
         inner
     }
@@ -482,6 +403,7 @@ pub struct StabilizerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::brush::stroke_engine::{DivergenceDiff, DIVERGENCE_EPSILON};
 
     #[test]
     fn pass_through_identity() {
@@ -492,8 +414,7 @@ mod tests {
                 pressure: 0.5,
                 ..Default::default()
             };
-            let result = stab.push(pt);
-            assert!(result.divergence_index.is_none());
+            stab.push(pt);
         }
         assert_eq!(stab.len(), 5);
         // Points are unchanged (no smoothing).
@@ -574,29 +495,7 @@ mod tests {
         assert!(types.iter().any(|(id, _, _)| *id == "laplacian"));
     }
 
-    // ── DivergenceDiff ──────────────────────────────────────────────────
-
-    fn at(x: f32) -> PaintInformation {
-        PaintInformation {
-            pos: [x, 0.0],
-            ..Default::default()
-        }
-    }
-
-    /// Regression: a vertex that moved is reported even when a vertex nearer
-    /// the tip did not. The walk used to stop at the first unchanged vertex,
-    /// so vertices behind a freshly rendered one accumulated drift unchecked
-    /// and snapped into place much later, leaving a visible disconnect.
-    #[test]
-    fn moved_vertex_behind_an_unchanged_one_is_reported() {
-        let mut diff = DivergenceDiff::new(0.5);
-        assert_eq!(diff.update(&[at(0.0), at(10.0), at(20.0)], 10), None);
-        assert_eq!(
-            diff.update(&[at(0.0), at(10.6), at(20.0)], 10),
-            Some(1),
-            "the moved vertex sits behind an unchanged tip"
-        );
-    }
+    // ── Rendering against the stack ─────────────────────────────────────
 
     /// After every push, every rendered vertex is within the epsilon of its
     /// current position: the invariant the renderer relies on, checked over a
@@ -606,14 +505,16 @@ mod tests {
     fn rendered_positions_stay_within_epsilon() {
         let mut stab =
             stroke_stabilizer_stack(&StabilizerRegistry::new(), &laplacian_config(1.0), 0.0, 1.0);
+        let mut diff = DivergenceDiff::new(DIVERGENCE_EPSILON);
         let mut rendered: Vec<[f32; 2]> = vec![];
         for i in 0..1200 {
             let th = i as f32 * 0.003;
-            let r = stab.push(mk(300.0 * th.cos(), 300.0 * th.sin(), i as f32 * 0.002));
+            stab.push(mk(300.0 * th.cos(), 300.0 * th.sin(), i as f32 * 0.002));
             let cur = stab.stabilized();
             // Mirror the engine: re-render from the reported index, or
             // append the new vertices.
-            let from = r.divergence_index.unwrap_or(rendered.len());
+            let r = diff.update(cur, stab.max_divergence_window());
+            let from = r.unwrap_or(rendered.len());
             rendered.truncate(from);
             rendered.extend(cur[from..].iter().map(|p| p.pos));
             for (j, (a, b)) in rendered.iter().zip(cur).enumerate() {
@@ -702,7 +603,7 @@ mod tests {
     #[test]
     fn prediction_extends_tip_on_straight_stroke() {
         // 30ms horizon, samples 10px / 10ms apart ⇒ N = round(30/10) = 3.
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
         for i in 0..8 {
             stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
         }
@@ -730,28 +631,32 @@ mod tests {
     /// predicted tail is rewritten to follow the turn (self-correction).
     #[test]
     fn prediction_self_corrects_via_combined_divergence() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut diff = DivergenceDiff::new(DIVERGENCE_EPSILON);
         for i in 0..8 {
             stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
+            diff.update(stab.stabilized(), stab.max_divergence_window());
         }
         // Straight-stroke prediction runs along +x (y≈0).
         assert!(stab.stabilized().last().unwrap().pos[1].abs() < 1e-2);
+        let rendered_tip = stab.stabilized().len() - 1;
 
         // A turn downward.
-        let r = stab.push(mk(80.0, 30.0, 0.08));
+        stab.push(mk(80.0, 30.0, 0.08));
         let real_len = 9; // 9 real points, N = 3 predicted
-        let tip_vi = stab.stabilized().len() - 1;
         let window = stab.max_divergence_window();
 
-        let div = r.divergence_index.expect("a turn must diverge");
+        let div = diff
+            .update(stab.stabilized(), window)
+            .expect("a turn must diverge");
         assert!(
             div <= real_len,
             "divergence {div} must cover the predicted tail (<= real_len {real_len})"
         );
         assert!(
-            div >= tip_vi.saturating_sub(window),
+            div >= rendered_tip.saturating_sub(window),
             "divergence {div} must stay within the widened window \
-             (tip_vi {tip_vi}, window {window})"
+             (rendered tip {rendered_tip}, window {window})"
         );
 
         // The predicted tail now heads into the turn (y grew from ~0).
@@ -766,7 +671,7 @@ mod tests {
     /// tip (no overshoot whisker) while keeping the point count constant.
     #[test]
     fn reversal_collapses_predicted_tail() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
         // Rightward…
         for i in 0..6 {
             stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
@@ -792,22 +697,18 @@ mod tests {
     }
 
     /// T-E: horizon 0 ⇒ the decorator is transparent: `stabilized()` and the
-    /// divergence result match a bare inner stabilizer, frame for frame.
+    /// window match a bare inner stabilizer, push for push.
     #[test]
     fn horizon_zero_is_transparent() {
-        let mut pred = PredictingStabilizer::new(laplacian_inner(0.5), 0.0, DIVERGENCE_EPSILON);
+        let mut pred = PredictingStabilizer::new(laplacian_inner(0.5), 0.0);
         let mut bare = laplacian_inner(0.5);
         for i in 0..8 {
             let p = mk(i as f32 * 10.0, (i as f32).sin() * 5.0, i as f32 * 0.01);
-            let rp = pred.push(p);
-            let rb = bare.push(p);
-            assert_eq!(rp.divergence_index, rb.divergence_index, "step {i}");
+            pred.push(p);
+            bare.push(p);
+            assert_eq!(pred.stabilized(), bare.stabilized(), "step {i}");
         }
         assert_eq!(pred.max_divergence_window(), bare.max_divergence_window());
-        assert_eq!(pred.stabilized().len(), bare.stabilized().len());
-        for (a, b) in pred.stabilized().iter().zip(bare.stabilized()) {
-            assert!(dist(a.pos, b.pos) < 1e-6, "positions must match bare inner");
-        }
     }
 
     /// Regression: on fixed-spacing input the predicted tail spans the
@@ -816,7 +717,7 @@ mod tests {
     /// `count x spacing` whatever the speed.
     #[test]
     fn prediction_on_fixed_spacing_spans_horizon_at_current_speed() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
         // 6 px vertices: 500 px/s for 12 vertices, then 2000 px/s.
         let (mut x, mut t) = (0.0f32, 0.0f32);
         let mut tail_at = |stab: &mut PredictingStabilizer, speed: f32, n: usize| {
@@ -855,18 +756,19 @@ mod tests {
     /// divergence never reports outside the (ramping) window.
     #[test]
     fn stroke_start_ramps_without_breaking_growth() {
-        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0, DIVERGENCE_EPSILON);
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut diff = DivergenceDiff::new(DIVERGENCE_EPSILON);
         let mut prev_len = 0usize;
         for i in 0..12 {
-            let r = stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
+            stab.push(mk(i as f32 * 10.0, 0.0, i as f32 * 0.01));
             let len = stab.stabilized().len();
-            let tip_vi = len.saturating_sub(1);
+            let rendered_tip = prev_len.saturating_sub(1);
             let window = stab.max_divergence_window();
 
-            if let Some(div) = r.divergence_index {
+            if let Some(div) = diff.update(stab.stabilized(), window) {
                 assert!(
-                    div >= tip_vi.saturating_sub(window),
-                    "step {i}: div {div} outside window (tip_vi {tip_vi}, window {window})"
+                    div >= rendered_tip.saturating_sub(window),
+                    "step {i}: div {div} outside window (rendered tip {rendered_tip}, window {window})"
                 );
             }
 
@@ -879,5 +781,71 @@ mod tests {
             }
             prev_len = len;
         }
+    }
+
+    // ── Batched diffs ───────────────────────────────────────────────────
+
+    /// Regression: with several pushes between two diffs, every rendered
+    /// vertex still ends within epsilon of where it now lies. Each frame here
+    /// commits forty vertices at a strength whose window is three, so the
+    /// vertices around the previous frame's tip, which the first push of the
+    /// next frame reshapes, sit far behind the current tip.
+    #[test]
+    fn batched_pushes_keep_rendered_positions_within_epsilon() {
+        let mut stab =
+            stroke_stabilizer_stack(&StabilizerRegistry::new(), &laplacian_config(0.1), 0.0, 1.0);
+        let mut diff = DivergenceDiff::new(DIVERGENCE_EPSILON);
+        let mut rendered: Vec<[f32; 2]> = vec![];
+        for i in 0..200 {
+            // About 40 px of arc per push: several commits each.
+            let th = i as f32 * 0.1;
+            stab.push(mk(400.0 * th.cos(), 400.0 * th.sin(), i as f32 * 0.02));
+            if i % 5 != 4 {
+                continue;
+            }
+            let cur = stab.stabilized();
+            let r = diff.update(cur, stab.max_divergence_window());
+            let from = r.unwrap_or(rendered.len());
+            rendered.truncate(from);
+            rendered.extend(cur[from..].iter().map(|p| p.pos));
+            for (j, (a, b)) in rendered.iter().zip(cur).enumerate() {
+                let d = (a[0] - b.pos[0]).hypot(a[1] - b.pos[1]);
+                assert!(
+                    d < DIVERGENCE_EPSILON + 1e-3,
+                    "push {i}: vertex {j} is rendered {d:.2} px from where it now lies"
+                );
+            }
+        }
+    }
+
+    /// Regression: prediction copies only the part of the inner polyline a
+    /// push can have changed, so its cost does not grow with the stroke. It
+    /// used to copy the whole stroke on every push, with prediction on by
+    /// default.
+    #[test]
+    fn prediction_copies_only_the_window_tail() {
+        let mut stab = PredictingStabilizer::new(laplacian_inner(0.5), 30.0);
+        let mut copies = Vec::new();
+        for i in 0..400 {
+            let before = stab.copied_vertices;
+            stab.push(mk(
+                i as f32 * 6.0,
+                (i as f32 * 0.05).sin() * 40.0,
+                i as f32 * 0.01,
+            ));
+            if i == 149 || i == 399 {
+                copies.push(stab.copied_vertices - before);
+            }
+        }
+        assert_eq!(
+            copies[0], copies[1],
+            "push 150 copied {} vertices, push 400 copied {}",
+            copies[0], copies[1]
+        );
+        assert!(
+            copies[1] as usize <= stab.inner.max_divergence_window() + 2,
+            "a push copied {} vertices",
+            copies[1]
+        );
     }
 }

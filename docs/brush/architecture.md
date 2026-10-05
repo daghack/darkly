@@ -48,16 +48,20 @@ Four pieces to keep in mind:
  begin_stroke(layer_id)
    │
    ├─► compile active graph → BrushGraphRunner
-   ├─► create StrokeBuffer (scratch + pre-stroke snapshot of the layer)
-   └─► first event only: runner.begin_stroke(gpu_ctx)
-          // every terminal's begin_stroke hook fires:
-          //   color_output → clear scratch to transparent
-          //   liquify      → copy layer into scratch
+   └─► create StrokeBuffer (scratch + pre-stroke snapshot of the layer)
 
  for each pen event (brush_stroke_to):
    │
-   ├─► stabilizer.push(event) → resampled, smoothed polyline; a divergence
-   │      index when a rendered vertex moved, else append-only
+   └─► stabilizer.push(event) → resampled, smoothed polyline; nothing renders
+
+ each frame, and at pen-up (flush_stroke), if events arrived since the last:
+   │
+   ├─► first flush only: runner.begin_stroke(gpu_ctx)
+   │      // every terminal's begin_stroke hook fires:
+   │      //   color_output → clear scratch to transparent
+   │      //   liquify      → copy layer into scratch
+   ├─► StrokeEngine.take_divergence() → the earliest rendered vertex that
+   │      moved since it was rendered, else append-only
    ├─► StrokeEngine.render_from_stabilized_range(gpu_ctx, first_new)
    │      │   (after restoring a checkpoint on divergence)
    │      ├─► for each dab position on the segment:
@@ -76,6 +80,7 @@ Four pieces to keep in mind:
 
  end_stroke:
    │
+   ├─► flush_stroke: render the events no frame has
    ├─► save_point → undo ring (bbox + checkpoint)
    └─► drop StrokeBuffer
 ```

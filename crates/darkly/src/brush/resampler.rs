@@ -29,20 +29,24 @@
 //!   `MAX_COMMITS_PER_PUSH x spacing` in a single event.
 //!
 //! Divergence window: the inner algorithm's window `W` bounds each of its
-//! pushes relative to its own tip at that push. After the provisional tip is
-//! retracted, the first push of an event lands where that tip was, so the
-//! earliest vertex that can move is `W` behind it; `k` commits and the new
-//! tip land at most `k` further on, so the output never diverges more than
-//! `W + k <= W + MAX_COMMITS_PER_PUSH` vertices behind its tip.
+//! pushes relative to its own tip before that push. After the provisional tip
+//! is retracted, the first inner push lands where that tip was, so the
+//! earliest vertex it can move is `W` behind the resampler's tip before the
+//! raw push; every later inner push of the same raw push starts further on
+//! and reaches no further back. The resampler's window is therefore the
+//! inner's, measured, like every stabilizer window, from the tip before the
+//! push, which is how the stroke engine diffs: from the tip as last
+//! rendered, however many vertices committed since.
 
 use super::interpolation::lerp_paint_info;
 use super::paint_info::PaintInformation;
-use super::stabilizer::{DivergenceDiff, StabilizeResult, StabilizerAlgorithm};
+use super::stabilizer::StabilizerAlgorithm;
 
 /// Arc length between committed vertices, in CSS pixels of pen travel.
 pub const RESAMPLE_SPACING_CSS_PX: f32 = 6.0;
 
-/// Most vertices one raw sample may commit. Bounds the divergence window.
+/// Most vertices one raw sample may commit, so a single jump cannot flood the
+/// polyline with vertices.
 pub const MAX_COMMITS_PER_PUSH: usize = 8;
 
 /// Raw segments shorter than this carry no direction and commit nothing.
@@ -54,7 +58,6 @@ pub struct ResamplingStabilizer {
     inner: Box<dyn StabilizerAlgorithm>,
     /// Arc length between committed vertices, canvas px.
     spacing: f32,
-    diff: DivergenceDiff,
     /// The previous raw sample: the start of the raw segment being walked.
     last_raw: Option<PaintInformation>,
     /// Raw arc length from the last committed vertex to `last_raw`.
@@ -66,8 +69,8 @@ pub struct ResamplingStabilizer {
 
 impl ResamplingStabilizer {
     /// Wrap `inner`, committing a vertex every `spacing` canvas px of raw arc
-    /// length and treating moves under `epsilon` canvas px as unchanged.
-    pub fn new(inner: Box<dyn StabilizerAlgorithm>, spacing: f32, epsilon: f32) -> Self {
+    /// length.
+    pub fn new(inner: Box<dyn StabilizerAlgorithm>, spacing: f32) -> Self {
         debug_assert!(
             spacing > 0.0,
             "resample spacing must be positive: {spacing}"
@@ -75,7 +78,6 @@ impl ResamplingStabilizer {
         Self {
             inner,
             spacing,
-            diff: DivergenceDiff::new(epsilon),
             last_raw: None,
             residual: 0.0,
             tip_is_committed: false,
@@ -117,7 +119,7 @@ impl ResamplingStabilizer {
 }
 
 impl StabilizerAlgorithm for ResamplingStabilizer {
-    fn push(&mut self, raw: PaintInformation) -> StabilizeResult {
+    fn push(&mut self, raw: PaintInformation) {
         match self.last_raw {
             // The stroke origin is the first committed vertex.
             None => {
@@ -136,11 +138,6 @@ impl StabilizerAlgorithm for ResamplingStabilizer {
             }
         }
         self.last_raw = Some(raw);
-
-        let window = self.max_divergence_window();
-        StabilizeResult {
-            divergence_index: self.diff.update(self.inner.stabilized(), window),
-        }
     }
 
     fn retract_tip(&mut self) {
@@ -152,12 +149,11 @@ impl StabilizerAlgorithm for ResamplingStabilizer {
     }
 
     fn max_divergence_window(&self) -> usize {
-        self.inner.max_divergence_window() + MAX_COMMITS_PER_PUSH
+        self.inner.max_divergence_window()
     }
 
     fn clear(&mut self) {
         self.inner.clear();
-        self.diff.clear();
         self.last_raw = None;
         self.residual = 0.0;
         self.tip_is_committed = false;
@@ -167,7 +163,8 @@ impl StabilizerAlgorithm for ResamplingStabilizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brush::stabilizer::{StabilizerRegistry, DIVERGENCE_EPSILON};
+    use crate::brush::stabilizer::StabilizerRegistry;
+    use crate::brush::stroke_engine::{DivergenceDiff, DIVERGENCE_EPSILON};
     use crate::gpu::params::ParamValue;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -182,12 +179,9 @@ mod tests {
     }
 
     impl StabilizerAlgorithm for CountingInner {
-        fn push(&mut self, point: PaintInformation) -> StabilizeResult {
+        fn push(&mut self, point: PaintInformation) {
             self.pushes.fetch_add(1, Ordering::Relaxed);
             self.points.push(point);
-            StabilizeResult {
-                divergence_index: None,
-            }
         }
         fn retract_tip(&mut self) {
             self.points.pop();
@@ -206,17 +200,14 @@ mod tests {
             points: Vec::new(),
             pushes: pushes.clone(),
         };
-        (
-            ResamplingStabilizer::new(Box::new(inner), SPACING, DIVERGENCE_EPSILON),
-            pushes,
-        )
+        (ResamplingStabilizer::new(Box::new(inner), SPACING), pushes)
     }
 
     fn laplacian(strength: f32) -> ResamplingStabilizer {
         let inner = StabilizerRegistry::new()
             .create("laplacian", &[ParamValue::Float(strength)], 1.0)
             .expect("laplacian registered");
-        ResamplingStabilizer::new(inner, SPACING, DIVERGENCE_EPSILON)
+        ResamplingStabilizer::new(inner, SPACING)
     }
 
     fn mk(x: f32, y: f32, pressure: f32, time: f32) -> PaintInformation {
@@ -303,26 +294,37 @@ mod tests {
         }
     }
 
-    /// The reported divergence never reaches further behind the tip than
-    /// the advertised window, which widens the inner window by the per-push
-    /// commit cap.
+    /// No push moves a vertex further behind the tip as it stood before the
+    /// push than the window, which is the inner algorithm's: checked per push
+    /// and across batches of pushes, as the stroke engine diffs once per
+    /// frame, on a path whose every fifth sample jumps several spacings.
     #[test]
-    fn divergence_stays_within_the_widened_window() {
+    fn pushes_move_nothing_further_than_the_window_behind_the_earlier_tip() {
         let mut stab = laplacian(1.0);
-        assert_eq!(stab.max_divergence_window(), 161 + MAX_COMMITS_PER_PUSH);
+        assert_eq!(stab.max_divergence_window(), 161);
         let (mut x, mut y) = (0.0f32, 0.0f32);
-        for i in 0..300 {
+        let mut per_push: Vec<PaintInformation> = vec![];
+        let mut per_batch: Vec<PaintInformation> = vec![];
+        for i in 0..600 {
             let step = if i % 5 == 0 { 40.0 } else { 1.0 };
             let angle = i as f32 * 0.07;
             x += step * angle.cos();
             y += step * angle.sin();
-            let result = stab.push(mk(x, y, 0.5, i as f32 * 0.004));
-            let tip = stab.stabilized().len() - 1;
-            if let Some(div) = result.divergence_index {
-                assert!(
-                    div + stab.max_divergence_window() >= tip,
-                    "push {i}: divergence {div} is more than the window behind tip {tip}"
+            stab.push(mk(x, y, 0.5, i as f32 * 0.004));
+            let cur = stab.stabilized();
+            for (earlier, what) in [(&per_push, "push"), (&per_batch, "batch")] {
+                let settled = earlier
+                    .len()
+                    .saturating_sub(stab.max_divergence_window() + 1);
+                assert_eq!(
+                    &cur[..settled],
+                    &earlier[..settled],
+                    "{what} ending at {i} moved a vertex behind the window"
                 );
+            }
+            per_push = cur.to_vec();
+            if i % 7 == 6 {
+                per_batch = cur.to_vec();
             }
         }
     }
@@ -332,22 +334,28 @@ mod tests {
     #[test]
     fn stroke_start_appends_without_divergence() {
         let mut stab = laplacian(0.5);
-        let first = stab.push(mk(10.0, 10.0, 0.5, 0.0));
+        let mut diff = DivergenceDiff::new(DIVERGENCE_EPSILON);
+        assert_eq!(stab.max_divergence_window(), 41);
+        stab.push(mk(10.0, 10.0, 0.5, 0.0));
         assert_eq!(stab.stabilized().len(), 1);
         assert_eq!(
-            first.divergence_index, None,
+            diff.update(stab.stabilized(), 41),
+            None,
             "nothing was rendered before the origin"
         );
-        assert_eq!(stab.max_divergence_window(), 41 + MAX_COMMITS_PER_PUSH);
 
-        let second = stab.push(mk(12.0, 10.0, 0.5, 0.004));
+        stab.push(mk(12.0, 10.0, 0.5, 0.004));
         assert_eq!(stab.stabilized().len(), 2);
-        assert_eq!(second.divergence_index, None, "the origin did not move");
+        assert_eq!(
+            diff.update(stab.stabilized(), 41),
+            None,
+            "the origin did not move"
+        );
 
         // Replacing the tip in place is a divergence at the tip's own index.
-        let third = stab.push(mk(14.0, 11.0, 0.5, 0.008));
+        stab.push(mk(14.0, 11.0, 0.5, 0.008));
         assert_eq!(stab.stabilized().len(), 2);
-        assert_eq!(third.divergence_index, Some(1));
+        assert_eq!(diff.update(stab.stabilized(), 41), Some(1));
     }
 
     /// Regression: committing a vertex must not jolt the stroke. On a tight

@@ -616,6 +616,12 @@ pub struct DarklyEngine {
     /// rewind path against it byte for byte.
     #[cfg(any(test, feature = "testing"))]
     pub(crate) test_full_rerender: bool,
+    /// Overrides the distance a rendered stroke vertex may drift before it
+    /// is re-rendered, for strokes begun after it is set. Zero re-renders
+    /// every vertex that moved at all, which makes a stabilized stroke's
+    /// incremental rewinds comparable byte for byte with a full re-render.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) test_divergence_epsilon: Option<f32>,
     /// Pending layer/selection flip waiting for the selection CPU cache.
     pub(crate) pending_flip: Option<PendingFlip>,
     /// Pending destructive filter waiting for the selection CPU cache.
@@ -680,10 +686,10 @@ pub struct DarklyEngine {
     /// via `test_stroke_full_rerender_events`.
     pub(crate) brush_full_rerender_events: u32,
 
-    /// Checkpoint rewinds attempted during this stroke: every event whose
-    /// stabilizer reported a divergence behind the already-rendered tip.
-    /// Surfaced via `test_stroke_rewind_events`.
-    pub(crate) brush_rewind_events: u32,
+    /// Checkpoint rewinds attempted during this stroke: every stroke flush
+    /// that found a rendered vertex moved since it was rendered. Surfaced via
+    /// `test_stroke_rewinds`.
+    pub(crate) brush_rewinds: u32,
 
     /// Snapshot of `brush_perf` taken on the last `drain_brush_perf_delta`
     /// call. Subtracted from the current accumulator on each drain to
@@ -835,9 +841,11 @@ impl DarklyEngine {
             layer_growth_capped: false,
             brush_perf: BrushPerfCounters::default(),
             brush_full_rerender_events: 0,
-            brush_rewind_events: 0,
+            brush_rewinds: 0,
             #[cfg(any(test, feature = "testing"))]
             test_full_rerender: false,
+            #[cfg(any(test, feature = "testing"))]
+            test_divergence_epsilon: None,
             last_brush_perf: BrushPerfCounters::default(),
             last_frame_phases: FrameRenderPhases::default(),
             recorder: ProcessRecorder::new(),
@@ -1410,6 +1418,13 @@ impl DarklyEngine {
         self.test_full_rerender = on;
     }
 
+    /// Override the stroke divergence epsilon in canvas px (see the
+    /// `test_divergence_epsilon` field). Test-only.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_set_divergence_epsilon(&mut self, epsilon: f32) {
+        self.test_divergence_epsilon = Some(epsilon);
+    }
+
     /// Count of mid-stroke full-re-render fallbacks observed during the
     /// most recent stroke. Used by integration tests to assert that the
     /// checkpoint ring's coverage invariant kept fallback at zero across
@@ -1419,10 +1434,10 @@ impl DarklyEngine {
     }
 
     /// Count of checkpoint rewinds (restore attempts) during the most
-    /// recent stroke. An unstabilized stroke never diverges, so it must
-    /// read zero.
-    pub fn test_stroke_rewind_events(&self) -> u32 {
-        self.brush_rewind_events
+    /// recent stroke: at most one per stroke flush, so at most one per frame.
+    /// An unstabilized stroke never diverges, so it must read zero.
+    pub fn test_stroke_rewinds(&self) -> u32 {
+        self.brush_rewinds
     }
 
     /// Total dabs placed during the most recent stroke. `brush_perf` is

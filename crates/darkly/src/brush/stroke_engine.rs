@@ -3,6 +3,8 @@
 //! Owns the `BrushGraphRunner` for the stroke duration and handles:
 //! - Storing raw events in `StrokeRecord` (for re-rendering)
 //! - Stabilization (retroactive stroke reshaping via pluggable algorithm)
+//! - Tracking where each vertex was last rendered, so a render rewinds only
+//!   from the earliest vertex that has moved since
 //! - Computing derived sensor values (speed, distance, angle, tilt)
 //! - Placing dabs at spacing intervals along the straight segment between
 //!   consecutive stabilized vertices
@@ -15,7 +17,7 @@ use super::interpolation::lerp_paint_info;
 use super::paint_info::{PaintInformation, StrokeRecord};
 use super::save_points::SavePointStore;
 use super::spacing::SpacingConfig;
-use super::stabilizer::{StabilizeResult, StabilizerAlgorithm};
+use super::stabilizer::StabilizerAlgorithm;
 use super::DAB_REFERENCE_SIZE;
 
 /// Snapshot of the stroke engine's render state at a specific dab.
@@ -33,13 +35,111 @@ pub struct RenderCheckpoint {
     pub stamp_angle: Option<f32>,
 }
 
+/// Distance in CSS pixels below which a stabilized point is considered
+/// unchanged since it was rendered. The engine scales it to canvas pixels at
+/// the stroke's zoom when it builds the [`StrokeEngine`].
+///
+/// Neighbouring vertices are re-rendered at different moments, so this is
+/// also the amplitude of the ripple the rendered stroke can carry that the
+/// smoothed polyline does not. A tenth of a pixel keeps that below what a
+/// thin antialiased stroke shows; a wider tolerance made quick wide curves
+/// look faintly jagged.
+pub const DIVERGENCE_EPSILON: f32 = 0.1;
+
+/// Find the earliest rendered index whose position is more than `epsilon`
+/// from where it was rendered, looking no further back than `max_window`
+/// indices behind the tip as last rendered.
+///
+/// `current` is the stabilized polyline now, `rendered` the positions its
+/// vertices were last rendered at. A stabilizer's window bounds how far
+/// behind the tip before a push that push can move a vertex; every push
+/// since the last render started at or beyond the rendered tip, so the walk
+/// starts `max_window` behind it however many pushes there were. Within the
+/// window every index is checked: vertices are re-rendered at different
+/// times, so one that sits within tolerance of its own recent render says
+/// nothing about the older renders behind it.
+///
+/// Returns `None` when every rendered index is within tolerance, even if the
+/// polyline grew: new indices have never been rendered, so appending them
+/// needs no rewind. An `epsilon` of zero reports any change at all.
+fn find_divergence(
+    current: &[PaintInformation],
+    rendered: &[[f32; 2]],
+    max_window: usize,
+    epsilon: f32,
+) -> Option<usize> {
+    let overlap = rendered.len().min(current.len());
+    let earliest = rendered.len().saturating_sub(max_window + 1);
+    let eps2 = epsilon * epsilon;
+    let moved = |i: usize| {
+        let cur = current[i].pos;
+        let was = rendered[i];
+        let dx = cur[0] - was[0];
+        let dy = cur[1] - was[1];
+        let d2 = dx * dx + dy * dy;
+        d2 > 0.0 && d2 >= eps2
+    };
+    debug_assert!(
+        !(0..earliest.min(overlap)).any(moved),
+        "a vertex more than {max_window} behind the rendered tip moved: \
+         the stabilizer's max_divergence_window is not a bound"
+    );
+    (earliest..overlap).find(|&i| moved(i))
+}
+
+/// The positions each vertex of a stabilized polyline was last rendered at,
+/// and the diff of the current polyline against them.
+///
+/// Comparing against rendered positions rather than the previous push keeps
+/// every rendered vertex within `epsilon` of where it now lies: a vertex that
+/// drifts a little on every push is re-rendered once its accumulated drift
+/// reaches `epsilon`, instead of never.
+pub struct DivergenceDiff {
+    rendered: Vec<[f32; 2]>,
+    epsilon: f32,
+}
+
+impl DivergenceDiff {
+    /// A diff that treats moves shorter than `epsilon` canvas px as unchanged.
+    pub fn new(epsilon: f32) -> Self {
+        Self {
+            rendered: Vec::with_capacity(256),
+            epsilon,
+        }
+    }
+
+    /// Diff `current` against the rendered positions and report the first
+    /// index to re-render, recording `current` as rendered from there on.
+    /// `max_window` is the stabilizer's bound on how far a push reaches
+    /// behind the tip before it.
+    pub fn update(&mut self, current: &[PaintInformation], max_window: usize) -> Option<usize> {
+        let divergence = find_divergence(current, &self.rendered, max_window, self.epsilon);
+        let from = divergence.unwrap_or(self.rendered.len());
+        self.rendered.truncate(from);
+        self.rendered.extend(current[from..].iter().map(|p| p.pos));
+        divergence
+    }
+
+    /// Number of vertices recorded as rendered.
+    pub fn len(&self) -> usize {
+        self.rendered.len()
+    }
+
+    /// Whether nothing has been rendered yet.
+    pub fn is_empty(&self) -> bool {
+        self.rendered.is_empty()
+    }
+}
+
 /// Reference fade distance in pixels.  The fade sensor goes from 0 to 1
 /// over this distance, then clamps at 1.  Configurable per-brush later.
 const FADE_DISTANCE_PX: f32 = 1000.0;
 
 /// Drives a single brush stroke from begin to end.
 ///
-/// Created by the engine at stroke start, fed pointer events via `move_to`,
+/// Created by the engine at stroke start, fed pointer events via
+/// [`Self::stabilize`], rendered from the stabilized polyline once per frame
+/// (the engine diffs with [`Self::take_divergence`], rewinds, and replays),
 /// and consumed at stroke end to yield a `StrokeRecord`.
 pub struct StrokeEngine {
     runner: BrushGraphRunner,
@@ -48,6 +148,10 @@ pub struct StrokeEngine {
 
     /// Pluggable stabilizer algorithm (pass-through when no stabilization).
     stabilizer: Box<dyn StabilizerAlgorithm>,
+    /// Where each stabilized vertex was last rendered.
+    rendered: DivergenceDiff,
+    /// Input has been stabilized since the last [`Self::take_divergence`].
+    unrendered_input: bool,
 
     /// Per-dab save points for rewind capability.
     pub save_points: SavePointStore,
@@ -97,7 +201,7 @@ pub struct StrokeEngine {
     /// first dab, so raw engine input is wrong); reset on full re-render.
     clone_dest_anchor: Option<[f32; 2]>,
     /// Plane-space frame of the clone source snapshot, refreshed by the
-    /// engine every pen event via [`Self::set_clone_source_frame`] (the
+    /// engine every stroke flush via [`Self::set_clone_source_frame`] (the
     /// frozen cross-layer / merged snapshot's rect when one exists, else
     /// the paint target's current extent so same-layer clone tracks
     /// mid-stroke layer growth). Stroke-stable: NOT cleared by
@@ -115,7 +219,9 @@ impl StrokeEngine {
     /// brush diameter of travel.  `stroke_seed` drives every `random` node in
     /// the graph, reaching them through [`EvalContext::prng_at`]: a real
     /// stroke passes [`Self::random_seed`], a render that has to be
-    /// reproducible passes a constant. It does **not** reach `noise`, which
+    /// reproducible passes a constant. `divergence_epsilon` is the canvas
+    /// distance a rendered vertex may drift before it is re-rendered
+    /// ([`DIVERGENCE_EPSILON`] at the stroke's view scale). It does **not** reach `noise`, which
     /// seeds from its own compile-time `seed` port and so is identical from
     /// stroke to stroke.  `dpi` is the owning document's DPI, from which the
     /// runner derives the reference-to-canvas factor; a render with no
@@ -127,6 +233,7 @@ impl StrokeEngine {
         spacing: SpacingConfig,
         base_size: f32,
         stabilizer: Box<dyn StabilizerAlgorithm>,
+        divergence_epsilon: f32,
         clone_source_anchor: Option<[f32; 2]>,
         stroke_seed: u32,
         stamp_angle_rate: f32,
@@ -162,6 +269,8 @@ impl StrokeEngine {
             record: StrokeRecord::new(color, "default".into()),
             spacing,
             stabilizer,
+            rendered: DivergenceDiff::new(divergence_epsilon),
+            unrendered_input: false,
             save_points: SavePointStore::new(),
             last_point: None,
             accumulated_distance: 0.0,
@@ -206,7 +315,7 @@ impl StrokeEngine {
     }
 
     /// Set the clone source snapshot's plane-space frame for the current
-    /// stroke. Called by the engine every pen event, before rendering;
+    /// stroke. Called by the engine every stroke flush, before rendering;
     /// see the field doc for what the frame is.
     pub fn set_clone_source_frame(&mut self, frame: crate::coord::CanvasRect) {
         self.clone_source_frame = Some(frame);
@@ -225,13 +334,35 @@ impl StrokeEngine {
         self.last_dab_size[0].max(self.last_dab_size[1])
     }
 
-    /// Feed a raw pointer event to the stabilizer.
-    ///
-    /// Returns the stabilization result (divergence info).  The caller
-    /// is responsible for rewind + re-render when divergence occurs.
-    pub fn stabilize(&mut self, raw: PaintInformation) -> StabilizeResult {
+    /// Feed a raw pointer event to the stabilizer. Rendering waits for the
+    /// next [`Self::take_divergence`], however many events arrive first.
+    pub fn stabilize(&mut self, raw: PaintInformation) {
         self.record.push(raw);
-        self.stabilizer.push(raw)
+        self.stabilizer.push(raw);
+        self.unrendered_input = true;
+    }
+
+    /// Whether input has been stabilized since the last
+    /// [`Self::take_divergence`].
+    pub fn has_unrendered_input(&self) -> bool {
+        self.unrendered_input
+    }
+
+    /// Number of stabilized vertices recorded as rendered: the index of the
+    /// first vertex a render that rewinds nothing starts from.
+    pub fn rendered_len(&self) -> usize {
+        self.rendered.len()
+    }
+
+    /// Diff the stabilized polyline against where it was last rendered, then
+    /// record it as rendered: the earliest vertex to re-render, or `None`
+    /// when nothing rendered has moved and only the vertices from
+    /// [`Self::rendered_len`] (read before this call) need rendering. Called
+    /// once per render of the stroke, whatever number of events it covers.
+    pub fn take_divergence(&mut self) -> Option<usize> {
+        self.unrendered_input = false;
+        let window = self.stabilizer.max_divergence_window();
+        self.rendered.update(self.stabilizer.stabilized(), window)
     }
 
     /// The stabilizer's conservative max divergence window (vector indices).
@@ -426,20 +557,6 @@ impl StrokeEngine {
         self.runner.flush_dabs(gpu);
     }
 
-    /// Process a raw pointer event: stabilize, then render the newly
-    /// appended vertices.
-    ///
-    /// Used by the fallback path when no stroke buffer is active.
-    /// When divergence occurs, the caller must handle rewind externally.
-    pub fn move_to(&mut self, raw: PaintInformation, gpu: &mut BrushGpuContext) -> StabilizeResult {
-        let first_new = self.stabilizer.len();
-        let result = self.stabilize(raw);
-        if result.divergence_index.is_none() {
-            self.render_from_stabilized_range(gpu, first_new);
-        }
-        result
-    }
-
     /// Evaluate the brush graph for a single dab at the given position.
     fn place_dab(
         &mut self,
@@ -469,7 +586,7 @@ impl StrokeEngine {
         // is `None`).
         if let Some(source_anchor) = self.clone_source_anchor {
             let dest_anchor = *self.clone_dest_anchor.get_or_insert(dab_info.pos);
-            // The engine refreshes the frame every pen event before any
+            // The engine refreshes the frame every stroke flush before any
             // dab is placed; the fallback identity frame only guards a
             // driver that forgot to (and would sample garbage UVs anyway).
             debug_assert!(
@@ -582,8 +699,8 @@ impl StrokeEngine {
         self.runner.begin_stroke(gpu, region);
     }
 
-    /// Delegate the per-pen-event commit hook to every GPU terminal. Called
-    /// once per pen event after the event's dabs have rendered into the
+    /// Delegate the per-flush commit hook to every GPU terminal. Called once
+    /// per stroke flush after the flush's dabs have rendered into the
     /// scratch.
     pub fn commit(&mut self, gpu: &mut BrushGpuContext) {
         self.runner.commit(gpu);
@@ -938,6 +1055,50 @@ mod tests {
             got.abs() < 1e-5,
             "an instant reversal folds to a no-op rather than crawling half a \
              turn; got {got}"
+        );
+    }
+
+    // ── DivergenceDiff ──────────────────────────────────────────────────
+
+    fn at(x: f32) -> PaintInformation {
+        PaintInformation {
+            pos: [x, 0.0],
+            ..Default::default()
+        }
+    }
+
+    /// Regression: a vertex that moved is reported even when a vertex nearer
+    /// the tip did not. The walk used to stop at the first unchanged vertex,
+    /// so vertices behind a freshly rendered one accumulated drift unchecked
+    /// and snapped into place much later, leaving a visible disconnect.
+    #[test]
+    fn moved_vertex_behind_an_unchanged_one_is_reported() {
+        let mut diff = DivergenceDiff::new(0.5);
+        assert_eq!(diff.update(&[at(0.0), at(10.0), at(20.0)], 10), None);
+        assert_eq!(
+            diff.update(&[at(0.0), at(10.6), at(20.0)], 10),
+            Some(1),
+            "the moved vertex sits behind an unchanged tip"
+        );
+    }
+
+    /// Regression: the divergence walk starts from the tip as last rendered,
+    /// not from the current tip. When several pushes land between two
+    /// renders, a push's reach is measured from the tip that existed before
+    /// it, and the earliest of those is the rendered one; walking from the
+    /// current tip skipped every moved vertex the frame's commits had pushed
+    /// out of the window.
+    #[test]
+    fn divergence_walk_starts_from_the_rendered_tip() {
+        let mut diff = DivergenceDiff::new(DIVERGENCE_EPSILON);
+        let rendered: Vec<_> = (0..10).map(|i| at(i as f32 * 6.0)).collect();
+        assert_eq!(diff.update(&rendered, 5), None);
+        let mut current: Vec<_> = (0..30).map(|i| at(i as f32 * 6.0)).collect();
+        current[8].pos[1] = 1.0;
+        assert_eq!(
+            diff.update(&current, 5),
+            Some(8),
+            "vertex 8 moved, within the window behind the rendered tip at 9"
         );
     }
 }

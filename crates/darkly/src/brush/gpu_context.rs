@@ -144,7 +144,8 @@ impl std::ops::AddAssign for BrushPerfCounters {
 /// trivial VRAM cost (16384 records × ~32-byte typical record ≈ 512
 /// KB). A live stroke phase stays far below it (~30 dabs even at high
 /// stabilisation), but a whole path drawn in one phase (the brush
-/// preview, `DarklyEngine::stroke_path`) can reach it, so
+/// preview, or a stroke no frame ran during, rendered at pen-up) can
+/// reach it, so
 /// `StrokeEngine::place_dab` flushes and submits when the queue is full.
 /// Queuing past the cap would make the terminal's upload overrun its dab
 /// buffer, which fails wgpu validation; `DabBatch::queue_dab`

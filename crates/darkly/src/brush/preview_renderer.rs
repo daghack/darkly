@@ -225,6 +225,9 @@ impl BrushStrokePreviewRenderer {
             spacing,
             base_size,
             Box::new(PassThrough::new()),
+            // A preview renders its path once and never diffs, so the
+            // epsilon is unused; the reference scale is the honest value.
+            crate::brush::stroke_engine::DIVERGENCE_EPSILON,
             clone_source_anchor,
             PREVIEW_STROKE_SEED,
             brush_settings::stamp_angle_rate(graph),
@@ -245,12 +248,14 @@ impl BrushStrokePreviewRenderer {
         // Pre-cooked points: pass them through a pass-through stabilizer so
         // the render walks them verbatim. No smoothing, no lag: the S-curve
         // is exactly what we handed in.
-        engine.stabilize_all(path);
+        for pt in path {
+            engine.stabilize(*pt);
+        }
 
         let sel_bg = pipelines.default_selection_bind_group();
 
         // Clear the scratch, place every dab, and composite onto the
-        // pre-stroke snapshot: the same render a whole-path stroke uses.
+        // pre-stroke snapshot: the same path as a real stroke's commit.
         let mut ctx = {
             // The preview stroke buffer never captures a source
             // snapshot, so a source-sampling brush previews off the

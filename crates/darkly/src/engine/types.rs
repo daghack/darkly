@@ -1,6 +1,5 @@
 //! FFI/serialization types: serde-serializable for any WASM bridge.
 
-use crate::brush::paint_info::PaintInformation;
 use crate::coord::CanvasRect;
 use crate::gpu::params::{ParamDef, ParamKind, ParamValue};
 use crate::units::UnitType;
@@ -530,40 +529,6 @@ pub enum StrokeOp {
 }
 
 impl StrokeOp {
-    /// The pen sample this op carries and its foreground color, or `None`
-    /// for a single-shot op (fill, gradient) that is not a point on a path.
-    pub(crate) fn pen_sample(&self) -> Option<(PaintInformation, [f32; 4])> {
-        match *self {
-            StrokeOp::BrushStroke {
-                x,
-                y,
-                pressure,
-                x_tilt,
-                y_tilt,
-                rotation,
-                tangential_pressure,
-                time_ms,
-                cr,
-                cg,
-                cb,
-                ca,
-            } => Some((
-                PaintInformation {
-                    pos: [x, y],
-                    pressure,
-                    x_tilt,
-                    y_tilt,
-                    rotation,
-                    tangential_pressure,
-                    time: (time_ms / 1000.0) as f32,
-                    ..Default::default()
-                },
-                [cr, cg, cb, ca],
-            )),
-            StrokeOp::FloodFill { .. } | StrokeOp::LinearGradient { .. } => None,
-        }
-    }
-
     /// The canvas region the paint target must cover before this op runs, or
     /// `None` when the op cannot reach beyond the pixels the target already has.
     ///

@@ -25,9 +25,10 @@
 //!   same fraction of the canvas.
 //! - `--output <path>` - TSV output path. Defaults to
 //!   `crates/darkly/bench-results/stroke-replay-<stem>-<sha>.tsv`.
-//! - `--whole-path` - instead, time the recording drawn as fast as possible
-//!   through the live path against one `DarklyEngine::stroke_path` call,
-//!   each on a fresh engine with prediction off and including GPU completion.
+//! - `--no-frames` - instead, time the recording with a stroke flush after
+//!   every event against the same events with no frame between them (one
+//!   flush, at pen-up: what a headless embedder pays). Each on a fresh
+//!   engine with prediction off, including GPU completion.
 
 use std::fs;
 use std::io::Write as _;
@@ -38,7 +39,7 @@ use darkly::brush::builtin_brushes;
 use darkly::engine::DarklyEngine;
 use darkly::format::stroke_recording::{replay, EventTiming, ReplayPacing, StrokeRecording};
 use darkly::gpu::context::GpuContext;
-use darkly::gpu::test_utils::test_device;
+use darkly::gpu::test_utils::bench_device;
 
 /// The `pen_input.size` base knob is the dab radius expressed as a fraction
 /// of the dab reference: `radius_px = size * DAB_REFERENCE_SIZE_PX * 0.5`,
@@ -54,7 +55,7 @@ struct Args {
     dab_size_px: Option<f32>,
     canvas: Option<(u32, u32)>,
     output: Option<PathBuf>,
-    whole_path: bool,
+    no_frames: bool,
 }
 
 fn parse_args() -> Args {
@@ -64,7 +65,7 @@ fn parse_args() -> Args {
         dab_size_px: None,
         canvas: None,
         output: None,
-        whole_path: false,
+        no_frames: false,
     };
     let mut input_set = false;
     let mut argv = std::env::args().skip(1);
@@ -94,7 +95,7 @@ fn parse_args() -> Args {
                     argv.next().expect("--output requires a path"),
                 ));
             }
-            "--whole-path" => args.whole_path = true,
+            "--no-frames" => args.no_frames = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -123,7 +124,7 @@ fn parse_canvas(s: &str) -> (u32, u32) {
 fn print_help() {
     eprintln!(
         "stroke_replay_bench --input <path> [--brush <name>] [--dab-size <px>] \
-         [--canvas <WxH>] [--output <tsv>] [--whole-path]"
+         [--canvas <WxH>] [--output <tsv>] [--no-frames]"
     );
 }
 
@@ -164,7 +165,7 @@ fn brush_graph_json(brush_name: &str, dab_size_px: Option<f32>) -> String {
 // ── Engine setup ────────────────────────────────────────────────────────
 
 fn build_engine(canvas: (u32, u32)) -> DarklyEngine {
-    let (device, queue) = test_device();
+    let (device, queue) = bench_device();
     let gpu = GpuContext::new_headless(device, queue);
     DarklyEngine::new(gpu, canvas.0, canvas.1)
 }
@@ -243,23 +244,23 @@ fn write_tsv(path: &Path, timings: &[EventTiming]) -> std::io::Result<()> {
     Ok(())
 }
 
-// ── Whole path ──────────────────────────────────────────────────────────
+// ── Flush cadence ───────────────────────────────────────────────────────
 
-/// The recording as fast as possible through the live path, then as one
-/// `stroke_path` call, each on a fresh engine, timed through GPU completion.
-fn compare_whole_path(recording: &StrokeRecording, graph_json: &str, canvas: (u32, u32)) {
+/// The recording with a stroke flush after every event, then with no frame
+/// between events, each on a fresh engine, timed through GPU completion.
+fn compare_flush_cadence(recording: &StrokeRecording, graph_json: &str, canvas: (u32, u32)) {
     darkly::config::set(
         "input.predictionHorizon",
         darkly::config::ConfigValue::Float(0.0),
     );
-    let run = |whole: bool| {
+    let run = |no_frames: bool| {
         let mut engine = build_engine(canvas);
         engine
             .set_brush_graph(graph_json)
             .expect("brush graph compiles");
         let layer = engine.add_raster_layer(None);
         let start = Instant::now();
-        let submits = if whole {
+        let submits = if no_frames {
             let scale = (
                 canvas.0 as f32 / recording.canvas_width as f32,
                 canvas.1 as f32 / recording.canvas_height as f32,
@@ -269,7 +270,13 @@ fn compare_whole_path(recording: &StrokeRecording, graph_json: &str, canvas: (u3
                 .iter()
                 .map(|e| e.to_stroke_op(scale))
                 .collect();
-            engine.stroke_path(layer, &ops).expect("stroke_path");
+            engine.begin_stroke(layer).expect("layer is paintable");
+            for op in ops {
+                engine.stroke_to(op);
+            }
+            engine.end_stroke();
+            // `replay` composites after pen-up inside its timing too.
+            engine.render(0.0);
             engine.drain_brush_perf_delta().submits
         } else {
             let timings = replay(
@@ -285,15 +292,16 @@ fn compare_whole_path(recording: &StrokeRecording, graph_json: &str, canvas: (u3
         engine.test_flush_readbacks();
         (start.elapsed().as_secs_f64() * 1000.0, submits)
     };
-    let (live_ms, live_submits) = run(false);
-    let (path_ms, path_submits) = run(true);
+    let (per_event_ms, per_event_submits) = run(false);
+    let (no_frames_ms, no_frames_submits) = run(true);
     eprintln!(
-        "{} events, canvas {}x{}: live {live_ms:.1} ms ({live_submits} submits), \
-         stroke_path {path_ms:.1} ms ({path_submits} submits), {:.1}x",
+        "{} events, canvas {}x{}, prediction off: flush per event {per_event_ms:.1} ms \
+         ({per_event_submits} submits), no frames {no_frames_ms:.1} ms \
+         ({no_frames_submits} submits), {:.1}x",
         recording.events.len(),
         canvas.0,
         canvas.1,
-        live_ms / path_ms,
+        per_event_ms / no_frames_ms,
     );
 }
 
@@ -311,8 +319,8 @@ fn main() {
         .unwrap_or((recording.canvas_width, recording.canvas_height));
 
     let graph_json = brush_graph_json(&args.brush, args.dab_size_px);
-    if args.whole_path {
-        compare_whole_path(&recording, &graph_json, target_canvas);
+    if args.no_frames {
+        compare_flush_cadence(&recording, &graph_json, target_canvas);
         return;
     }
 

@@ -1,20 +1,22 @@
 //! The checkpoint ring's region save and restore, pinned against a
 //! from-scratch render.
 //!
-//! Every mid-stroke event rewinds to a checkpoint, restores it, and
-//! replays the dabs after it. The ring copies only the region those dabs
-//! dirtied, so a region that is one texel too small leaves a stale dab or
-//! a hole. The
-//! oracle is the engine's own full re-render path: `test_set_full_rerender`
-//! clears the ring before every rewind, so each event renders the final
-//! polyline from index 0 with the terminal's whole-scratch prologue.
-//! That path and the incremental one must produce the same bytes.
+//! A stabilized stroke rewinds to a checkpoint, restores it, and replays
+//! the dabs after it, at every frame where a rendered vertex moved. The ring
+//! copies only the region those dabs dirtied, so a region that is one texel
+//! too small leaves a stale dab or a hole. The oracle is the engine's own
+//! full re-render path: `test_set_full_rerender` clears the ring before
+//! every rewind, so each frame renders the polyline from index 0 with the
+//! terminal's whole-scratch prologue. That path and the incremental one must
+//! produce the same bytes.
 //!
-//! All cells run at `stabilize = 0`, where only the synthetic tip
-//! correction rewinds and the two paths are exactly equal; a reported
-//! divergence at `stabilize > 0` leaves the segment before it drawn with
-//! a lookahead point that has since moved, so a from-scratch render
-//! differs there regardless of the ring.
+//! The cells stabilize at [`STABILIZE`] with a divergence epsilon of zero.
+//! An unstabilized stroke never rewinds, so it would compare the oracle with
+//! itself. With the production epsilon, a vertex that drifts by less than
+//! it keeps the dabs it was first rendered with, while the oracle redraws
+//! it where it now lies, so the two would differ regardless of the ring. At
+//! zero every moved vertex is re-rendered, and vertices the stabilizer has
+//! not moved are bit-identical in both runs.
 //!
 //! Run with: `cargo test -p darkly --test stroke_rewind --features testing -- --test-threads=1`
 
@@ -29,6 +31,10 @@ use darkly::format::stroke_recording::{replay, EventTiming, ReplayPacing, Stroke
 use darkly::gpu::context::GpuContext;
 use darkly::gpu::test_utils::test_device;
 use darkly::layer::LayerId;
+
+/// Stabilizer strength every cell paints at: deep enough that a frame
+/// rewinds across several checkpoint segments.
+const STABILIZE: f32 = 0.5;
 
 fn fixture(name: &str) -> PathBuf {
     [env!("CARGO_MANIFEST_DIR"), "tests", "fixtures", name]
@@ -108,7 +114,8 @@ impl Cell<'_> {
         full_rerender: bool,
         drive: impl FnOnce(&mut DarklyEngine, LayerId),
     ) -> (Vec<u8>, CanvasRect) {
-        let mut engine = new_engine(self.canvas, self.brush, 0.0);
+        let mut engine = new_engine(self.canvas, self.brush, STABILIZE);
+        engine.test_set_divergence_epsilon(0.0);
         if let Some(b) = self.buildup {
             set_input(&mut engine, "paint", "buildup", b);
         }
@@ -120,6 +127,11 @@ impl Cell<'_> {
         drive(&mut engine, layer);
         engine.test_flush_readbacks();
         if !full_rerender {
+            assert!(
+                engine.test_stroke_rewinds() > 0,
+                "the incremental run never rewound, so this comparison would \
+                 be the oracle against itself"
+            );
             assert_eq!(
                 engine.test_stroke_full_rerender_events(),
                 0,
@@ -191,31 +203,30 @@ fn replay_recording(
 }
 
 /// A checkpoint save never submits on its own: it is recorded into the
-/// submission of the segment it snapshots. At `stabilize = 0` the
-/// synthetic tip correction rewinds to the checkpoint two indices below
-/// the tip and replays exactly two segments, so an event is at most four
-/// submissions: the stroke prologue or the rewind, the two segments
-/// (one may place no dab and still submits for its save), and the
-/// commit. A save in a submission of its own makes it six. Checked per
-/// event rather than as a stroke total, which could not tell one event
-/// over from another under.
+/// submission of the segment it snapshots. A frame is the stroke prologue
+/// or the rewind, one submission per segment, which also flushes the
+/// segment's dabs, an unsaved tail, and the commit, so it submits at most
+/// three more times than it flushes dabs. A save in a submission of its own
+/// adds one per segment. Checked per frame rather than as a stroke total,
+/// which could not tell one frame over from another under.
 #[test]
 fn checkpoint_saves_share_their_segment_submission() {
     let canvas = (1024, 512);
-    let mut engine = new_engine(canvas, "Ink Pen", 0.0);
+    let mut engine = new_engine(canvas, "Ink Pen", STABILIZE);
     let layer = engine.add_raster_layer(None);
     let timings = replay_recording(&mut engine, layer, canvas);
     engine.test_flush_readbacks();
+    assert!(engine.test_stroke_rewinds() > 0, "the stroke must rewind");
     assert_eq!(engine.test_stroke_full_rerender_events(), 0);
-    let over: Vec<(usize, u32)> = timings
+    let over: Vec<(usize, u32, u32)> = timings
         .iter()
-        .filter(|t| t.submits > 4)
-        .map(|t| (t.index, t.submits))
+        .filter(|t| t.submits > t.dab_flushes + 3)
+        .map(|t| (t.index, t.submits, t.dab_flushes))
         .collect();
     assert!(
         over.is_empty(),
-        "events with more submissions than rewind + two segments + commit (index, submits): \
-         {over:?}"
+        "frames with more submissions than dab flushes + rewind + tail + commit \
+         (index, submits, dab flushes): {over:?}"
     );
 }
 
@@ -233,8 +244,10 @@ fn checkpoint_saves_share_their_segment_submission() {
 fn grow_reverse_jump(engine: &mut DarklyEngine, layer: LayerId) {
     engine.begin_stroke(layer).unwrap();
     let mut t = 0.0;
+    // A frame per event, so the stroke rewinds as it goes.
     let mut go = |x: f32, y: f32| {
         engine.stroke_to(event(x, y, t));
+        engine.render(0.0);
         t += 16.0;
     };
     let (mut x, mut y) = (150.0, 120.0);
@@ -279,7 +292,7 @@ fn recorded_stroke_rewinds_match_full_rerender() {
 }
 
 /// Black vertical bars across the layer in the Ink Pen, then `brush`
-/// back at `stabilize = 0`: something for a brush that moves existing
+/// back at [`STABILIZE`]: something for a brush that moves existing
 /// pigment to move. The bars stay a dab's reach inside the layer: pigment
 /// at the border would let the smear cross the edge at a dab clipped
 /// before the layer grows, the history `grow_reverse_jump`'s note says a
@@ -297,7 +310,7 @@ fn lay_stripes(engine: &mut DarklyEngine, layer: LayerId, canvas: (u32, u32), br
         engine.end_stroke();
     }
     install_builtin(engine, brush);
-    set_input(engine, "brush_settings", "stabilize", 0.0);
+    set_input(engine, "brush_settings", "stabilize", STABILIZE);
 }
 
 /// The recorded stroke through the Smudge over a striped layer: every

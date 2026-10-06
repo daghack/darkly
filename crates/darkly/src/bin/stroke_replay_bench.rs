@@ -35,7 +35,7 @@ use darkly::brush::builtin_brushes;
 use darkly::engine::DarklyEngine;
 use darkly::format::stroke_recording::{replay, EventTiming, ReplayPacing, StrokeRecording};
 use darkly::gpu::context::GpuContext;
-use darkly::gpu::test_utils::test_device;
+use darkly::gpu::test_utils::bench_device;
 
 /// The `pen_input.size` base knob is the dab radius expressed as a fraction
 /// of the dab reference: `radius_px = size * DAB_REFERENCE_SIZE_PX * 0.5`,
@@ -158,7 +158,7 @@ fn brush_graph_json(brush_name: &str, dab_size_px: Option<f32>) -> String {
 // ── Engine setup ────────────────────────────────────────────────────────
 
 fn build_engine(canvas: (u32, u32)) -> DarklyEngine {
-    let (device, queue) = test_device();
+    let (device, queue) = bench_device();
     let gpu = GpuContext::new_headless(device, queue);
     DarklyEngine::new(gpu, canvas.0, canvas.1)
 }

@@ -29,6 +29,8 @@ use std::path::PathBuf;
 use darkly::brush::builtin_brushes;
 use darkly::brush::gpu_context::MAX_DABS_PER_PHASE;
 use darkly::brush::input_value::InputValue;
+use darkly::brush::resampler::MAX_COMMITS_PER_SAMPLE;
+use darkly::brush::stabilizers::laplacian::relaxed_vertex_updates;
 use darkly::coord::CanvasRect;
 use darkly::engine::types::StrokeOp;
 use darkly::engine::DarklyEngine;
@@ -579,5 +581,27 @@ fn headless_stroke_matches_frame_by_frame() {
         readback(&mut engine, layer),
         "a flush per event",
         framed,
+    );
+}
+
+/// Regression: a stroke no frame ran during reaches the stabilizer as one
+/// batch at pen-up, which the Laplacian relaxes once. Fed a sample at a time,
+/// it relaxed a window per resampled vertex: at stabilize 0.6 that was most
+/// of a headless stroke's CPU.
+#[test]
+fn headless_stroke_relaxes_once() {
+    let canvas = (1024, 512);
+    let ops = recorded_ops(canvas);
+    let mut engine = new_engine(canvas, "Ink Pen", 0.6);
+    let layer = engine.add_raster_layer(None);
+    let before = relaxed_vertex_updates();
+    headless(&mut engine, layer, &ops);
+    let updates = relaxed_vertex_updates() - before;
+    // One relaxation of ceil(0.6^2 x 160) = 58 sweeps over every resampled
+    // vertex, of which a raw sample commits at most `MAX_COMMITS_PER_SAMPLE`.
+    let bound = 58 * (ops.len() * MAX_COMMITS_PER_SAMPLE + 1) as u64;
+    assert!(
+        updates <= bound,
+        "the stroke relaxed {updates} vertex updates, more than one pass ({bound})"
     );
 }

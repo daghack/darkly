@@ -52,7 +52,7 @@ Four pieces to keep in mind:
 
  for each pen event (brush_stroke_to):
    │
-   └─► stabilizer.push(event) → resampled, smoothed polyline; nothing renders
+   └─► record the event; nothing stabilizes or renders
 
  each frame, and at pen-up (flush_stroke), if events arrived since the last:
    │
@@ -60,8 +60,9 @@ Four pieces to keep in mind:
    │      // every terminal's begin_stroke hook fires:
    │      //   color_output → clear scratch to transparent
    │      //   liquify      → copy layer into scratch
-   ├─► StrokeEngine.take_divergence() → the earliest rendered vertex that
-   │      moved since it was rendered, else append-only
+   ├─► StrokeEngine.take_divergence() → stabilizer.push_all(events since
+   │      the last flush), then the earliest rendered vertex that moved
+   │      since it was rendered, else append-only
    ├─► StrokeEngine.render_from_stabilized_range(gpu_ctx, first_new)
    │      │   (after restoring a checkpoint on divergence)
    │      ├─► for each dab position on the segment:

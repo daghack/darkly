@@ -150,8 +150,9 @@ pub struct StrokeEngine {
     stabilizer: Box<dyn StabilizerAlgorithm>,
     /// Where each stabilized vertex was last rendered.
     rendered: DivergenceDiff,
-    /// Input has been stabilized since the last [`Self::take_divergence`].
-    unrendered_input: bool,
+    /// Events of `record` already handed to the stabilizer. Those after it
+    /// are pending until the next [`Self::take_divergence`].
+    stabilized_events: usize,
 
     /// Per-dab save points for rewind capability.
     pub save_points: SavePointStore,
@@ -270,7 +271,7 @@ impl StrokeEngine {
             spacing,
             stabilizer,
             rendered: DivergenceDiff::new(divergence_epsilon),
-            unrendered_input: false,
+            stabilized_events: 0,
             save_points: SavePointStore::new(),
             last_point: None,
             accumulated_distance: 0.0,
@@ -334,18 +335,25 @@ impl StrokeEngine {
         self.last_dab_size[0].max(self.last_dab_size[1])
     }
 
-    /// Feed a raw pointer event to the stabilizer. Rendering waits for the
-    /// next [`Self::take_divergence`], however many events arrive first.
+    /// Record a raw pointer event. The stabilizer takes every event recorded
+    /// since it last ran as one batch at the next [`Self::take_divergence`],
+    /// however many arrive first.
     pub fn stabilize(&mut self, raw: PaintInformation) {
         self.record.push(raw);
-        self.stabilizer.push(raw);
-        self.unrendered_input = true;
     }
 
-    /// Whether input has been stabilized since the last
+    /// Hand the stabilizer every event recorded since it last ran, as one
+    /// batch.
+    fn stabilize_pending(&mut self) {
+        self.stabilizer
+            .push_all(&self.record.events[self.stabilized_events..]);
+        self.stabilized_events = self.record.events.len();
+    }
+
+    /// Whether events have been recorded since the last
     /// [`Self::take_divergence`].
     pub fn has_unrendered_input(&self) -> bool {
-        self.unrendered_input
+        self.stabilized_events < self.record.events.len()
     }
 
     /// Number of stabilized vertices recorded as rendered: the index of the
@@ -360,7 +368,7 @@ impl StrokeEngine {
     /// [`Self::rendered_len`] (read before this call) need rendering. Called
     /// once per render of the stroke, whatever number of events it covers.
     pub fn take_divergence(&mut self) -> Option<usize> {
-        self.unrendered_input = false;
+        self.stabilize_pending();
         let window = self.stabilizer.max_divergence_window();
         self.rendered.update(self.stabilizer.stabilized(), window)
     }
@@ -714,6 +722,7 @@ impl StrokeEngine {
     /// every sample is known up front, such as the brush preview, so no
     /// segment is ever drawn without its real lookahead.
     pub fn render_whole(&mut self, gpu: &mut BrushGpuContext) {
+        self.stabilize_pending();
         self.begin_stroke(gpu, None);
         self.reset_render_state();
         if let Some(end) = self.stabilizer.len().checked_sub(1) {
